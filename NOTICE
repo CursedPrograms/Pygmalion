@@ -8,6 +8,14 @@ Pygmalion's code is under the GNU Affero General Public License v3 (LICENSE.md):
 The body, its 1,280 shapes (targets), the modifiers and sliders, the eyes and the litspheres in data\ are MakeHuman's
 assets, released as CC0 (data\LICENSE.ASSETS.md).
 
+The skeletons (rigs\), poses, expressions, face and body pose units and animations in data\ come from MakeHuman 1.1.1
+(files.jwp.se/archive/releases/1.1.1); the expressions say AGPL-3.0, as Pygmalion is.
+MakeHuman's system asset pack (clothes, hair, eyebrows, eyelashes, teeth, tongue, topologies, skins, eye materials) in
+assets-mh\ is CC0, from mirror1.makehuman.net/asset_packs; the community packs Utilities > Download fetches are CC0 too.
+
+The FBX writer follows MakeHuman's 9_export_fbx plugin (encode_bin.py: header, FileId, footer), AGPL-3.0.
+http.cpp (WinHTTP downloads) comes from Hymnal, Cursed Entertainment.
+
 SDL2 - https://www.libsdl.org - zlib License
 Dear ImGui - Omar Cornut - https://github.com/ocornut/imgui - MIT License
 stb_image, stb_image_write - Sean Barrett - https://github.com/nothings/stb - MIT License / public domain

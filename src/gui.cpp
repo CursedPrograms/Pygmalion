@@ -848,12 +848,17 @@ static void symmetry(bool rightToLeft) {
     dirty = true;
 }
 
+static float toolbarH = 34;   // one row of buttons, or more when the window is narrow
 static void toolbar(float x, float y, float w) {
-    ImGui::SetNextWindowPos(ImVec2(x, y)); ImGui::SetNextWindowSize(ImVec2(w, 34));
+    ImGui::SetNextWindowPos(ImVec2(x, y)); ImGui::SetNextWindowSize(ImVec2(w, toolbarH));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8, 5));
     ImGui::PushStyleColor(ImGuiCol_WindowBg, col4(C_BG));
     ImGui::Begin("toolbar", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus);
-    auto btn = [&](const char* l, const char* t, bool on = false) { if (on) ImGui::PushStyleColor(ImGuiCol_Button, col4(C_DEEP)); const bool r = ImGui::SmallButton(l); if (on) ImGui::PopStyleColor(); tip(t); ImGui::SameLine(); return r; };
+    auto btn = [&](const char* l, const char* t, bool on = false) {
+        // a row full: the next one below (the toolbar grows to fit)
+        const float bw = ImGui::CalcTextSize(l).x + ImGui::GetStyle().FramePadding.x * 2;
+        if (ImGui::GetCursorPosX() + bw > ImGui::GetWindowContentRegionMax().x) ImGui::NewLine();
+        if (on) ImGui::PushStyleColor(ImGuiCol_Button, col4(C_DEEP)); const bool r = ImGui::SmallButton(l); if (on) ImGui::PopStyleColor(); tip(t); ImGui::SameLine(); return r; };
     auto gap = [] { ImGui::SameLine(0, 12); };
     if (btn("Undo", "Undo (Ctrl+Z)") && !undo.empty()) { redo.push_back({snapshot(), undo.back().second}); restore(undo.back().first); undo.pop_back(); }
     if (btn("Redo", "Redo (Ctrl+Y)") && !redo.empty()) { undo.push_back({snapshot(), redo.back().second}); restore(redo.back().first); redo.pop_back(); }
@@ -885,6 +890,8 @@ static void toolbar(float x, float y, float w) {
         const std::string p = fileDialog(true, L"PNG\0*.png\0\0", L"png", homeDir() + "\\screenshot.png");
         if (!p.empty()) { wantThumb = true; thumbPath = p; }
     }
+    ImGui::NewLine();
+    toolbarH = std::max(34.0f, ImGui::GetCursorPosY() + 2);
     ImGui::End();
     ImGui::PopStyleColor(); ImGui::PopStyleVar();
 }
@@ -1457,7 +1464,7 @@ static void frame() {
     ImGui::End();
 
     // the person in the middle
-    ImGui::SetNextWindowPos(ImVec2(sideW, top + 34)); ImGui::SetNextWindowSize(ImVec2(W - 2 * sideW, H - top - 34 - statusH));
+    ImGui::SetNextWindowPos(ImVec2(sideW, top + toolbarH)); ImGui::SetNextWindowSize(ImVec2(W - 2 * sideW, H - top - toolbarH - statusH));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::Begin("view", nullptr, fixed);
     if (dirty && loadErr.empty()) {

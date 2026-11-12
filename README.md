@@ -54,7 +54,8 @@ MakeHuman's own layout, tab for tab:
   ambient light, shine and up to four lights (direction, colour, strength, fixed or turning with the view), five
   ready-made scenes and your own saved as `.pygscene`; the background; an orthographic view.
 - **Exports:** Collada (`.dae`), FBX, glTF (`.glb`), OBJ, Ogre3D, STL, BVH and the UV map, with the skeleton, its
-  weights and the textures, posed or not, feet on the ground, in any units. Tested by importing into Blender.
+  weights and the textures, posed or not, feet on the ground, in any units. Collada, FBX and OBJ keep MakeHuman's
+  four-sided faces and shared vertices (glTF, STL and Ogre3D only take triangles). Tested by importing into Blender.
 - **Utilities:** Describe ("a tall, muscular old woman with a big nose" sets the sliders), Symmetry, Statistics,
   Material Editor, Expression mixer (save your own mixes as `.mhpose`), Targets, Save targets, Mass produce (hundreds of random people, saved and
   exported), Shell (one command at a time, with history), Scripting (Pygmalion's own commands for every job), Download (MakeHuman's 60+ community asset packs,

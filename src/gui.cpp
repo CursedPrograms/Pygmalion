@@ -772,9 +772,13 @@ static const float UNIT_CM[] = {10, 100, 1, 0.1f, 2.54f};
 static Mesh toMesh();
 static bool exportTo(const std::string& p, int fmt, std::string& err) {
     const float sc = UNIT_SCALE[exportUnits];
-    if (fmt == EX_GLB || fmt == EX_OBJ || fmt == EX_STL) {
+    if (fmt == EX_GLB || fmt == EX_STL) {
         const Mesh m = toMesh();
-        return fmt == EX_GLB ? saveGlb(m, p, sc, false, err) : fmt == EX_OBJ ? saveObj(m, p, sc, false, err) : saveStl(m, p, sc, false, err);
+        return fmt == EX_GLB ? saveGlb(m, p, sc, false, err) : saveStl(m, p, sc, false, err);
+    }
+    if (fmt == EX_OBJ) {   // MakeHuman's OBJ: shared vertices and its quads, as posed now
+        Export::Options o; o.scale = sc; o.cmPerUnit = UNIT_CM[exportUnits]; o.feetOnGround = exportFeet; o.posed = exportPosed;
+        return Export::saveObj(Export::withTexturesBeside(Export::parts(body, nullptr, exportPosed), p), p, o, err);
     }
     if (fmt == EX_UV) return Export::saveUvMap(body, p, 2048, err);
     if (fmt == EX_BVH) {

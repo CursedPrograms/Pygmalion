@@ -17,6 +17,7 @@ struct Part {                                   // one mesh with one material: t
     std::string name, texture;                  // texture: a PNG beside the export ("" none)
     std::vector<float> pos, nrm, uv;            // per vertex (vertices split where their uvs differ)
     std::vector<int> tri;                       // 3 a triangle
+    std::vector<int> faces, faceSize;           // the same surface as MakeHuman's faces: quads where its files have them
     std::vector<std::vector<std::pair<int, float>>> weights;   // per vertex: (bone, weight), at most 4, adding to 1
 };
 
@@ -33,6 +34,8 @@ std::vector<Part> parts(const Human::Body& b, const Skel::Skeleton* s, bool pose
 
 bool saveCollada(const std::vector<Part>& parts, const Skel::Skeleton* s, const std::string& path, const Options& o, std::string& err);
 bool saveFbx(const std::vector<Part>& parts, const Skel::Skeleton* s, const std::string& path, const Options& o, std::string& err);
+// Wavefront OBJ as MakeHuman writes it: shared vertices, quads, uvs, normals, a .mtl and the textures beside it
+bool saveObj(const std::vector<Part>& parts, const std::string& path, const Options& o, std::string& err);
 bool saveOgre(const std::vector<Part>& parts, const Skel::Skeleton* s, const std::string& path, const Options& o, std::string& err);
 // the body's uv layout as lines on a square picture (size x size)
 bool saveUvMap(const Human::Body& b, const std::string& path, int size, std::string& err);

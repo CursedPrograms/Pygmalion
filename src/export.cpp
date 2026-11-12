@@ -61,22 +61,35 @@ std::vector<Part> parts(const Human::Body& b, const Skel::Skeleton* s, bool pose
         Part p; p.name = name; p.texture = tex;
         std::vector<float> n; normalsOf(pos, tri, n);
         std::map<std::pair<int, std::pair<float, float>>, int> seen;
-        for (size_t t = 0; t + 2 < tri.size(); t += 3) {
-            if (hidden && ((*hidden)[tri[t]] || (*hidden)[tri[t + 1]] || (*hidden)[tri[t + 2]])) continue;
-            for (size_t c = t; c < t + 3; ++c) {
-                float uv[2]; uvOf(c, uv);
-                const int v = tri[c];
-                const auto key = std::make_pair(v, std::make_pair(uv[0], uv[1]));
-                auto it = seen.find(key);
-                if (it == seen.end()) {
-                    it = seen.emplace(key, (int)(p.pos.size() / 3)).first;
-                    p.pos.insert(p.pos.end(), &pos[(size_t)v * 3], &pos[(size_t)v * 3] + 3);
-                    p.nrm.insert(p.nrm.end(), &n[(size_t)v * 3], &n[(size_t)v * 3] + 3);
-                    p.uv.insert(p.uv.end(), {uv[0], uv[1]});
-                    if (s) { auto acc = weightOf(v); p.weights.push_back(topFour(acc)); }
-                }
-                p.tri.push_back(it->second);
+        auto corner = [&](size_t c) {   // the part's vertex for a corner: one per (vertex, uv)
+            float uv[2]; uvOf(c, uv);
+            const int v = tri[c];
+            const auto key = std::make_pair(v, std::make_pair(uv[0], uv[1]));
+            auto it = seen.find(key);
+            if (it == seen.end()) {
+                it = seen.emplace(key, (int)(p.pos.size() / 3)).first;
+                p.pos.insert(p.pos.end(), &pos[(size_t)v * 3], &pos[(size_t)v * 3] + 3);
+                p.nrm.insert(p.nrm.end(), &n[(size_t)v * 3], &n[(size_t)v * 3] + 3);
+                p.uv.insert(p.uv.end(), {uv[0], uv[1]});
+                if (s) { auto acc = weightOf(v); p.weights.push_back(topFour(acc)); }
             }
+            return it->second;
+        };
+        auto shown = [&](size_t t) { return !(hidden && ((*hidden)[tri[t]] || (*hidden)[tri[t + 1]] || (*hidden)[tri[t + 2]])); };
+        auto face = [&](std::initializer_list<int> f) { p.faces.insert(p.faces.end(), f); p.faceSize.push_back((int)f.size()); };
+        for (size_t t = 0; t + 2 < tri.size(); t += 3) {
+            if (!shown(t)) continue;
+            const int a = corner(t), b2 = corner(t + 1), c = corner(t + 2);
+            p.tri.insert(p.tri.end(), {a, b2, c});
+            // MakeHuman's quads were cut in two as a fan (a b c, a c d): put them back together
+            if (t + 5 < tri.size() && shown(t + 3) && tri[t + 3] == tri[t] && tri[t + 4] == tri[t + 2]) {
+                const int a2 = corner(t + 3), c2 = corner(t + 4), d = corner(t + 5);
+                p.tri.insert(p.tri.end(), {a2, c2, d});
+                if (a2 == a && c2 == c) face({a, b2, c, d}); else { face({a, b2, c}); face({a2, c2, d}); }
+                t += 3;
+                continue;
+            }
+            face({a, b2, c});
         }
         if (!p.tri.empty()) out.push_back(std::move(p));
     };
@@ -160,6 +173,42 @@ static void rowMajor(std::ostream& o, const Mat4& m) {
     for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) { snprintf(b, sizeof b, "%g ", m[c * 4 + r]); o << b; }
 }
 
+bool saveObj(const std::vector<Part>& parts, const std::string& path, const Options& op, std::string& err) {
+    const Xf x = xfOf(parts, op);
+    const fs::path p = fs::u8path(path);
+    const std::string mtl = p.stem().u8string() + ".mtl";
+    std::ofstream o(p);
+    if (!o) { err = "Couldn't write " + path; return false; }
+    o << "# Pygmalion (MakeHuman, remade in C++)\nmtllib " << mtl << "\n";
+    char b[128];
+    size_t base = 1;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        const Part& q = parts[i];
+        const size_t n = q.pos.size() / 3;
+        o << "o " << q.name << "\n";
+        for (size_t v = 0; v < n; ++v) { float w[3]; x.pt(&q.pos[v * 3], w); snprintf(b, sizeof b, "v %.6f %.6f %.6f\n", w[0], w[1], w[2]); o << b; }
+        for (size_t v = 0; v < n; ++v) { snprintf(b, sizeof b, "vt %.6f %.6f\n", q.uv[v * 2], q.uv[v * 2 + 1]); o << b; }
+        for (size_t v = 0; v < n; ++v) { snprintf(b, sizeof b, "vn %.4f %.4f %.4f\n", q.nrm[v * 3], q.nrm[v * 3 + 1], q.nrm[v * 3 + 2]); o << b; }
+        o << "usemtl mat" << i << "\ns 1\n";
+        size_t at = 0;
+        for (int k : q.faceSize) {
+            o << 'f';
+            for (int c = 0; c < k; ++c) { const size_t v = base + (size_t)q.faces[at + (size_t)c]; o << ' ' << v << '/' << v << '/' << v; }
+            o << '\n';
+            at += (size_t)k;
+        }
+        base += n;
+    }
+    if (!o) { err = "Couldn't write " + path; return false; }
+    std::ofstream m(p.parent_path() / fs::u8path(mtl));
+    for (size_t i = 0; i < parts.size(); ++i) {
+        m << "newmtl mat" << i << "\n# " << parts[i].name << "\nKd 1 1 1\nKa 0 0 0\nKs 0.1 0.1 0.1\nNs 20\nillum 2\n";
+        if (!parts[i].texture.empty()) m << "map_Kd " << fs::u8path(parts[i].texture).filename().u8string() << "\n";
+        m << "\n";
+    }
+    return true;
+}
+
 bool saveCollada(const std::vector<Part>& parts, const Skel::Skeleton* s, const std::string& path, const Options& op, std::string& err) {
     std::ofstream o(fs::u8path(path));
     if (!o) { err = "Couldn't write " + path; return false; }
@@ -199,10 +248,12 @@ bool saveCollada(const std::vector<Part>& parts, const Skel::Skeleton* s, const 
         for (size_t v = 0; v < n; ++v) { snprintf(b, sizeof b, "%.5f %.5f ", p.uv[v * 2], p.uv[v * 2 + 1]); o << b; }
         o << "</float_array><technique_common><accessor source=\"#" << g << "-uv-a\" count=\"" << n << "\" stride=\"2\"><param name=\"S\" type=\"float\"/><param name=\"T\" type=\"float\"/></accessor></technique_common></source>\n";
         o << "      <vertices id=\"" << g << "-v\"><input semantic=\"POSITION\" source=\"#" << g << "-pos\"/></vertices>\n";
-        o << "      <triangles material=\"mat" << i << "\" count=\"" << p.tri.size() / 3 << "\"><input semantic=\"VERTEX\" source=\"#" << g << "-v\" offset=\"0\"/><input semantic=\"NORMAL\" source=\"#" << g
-          << "-nrm\" offset=\"0\"/><input semantic=\"TEXCOORD\" source=\"#" << g << "-uv\" offset=\"0\" set=\"0\"/><p>";
-        for (int t : p.tri) o << t << ' ';
-        o << "</p></triangles>\n    </mesh></geometry>\n";
+        o << "      <polylist material=\"mat" << i << "\" count=\"" << p.faceSize.size() << "\"><input semantic=\"VERTEX\" source=\"#" << g << "-v\" offset=\"0\"/><input semantic=\"NORMAL\" source=\"#" << g
+          << "-nrm\" offset=\"0\"/><input semantic=\"TEXCOORD\" source=\"#" << g << "-uv\" offset=\"0\" set=\"0\"/><vcount>";
+        for (int k : p.faceSize) o << k << ' ';
+        o << "</vcount><p>";
+        for (int t : p.faces) o << t << ' ';
+        o << "</p></polylist>\n    </mesh></geometry>\n";
     }
     o << "  </library_geometries>\n";
     std::vector<Mat4> bind, scene, local;
@@ -364,16 +415,16 @@ bool saveFbx(const std::vector<Part>& parts, const Skel::Skeleton* s, const std:
         Node& g = objects.add("Geometry"); g.L(geo).S(fbxName(p.name, "Geometry")).S("Mesh");
         std::vector<double> v(n * 3); for (size_t k = 0; k < n; ++k) { float q[3]; x.pt(&p.pos[k * 3], q); v[k * 3] = q[0]; v[k * 3 + 1] = q[1]; v[k * 3 + 2] = q[2]; }
         g.add("Vertices").Ad(v);
-        std::vector<int32_t> pvi(p.tri.begin(), p.tri.end());
-        for (size_t k = 2; k < pvi.size(); k += 3) pvi[k] = -pvi[k] - 1;
+        std::vector<int32_t> pvi(p.faces.begin(), p.faces.end());
+        { size_t at = 0; for (int k : p.faceSize) { at += (size_t)k; pvi[at - 1] = -pvi[at - 1] - 1; } }   // a face ends on a negative index
         g.add("PolygonVertexIndex").Ai(pvi);
         g.add("GeometryVersion").I(124);
-        std::vector<double> nr; for (int t : p.tri) for (int c = 0; c < 3; ++c) nr.push_back(p.nrm[(size_t)t * 3 + c]);
+        std::vector<double> nr; for (int t : p.faces) for (int c = 0; c < 3; ++c) nr.push_back(p.nrm[(size_t)t * 3 + c]);
         Node& ln = g.add("LayerElementNormal"); ln.I(0);
         ln.add("Version").I(101); ln.add("Name").S(""); ln.add("MappingInformationType").S("ByPolygonVertex"); ln.add("ReferenceInformationType").S("Direct"); ln.add("Normals").Ad(nr);
         Node& lu = g.add("LayerElementUV"); lu.I(0);
         lu.add("Version").I(101); lu.add("Name").S("UVMap"); lu.add("MappingInformationType").S("ByPolygonVertex"); lu.add("ReferenceInformationType").S("IndexToDirect");
-        lu.add("UV").Ad(std::vector<double>(p.uv.begin(), p.uv.end())); lu.add("UVIndex").Ai(std::vector<int32_t>(p.tri.begin(), p.tri.end()));
+        lu.add("UV").Ad(std::vector<double>(p.uv.begin(), p.uv.end())); lu.add("UVIndex").Ai(std::vector<int32_t>(p.faces.begin(), p.faces.end()));
         Node& lm = g.add("LayerElementMaterial"); lm.I(0);
         lm.add("Version").I(101); lm.add("Name").S(""); lm.add("MappingInformationType").S("AllSame"); lm.add("ReferenceInformationType").S("IndexToDirect"); lm.add("Materials").Ai({0});
         Node& ly = g.add("Layer"); ly.I(0); ly.add("Version").I(100);

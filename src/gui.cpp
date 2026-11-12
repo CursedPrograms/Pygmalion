@@ -15,6 +15,7 @@
 #include <imgui.h>
 #include <imgui_impl_opengl3.h>
 #include <imgui_impl_sdl2.h>
+#include <stb_image.h>
 #include <stb_image_write.h>
 
 #include <algorithm>
@@ -24,7 +25,9 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <mutex>
+#include <sstream>
 #include <random>
 #include <string>
 #include <thread>
@@ -122,7 +125,8 @@ static bool quit = false;
 static Human::Body body;
 static std::string dataDir, loadErr, toast; static double toastUntil = 0;
 static bool dirty = true;
-static int tab = 0, forcedTab = -1;
+static int tab = 0, forcedTab = 1;   // MakeHuman opens on Modelling
+static std::string forcedTask;
 static char prompt[512] = "", search[64] = "";
 static std::string understood;
 static float randomAmount = 0.6f; static bool randMacros = true, randFace = true, randBody = true;
@@ -173,210 +177,475 @@ static Mesh toMesh() {
     return m;
 }
 
-// ---------- the sliders ----------
+// ---------- settings (Settings > Sliders and General, as MakeHuman has them) ----------
+struct Prefs {
+    bool sliderImages = true;      // the shape's picture beside each slider
+    bool showValues = true;        // the number on the slider
+    bool camFollows = true;        // the view turns to what a slider changes
+    bool realtime = true;          // the body follows the slider as it moves (else when let go)
+    bool metric = true;            // cm (else inches)
+    bool invertMouse = false;
+};
+static Prefs prefs;
+static std::vector<std::pair<std::vector<float>, std::string>> redo;
+
+static std::string units(float cm) {
+    char b[48];
+    if (prefs.metric) snprintf(b, sizeof b, "%.1f cm", cm); else snprintf(b, sizeof b, "%.1f in", cm * 0.393700787f);
+    return b;
+}
+
+// the slider pictures, loaded once
+static std::map<std::string, GLuint> pics;
+static GLuint picture(const std::string& path) {
+    if (path.empty()) return 0;
+    auto it = pics.find(path);
+    if (it != pics.end()) return it->second;
+    GLuint t = 0;
+    int w, h, n;
+    stbi_set_flip_vertically_on_load(0);
+    if (unsigned char* px = stbi_load(path.c_str(), &w, &h, &n, 4)) {
+        glGenTextures(1, &t); glBindTexture(GL_TEXTURE_2D, t);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        stbi_image_free(px);
+    }
+    pics[path] = t;
+    return t;
+}
+
+// MakeHuman's slider cameras: a part of the body (a joint marker), seen from a side
+static void lookFor(const std::string& cam) {
+    if (!prefs.camFollows || cam.empty()) return;
+    const float H = Viewer::bodyHeight();
+    const float PI = 3.14159265f;
+    auto at = [&](const char* joint, float dist, float yaw, float pitch) {
+        float p[3];
+        if (Human::jointPos(body, joint, p)) Viewer::focus(p, dist, yaw, pitch);
+    };
+    if (cam == "frontView" || cam == "globalCamera") Viewer::focusBody(0, 0.05f);
+    else if (cam == "backView") Viewer::focusBody(PI, 0.05f);
+    else if (cam == "leftView") Viewer::focusBody(PI / 2, 0.05f);
+    else if (cam == "rightView") Viewer::focusBody(-PI / 2, 0.05f);
+    else if (cam == "topView") Viewer::focusBody(0, 1.5f);
+    else if (cam == "bottomView") Viewer::focusBody(0, -1.5f);
+    else if (cam == "faceCamera") at("joint-head", H * 0.22f, 0, 0.02f);
+    else {
+        // e.g. leftArmTopCamera, rightFootRightCamera: the part, then the side
+        const bool left = cam.rfind("left", 0) == 0;
+        const std::string s = left ? "l" : "r";
+        const std::string rest = cam.substr(left ? 4 : 5);
+        const char* joint = nullptr; float dist = H * 0.45f;
+        if (rest.rfind("Arm", 0) == 0) { joint = "elbow"; dist = H * 0.5f; }
+        else if (rest.rfind("Hand", 0) == 0) { joint = "hand"; dist = H * 0.2f; }
+        else if (rest.rfind("Leg", 0) == 0) { joint = "knee"; dist = H * 0.6f; }
+        else if (rest.rfind("Foot", 0) == 0) { joint = "ankle"; dist = H * 0.2f; }
+        if (!joint) return;
+        float yaw = 0, pitch = 0.05f;
+        if (rest.find("Top") != std::string::npos) pitch = 1.45f;
+        else if (rest.find("Left") != std::string::npos) yaw = PI / 2;
+        else if (rest.find("Right") != std::string::npos) yaw = -PI / 2;
+        at(("joint-" + s + "-" + joint).c_str(), dist, yaw, pitch);
+    }
+}
+
 static void tip(const std::string& s) { if (!s.empty() && ImGui::IsItemHovered()) { ImGui::BeginTooltip(); ImGui::PushTextWrapPos(380); ImGui::TextUnformatted(s.c_str()); ImGui::PopTextWrapPos(); ImGui::EndTooltip(); } }
 
-static bool modSlider(int i, float w) {
+// one slider, MakeHuman's way: its picture beside it, its value on it, right-click resets, the view follows
+static void modSlider(int i, float w, const std::string& tabCam) {
     Human::Modifier& m = body.mods[i];
-    float v = m.value;
     ImGui::PushID(i);
-    ImGui::SetNextItemWidth(w);
-    char fmt[160]; snprintf(fmt, sizeof fmt, "%s: %s", m.label.c_str(), m.min() < 0 ? "%+.2f" : "%.2f");
-    static bool held = false;
-    const bool ch = ImGui::SliderFloat("##m", &v, m.min(), 1.0f, fmt);
-    if (ImGui::IsItemActivated()) { remember(m.label); held = true; }
+    const GLuint pic = prefs.sliderImages ? picture(m.image) : 0;
+    float sw = w;
+    if (pic) { ImGui::Image((ImTextureID)(intptr_t)pic, ImVec2(46, 46)); ImGui::SameLine(); sw = w - 53; ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 12); }
+    float v = m.value;
+    std::string fmt = m.label;
+    // Measure's sliders say the measurement itself
+    const float cm = m.group == "measure" ? Human::measureCm(body, m.fullName()) : -1;
+    if (prefs.showValues) fmt += cm >= 0 ? ": " + units(cm) : (m.min() < 0 ? ": %+.2f" : ": %.2f");
+    for (size_t at = 0; cm >= 0 && (at = fmt.find('%', at)) != std::string::npos; at += 2) fmt.insert(at, "%");
+    ImGui::SetNextItemWidth(sw);
+    const bool ch = ImGui::SliderFloat("##m", &v, m.min(), 1.0f, fmt.c_str());
+    if (ImGui::IsItemActivated()) { remember(m.label); redo.clear(); lookFor(m.cam.empty() ? tabCam : m.cam); }
     if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) { remember(m.label); Human::setModifier(body, i, m.defaultValue); dirty = true; }
-    tip(m.description + (m.description.empty() ? "" : "\n") + "Right-click: back to the start; Ctrl+click: type a value");
-    if (ch) { Human::setModifier(body, i, v); dirty = true; }
+    tip(m.description.empty() ? m.label : m.description);
+    if (ch) { Human::setModifier(body, i, v); if (prefs.realtime) dirty = true; }
+    if (ImGui::IsItemDeactivatedAfterEdit()) dirty = true;
     ImGui::PopID();
-    return ch;
 }
 
-static void macroPanel(float w) {
-    auto macro = [&](const char* var, const char* fmt, std::function<std::string(float)> shown, const char* help) {
-        auto it = body.modByName.end();
-        for (auto i = body.modByName.begin(); i != body.modByName.end(); ++i) if (body.mods[i->second].macro && body.mods[i->second].variable == var) { it = i; break; }
-        if (it == body.modByName.end()) return;
-        Human::Modifier& m = body.mods[it->second];
-        float v = m.value;
-        ImGui::PushID(var);
-        ImGui::SetNextItemWidth(w);
-        std::string label = shown ? shown(v) : std::string(fmt);
-        for (size_t at = 0; (at = label.find('%', at)) != std::string::npos; at += 2) label.insert(at, "%");   // the label is a format: % shown as %
-        const bool ch = ImGui::SliderFloat("##v", &v, 0, 1, label.c_str());
-        if (ImGui::IsItemActivated()) remember(var);
-        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) { remember(var); Human::setMacro(body, var, m.defaultValue); dirty = true; }
-        tip(help);
-        if (ch) { Human::setMacro(body, var, v); dirty = true; }
-        ImGui::PopID();
+static void groupBox(const char* title) {
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Text, col4(C_PINK)); ImGui::TextUnformatted(title); ImGui::PopStyleColor();
+    ImGui::Separator();
+}
+
+// ---------- the tasks: MakeHuman's categories and their tabs ----------
+enum Cat { CAT_FILES, CAT_MODELLING, CAT_GEOMETRIES, CAT_MATERIALS, CAT_POSE, CAT_RENDERING, CAT_SETTINGS, CAT_UTILITIES, CAT_HELP, CAT_COUNT };
+static const char* CAT_NAMES[] = {"Files", "Modelling", "Geometries", "Materials", "Pose/Animate", "Rendering", "Settings", "Utilities", "Help"};
+static int cat = CAT_MODELLING;
+static std::string task[CAT_COUNT] = {"Load", "Main", "Clothes", "Skin/Material", "Skeleton", "Render", "Sliders", "Describe", "About"};
+static std::map<std::string, int> category;   // a modelling tab's chosen Category (the slider group shown)
+
+static std::vector<std::string> tasksOf(int c) {
+    switch (c) {
+    case CAT_FILES: return {"Load", "Save", "Export"};
+    case CAT_MODELLING: {
+        std::vector<std::string> v = {"Main"};
+        for (const char* n : {"Gender", "Face", "Torso", "Arms and Legs", "Body shapes"}) for (const auto& t : body.tabs) if (t.name == n) v.push_back(n);
+        v.push_back("Custom");
+        for (const auto& t : body.tabs) if (t.name == "Measure") v.push_back("Measure");
+        v.push_back("Random");
+        return v;
+    }
+    case CAT_GEOMETRIES: return {"Clothes", "Eyes", "Hair", "Teeth", "Topologies", "Eyebrows", "Eyelashes", "Tongue"};
+    case CAT_MATERIALS: return {"Skin/Material"};
+    case CAT_POSE: return {"Skeleton", "Pose", "Expression"};
+    case CAT_RENDERING: return {"Render", "Scene", "Viewer"};
+    case CAT_SETTINGS: return {"Sliders", "General", "Mouse", "Shortcuts"};
+    case CAT_UTILITIES: return {"Describe", "Symmetry", "Statistics"};
+    default: return {"About", "Licence"};
+    }
+}
+
+static const Human::Tab* tabNamed(const std::string& n) { for (const auto& t : body.tabs) if (t.name == n) return &t; return nullptr; }
+
+// Main: the macro sliders, with MakeHuman's own readings (years, cm, percentages)
+static void macroSliders(float w) {
+    auto macro = [&](const char* var, std::function<std::string(float)> shown, const char* help) {
+        for (auto& m : body.mods) {
+            if (!m.macro || m.variable != var) continue;
+            float v = m.value;
+            ImGui::PushID(var);
+            ImGui::SetNextItemWidth(w);
+            std::string label = prefs.showValues ? shown(v) : std::string(var);
+            for (size_t at = 0; (at = label.find('%', at)) != std::string::npos; at += 2) label.insert(at, "%");
+            const bool ch = ImGui::SliderFloat("##v", &v, 0, 1, label.c_str());
+            if (ImGui::IsItemActivated()) { remember(var); redo.clear(); lookFor("frontView"); }
+            if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) { remember(var); Human::setMacro(body, var, m.defaultValue); dirty = true; }
+            tip(m.description.empty() ? help : m.description);
+            if (ch) { Human::setMacro(body, var, v); if (prefs.realtime) dirty = true; }
+            if (ImGui::IsItemDeactivatedAfterEdit()) dirty = true;
+            ImGui::PopID();
+            return;
+        }
     };
     char b[96];
-    macro("Gender", nullptr, [&](float v) { snprintf(b, sizeof b, "Gender: %.0f%% %s", std::fabs(v - 0.5f) * 200, v < 0.5f ? "female" : v > 0.5f ? "male" : "(in between)"); return std::string(b); }, "Female to male");
-    macro("Age", nullptr, [&](float) { snprintf(b, sizeof b, "Age: %.0f years", Human::ageYears(body)); return std::string(b); }, "1 to 90 years");
-    macro("Muscle", nullptr, [&](float v) { snprintf(b, sizeof b, "Muscle: %.0f%%", v * 100); return std::string(b); }, "Soft to muscular");
-    macro("Weight", nullptr, [&](float v) { snprintf(b, sizeof b, "Weight: %.0f%%", 50 + (v - 0.5f) * 100); return std::string(b); }, "Thin to heavy");
-    macro("Height", nullptr, [&](float) { snprintf(b, sizeof b, "Height: %.0f cm", Human::heightCm(body)); return std::string(b); }, "Short to tall (the height shown is measured on the body)");
-    macro("BodyProportions", nullptr, [&](float v) { snprintf(b, sizeof b, "Proportions: %.0f%% %s", v * 100, v > 0.6f ? "ideal" : v < 0.4f ? "uncommon" : "regular"); return std::string(b); }, "Uncommon, regular or ideal proportions");
-    ImGui::TextDisabled("Where from (the three add up to 100%)");
-    macro("African", nullptr, [&](float v) { snprintf(b, sizeof b, "African: %.0f%%", v * 100); return std::string(b); }, "");
-    macro("Asian", nullptr, [&](float v) { snprintf(b, sizeof b, "Asian: %.0f%%", v * 100); return std::string(b); }, "");
-    macro("Caucasian", nullptr, [&](float v) { snprintf(b, sizeof b, "Caucasian: %.0f%%", v * 100); return std::string(b); }, "");
-    ImGui::TextDisabled("Breasts");
-    macro("BreastSize", nullptr, [&](float v) { snprintf(b, sizeof b, "Breast size: %.0f%%", v * 100); return std::string(b); }, "");
-    macro("BreastFirmness", nullptr, [&](float v) { snprintf(b, sizeof b, "Breast firmness: %.0f%%", v * 100); return std::string(b); }, "");
+    macro("Gender", [&](float v) { snprintf(b, sizeof b, "Gender: %.2f%%", v * 100); return std::string(b); }, "Female to male");
+    macro("Age", [&](float) { snprintf(b, sizeof b, "Age: %.1f years", Human::ageYears(body)); return std::string(b); }, "1 to 90 years");
+    macro("Muscle", [&](float v) { snprintf(b, sizeof b, "Muscle: %.2f%%", v * 100); return std::string(b); }, "");
+    macro("Weight", [&](float v) { snprintf(b, sizeof b, "Weight: %.2f%%", 50 + (150 - 50) * v); return std::string(b); }, "");
+    macro("Height", [&](float) { return "Height: " + units(Human::heightCm(body)); }, "");
+    macro("BodyProportions", [&](float v) { snprintf(b, sizeof b, "Proportions: %.2f%%", v * 100); return std::string(b); }, "Uncommon to ideal proportions");
+    macro("African", [&](float v) { snprintf(b, sizeof b, "African: %.2f%%", v * 100); return std::string(b); }, "");
+    macro("Asian", [&](float v) { snprintf(b, sizeof b, "Asian: %.2f%%", v * 100); return std::string(b); }, "");
+    macro("Caucasian", [&](float v) { snprintf(b, sizeof b, "Caucasian: %.2f%%", v * 100); return std::string(b); }, "");
 }
 
-static void tabPanel(const Human::Tab& t, float w) {
-    const std::string q = search;
-    for (const auto& g : t.groups) {
-        if (q.empty()) {
-            if (!ImGui::CollapsingHeader(g.name.c_str())) continue;
-        } else {
-            bool any = false;
-            for (int i : g.mods) { std::string l = body.mods[i].label; std::transform(l.begin(), l.end(), l.begin(), ::tolower); std::string qq = q; std::transform(qq.begin(), qq.end(), qq.begin(), ::tolower); if (l.find(qq) != std::string::npos) any = true; }
-            if (!any) continue;
-            ImGui::TextColored(col4(C_PINK), "%s", g.name.c_str());
-        }
-        for (int i : g.mods) {
-            if (!q.empty()) { std::string l = body.mods[i].label; std::transform(l.begin(), l.end(), l.begin(), ::tolower); std::string qq = q; std::transform(qq.begin(), qq.end(), qq.begin(), ::tolower); if (l.find(qq) == std::string::npos) continue; }
-            if (body.mods[i].macro) continue;
-            modSlider(i, w);
-        }
+// a modelling tab: the chosen Category's sliders on the left, the Category list on the right
+static void modTabLeft(const Human::Tab& t, float w) {
+    int& c = category[t.name];
+    if (c >= (int)t.groups.size()) c = 0;
+    const auto& g = t.groups[c];
+    groupBox(g.name.c_str());
+    const std::string tabCam = t.name == "Face" ? "faceCamera" : "";
+    for (int i : g.mods) if (!body.mods[i].macro) modSlider(i, w, tabCam);
+    // the Gender tab's breast sliders are macros (size, firmness)
+    if (t.name == "Gender" && g.name == "Breast") {
+        char b[64];
+        for (const char* var : {"BreastSize", "BreastFirmness"})
+            for (auto& m : body.mods) if (m.macro && m.variable == var) {
+                float v = m.value;
+                snprintf(b, sizeof b, "%s: %%.2f%%%%", std::string(var) == "BreastSize" ? "Breast size" : "Breast firmness");
+                ImGui::PushID(var); ImGui::SetNextItemWidth(w);
+                if (ImGui::SliderFloat("##b", &v, 0, 1, prefs.showValues ? b : var)) { Human::setMacro(body, var, v); dirty = true; }
+                if (ImGui::IsItemActivated()) remember(var);
+                ImGui::PopID();
+            }
     }
 }
+static void modTabRight(const Human::Tab& t) {
+    groupBox("Category");
+    int& c = category[t.name];
+    for (int k = 0; k < (int)t.groups.size(); ++k) if (ImGui::RadioButton(t.groups[k].name.c_str(), &c, k)) lookFor(t.name == "Face" ? "faceCamera" : "");
+}
 
-static void leftPanel(float w) {
-    ImGui::TextColored(col4(C_PINK), "DESCRIBE");
-    ImGui::SetNextItemWidth(w);
-    const bool enter = ImGui::InputTextWithHint("##prompt", "a tall, muscular old woman with a big nose", prompt, sizeof prompt, ImGuiInputTextFlags_EnterReturnsTrue);
-    tip("Words like: woman, man, 34 years old, child, old, tall, short, thin, fat, muscular, athletic, african, asian, caucasian, ideal, big nose, round face, square jaw, long neck, broad shoulders, wide hips, pregnant. very / slightly change how much.");
-    if (ImGui::Button("Make them", ImVec2((w - 7) / 2, 0)) || enter) {
-        remember("Describe");
-        understood = Human::describe(body, prompt);
-        if (understood.empty()) understood = "(no words it knows: hover the box for a list)";
+static void statistics() {
+    groupBox("Statistics");
+    ImGui::Text("Height: %s", units(Human::heightCm(body)).c_str());
+    ImGui::Text("Chest: %s", units(Human::measureCm(body, "measure/measure-bust-circ-decr|incr")).c_str());
+    ImGui::Text("Waist: %s", units(Human::measureCm(body, "measure/measure-waist-circ-decr|incr")).c_str());
+    ImGui::Text("Hips: %s", units(Human::measureCm(body, "measure/measure-hips-circ-decr|incr")).c_str());
+}
+
+// Random, as MakeHuman's: what to randomise, how symmetric, and back to the start
+static bool rMacro = true, rFace = true, rBody = true, rHeight = false; static float rSym = 0.7f;
+static void randomLeft(float w) {
+    groupBox("Randomize settings");
+    ImGui::Checkbox("Macro", &rMacro); ImGui::Checkbox("Face", &rFace); ImGui::Checkbox("Body", &rBody); ImGui::Checkbox("Height", &rHeight);
+    ImGui::SetNextItemWidth(w); ImGui::SliderFloat("##sym", &rSym, 0, 1, "Symmetry: %.2f");
+    ImGui::SetNextItemWidth(w); ImGui::SliderFloat("##amt", &randomAmount, 0.1f, 1.0f, "Amount: %.2f");
+    if (ImGui::Button("Randomize", ImVec2(w, 0))) {
+        remember("Randomize"); redo.clear();
+        const float keepH = body.height;
+        const bool sym = body.symmetry;
+        body.symmetry = std::uniform_real_distribution<float>(0, 1)(*new std::mt19937(std::random_device{}())) < rSym;
+        Human::randomize(body, randomAmount, rMacro, rFace, rBody, (unsigned)std::random_device{}());
+        body.symmetry = sym;
+        if (!rHeight) Human::setMacro(body, "Height", keepH);
         dirty = true;
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Random", ImVec2((w - 7) / 2, 0))) { remember("Random"); Human::randomize(body, randomAmount, randMacros, randFace, randBody, (unsigned)std::random_device{}()); dirty = true; }
-    if (!understood.empty()) { ImGui::PushTextWrapPos(w + 14); ImGui::TextDisabled("%s", understood.c_str()); ImGui::PopTextWrapPos(); }
-    if (ImGui::CollapsingHeader("Random settings")) {
-        ImGui::SetNextItemWidth(w); ImGui::SliderFloat("##ra", &randomAmount, 0.1f, 1.0f, "how far: %.2f");
-        ImGui::Checkbox("Body type", &randMacros); ImGui::SameLine(); ImGui::Checkbox("Face", &randFace); ImGui::SameLine(); ImGui::Checkbox("Body", &randBody);
+    groupBox("Restore settings");
+    if (ImGui::Button("Restore to defaults", ImVec2(w, 0))) { remember("Restore"); Human::resetAll(body); dirty = true; }
+}
+
+// Files
+static std::vector<std::string> modelFiles() {
+    std::vector<std::string> v;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(fs::u8path(homeDir()), ec)) if (e.path().extension() == ".mhm") v.push_back(e.path().u8string());
+    std::sort(v.begin(), v.end());
+    return v;
+}
+static char saveName[128] = "person";
+static int exportFormat = 0; static int exportUnits = 1;
+static const char* EXPORT_NAMES[] = {"glTF binary (glb)", "Wavefront obj", "Stereolithography (stl)"};
+static const char* UNIT_NAMES[] = {"decimeter", "meter", "centimeter", "millimeter", "inch"};
+static const float UNIT_SCALE[] = {1, 0.1f, 10, 100, 3.93700787f};
+static bool wantThumb = false; static std::string thumbPath;
+
+static void filesLeft(float w) {
+    if (task[CAT_FILES] == "Load") {
+        groupBox("Load a model");
+        ImGui::TextDisabled("Models in %s", homeDir().c_str());
+        if (ImGui::Button("Load from another folder...", ImVec2(w, 0))) {
+            const std::string p = fileDialog(false, L"MakeHuman model\0*.mhm\0\0", L"mhm", homeDir() + "\\");
+            std::string err;
+            if (!p.empty()) { remember("Load"); if (Human::loadMhm(body, p, err)) { dirty = true; say("Loaded " + fs::u8path(p).filename().u8string()); } else say(err); }
+        }
+        for (const auto& f : modelFiles()) {
+            const std::string name = fs::u8path(f).stem().u8string();
+            const GLuint th = picture(fs::u8path(f).replace_extension(".thumb").u8string());
+            ImGui::PushID(f.c_str());
+            if (th) { if (ImGui::ImageButton("t", (ImTextureID)(intptr_t)th, ImVec2(64, 64))) { std::string err; remember("Load"); if (Human::loadMhm(body, f, err)) dirty = true; else say(err); } ImGui::SameLine(); }
+            if (ImGui::Button(name.c_str(), ImVec2(th ? w - 80 : w, th ? 72 : 0))) { std::string err; remember("Load"); if (Human::loadMhm(body, f, err)) dirty = true; else say(err); }
+            ImGui::PopID();
+        }
+    } else if (task[CAT_FILES] == "Save") {
+        groupBox("Save the model");
+        ImGui::SetNextItemWidth(w); ImGui::InputText("##name", saveName, sizeof saveName);
+        if (ImGui::Button("Save", ImVec2(w, 0))) {
+            const std::string p = (fs::u8path(homeDir()) / (std::string(saveName) + ".mhm")).u8string();
+            std::string err;
+            if (Human::saveMhm(body, p, saveName, err)) { say("Saved " + p + " (MakeHuman opens it too)"); wantThumb = true; thumbPath = fs::u8path(p).replace_extension(".thumb").u8string(); }
+            else say(err);
+        }
+        if (ImGui::Button("Save as...", ImVec2(w, 0))) {
+            const std::string p = fileDialog(true, L"MakeHuman model\0*.mhm\0\0", L"mhm", homeDir() + "\\" + saveName + ".mhm");
+            std::string err;
+            if (!p.empty()) { if (Human::saveMhm(body, p, fs::u8path(p).stem().u8string(), err)) { say("Saved"); wantThumb = true; thumbPath = fs::u8path(p).replace_extension(".thumb").u8string(); } else say(err); }
+        }
+        ImGui::TextDisabled("A picture of the view is saved beside it (.thumb), as MakeHuman does.");
+    } else {
+        groupBox("Export");
+        ImGui::SetNextItemWidth(w); ImGui::InputText("##ename", saveName, sizeof saveName);
+        if (ImGui::Button("Export...", ImVec2(w, 0))) {
+            static const wchar_t* filters[] = {L"GLB\0*.glb\0\0", L"OBJ\0*.obj\0\0", L"STL\0*.stl\0\0"};
+            static const wchar_t* exts[] = {L"glb", L"obj", L"stl"};
+            static const char* dots[] = {".glb", ".obj", ".stl"};
+            const std::string p = fileDialog(true, filters[exportFormat], exts[exportFormat], homeDir() + "\\" + saveName + dots[exportFormat]);
+            if (!p.empty()) {
+                std::string err;
+                const Mesh m = toMesh();
+                const float sc = UNIT_SCALE[exportUnits];
+                const bool ok = exportFormat == 0 ? saveGlb(m, p, sc, false, err) : exportFormat == 1 ? saveObj(m, p, sc, false, err) : saveStl(m, p, sc, false, err);
+                say(ok ? "Exported " + fs::u8path(p).filename().u8string() : err);
+            }
+        }
     }
-    ImGui::Spacing();
-    ImGui::TextColored(col4(C_PINK), "MAIN");
-    macroPanel(w);
-    ImGui::Spacing();
-    ImGui::Checkbox("Symmetry (left moves right too)", &body.symmetry);
-    if (ImGui::Button("Undo", ImVec2((w - 7) / 2, 0)) && !undo.empty()) { restore(undo.back().first); say("Undid " + undo.back().second); undo.pop_back(); }
-    ImGui::SameLine();
-    if (ImGui::Button("Start again", ImVec2((w - 7) / 2, 0))) { remember("Start again"); Human::resetAll(body); dirty = true; }
+}
+static void filesRight() {
+    if (task[CAT_FILES] != "Export") return;
+    groupBox("Mesh format");
+    for (int k = 0; k < 3; ++k) ImGui::RadioButton(EXPORT_NAMES[k], &exportFormat, k);
+    groupBox("Options");
+    ImGui::TextUnformatted("Scale units");
+    ImGui::SetNextItemWidth(-1); ImGui::Combo("##units", &exportUnits, UNIT_NAMES, 5);
+}
+
+// ---------- the toolbar: MakeHuman's edit, view, symmetry and camera buttons ----------
+static void symmetry(bool rightToLeft) {
+    remember(rightToLeft ? "Symmetry R>L" : "Symmetry L>R"); redo.clear();
+    for (size_t i = 0; i < body.mods.size(); ++i) {
+        const auto& m = body.mods[i];
+        std::vector<std::string> parts; std::stringstream ss(m.name); std::string p; bool from = false;
+        while (std::getline(ss, p, '-')) { if (p == (rightToLeft ? "r" : "l")) { from = true; p = rightToLeft ? "l" : "r"; } parts.push_back(p); }
+        if (!from) continue;
+        std::string n; for (size_t k = 0; k < parts.size(); ++k) n += (k ? "-" : "") + parts[k];
+        auto it = body.modByName.find(m.group + "/" + n);
+        if (it != body.modByName.end()) body.mods[it->second].value = m.value;
+    }
+    dirty = true;
+}
+
+static void toolbar(float x, float y, float w) {
+    ImGui::SetNextWindowPos(ImVec2(x, y)); ImGui::SetNextWindowSize(ImVec2(w, 34));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8, 5));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, col4(C_BG));
+    ImGui::Begin("toolbar", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus);
+    auto btn = [&](const char* l, const char* t, bool on = false) { if (on) ImGui::PushStyleColor(ImGuiCol_Button, col4(C_DEEP)); const bool r = ImGui::SmallButton(l); if (on) ImGui::PopStyleColor(); tip(t); ImGui::SameLine(); return r; };
+    auto gap = [] { ImGui::SameLine(0, 12); };
+    if (btn("Undo", "Undo (Ctrl+Z)") && !undo.empty()) { redo.push_back({snapshot(), undo.back().second}); restore(undo.back().first); undo.pop_back(); }
+    if (btn("Redo", "Redo (Ctrl+Y)") && !redo.empty()) { undo.push_back({snapshot(), redo.back().second}); restore(redo.back().first); redo.pop_back(); }
+    if (btn("Reset", "Reset the human to the start")) { remember("Reset"); Human::resetAll(body); dirty = true; }
+    gap();
+    Viewer::Look& lk = Viewer::look();
+    if (btn("Wire", "Show the mesh's lines", lk.wire)) lk.wire = !lk.wire;
+    if (btn("Clay", "Plain grey instead of skin", lk.shading == 1)) lk.shading = lk.shading == 1 ? 0 : 1;
+    if (btn("Floor", "The grid under the feet", lk.grid)) lk.grid = !lk.grid;
+    gap();
+    if (btn("R>L", "Copy the right side's shapes to the left")) symmetry(true);
+    if (btn("L>R", "Copy the left side's shapes to the right")) symmetry(false);
+    if (btn("Symm", "Moving a left slider moves the right one too", body.symmetry)) body.symmetry = !body.symmetry;
+    gap();
+    const float PI = 3.14159265f;
+    if (btn("Front", "Front view")) Viewer::focusBody(0, 0.05f);
+    if (btn("Back", "Back view")) Viewer::focusBody(PI, 0.05f);
+    if (btn("Left", "Left side")) Viewer::focusBody(PI / 2, 0.05f);
+    if (btn("Right", "Right side")) Viewer::focusBody(-PI / 2, 0.05f);
+    if (btn("Top", "From above")) Viewer::focusBody(0, 1.5f);
+    if (btn("Under", "From below")) Viewer::focusBody(0, -1.5f);
+    if (btn("Face", "The face, close")) lookFor("faceCamera");
+    if (btn("Home", "The whole person, from the front")) Viewer::focusBody(0, 0.05f);
+    gap();
+    if (btn("Shot", "Save a picture of the view")) {
+        const std::string p = fileDialog(true, L"PNG\0*.png\0\0", L"png", homeDir() + "\\screenshot.png");
+        if (!p.empty()) { wantThumb = true; thumbPath = p; }
+    }
+    ImGui::End();
+    ImGui::PopStyleColor(); ImGui::PopStyleVar();
+}
+
+// ---------- the categories without their own code yet show what's coming, honestly ----------
+static void notYet(const char* what) {
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextDisabled("%s", what);
+    ImGui::PopTextWrapPos();
 }
 
 static void frame() {
     ImGuiIO& io = ImGui::GetIO();
     const float W = io.DisplaySize.x, H = io.DisplaySize.y;
-    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z) && !undo.empty() && !io.WantTextInput) { restore(undo.back().first); undo.pop_back(); }
-    float top = 0;
-    if (ImGui::BeginMainMenuBar()) {
-        if (ImGui::BeginMenu("File")) {
-            if (ImGui::MenuItem("New person")) { remember("New"); Human::resetAll(body); dirty = true; }
-            if (ImGui::MenuItem("Open (MakeHuman .mhm)...")) {
-                const std::string p = fileDialog(false, L"MakeHuman model\0*.mhm\0\0", L"mhm", homeDir() + "\\");
-                std::string err;
-                if (!p.empty()) { remember("Open"); if (Human::loadMhm(body, p, err)) { dirty = true; say("Opened " + fs::u8path(p).filename().u8string()); } else say(err); }
-            }
-            if (ImGui::MenuItem("Save (MakeHuman .mhm)...")) {
-                const std::string p = fileDialog(true, L"MakeHuman model\0*.mhm\0\0", L"mhm", homeDir() + "\\person.mhm");
-                std::string err;
-                if (!p.empty()) say(Human::saveMhm(body, p, fs::u8path(p).stem().u8string(), err) ? "Saved (MakeHuman opens it too)" : err);
-            }
-            ImGui::Separator();
-            auto exportAs = [&](const wchar_t* filter, const wchar_t* ext, const char* name, int kind) {
-                const std::string p = fileDialog(true, filter, ext, homeDir() + "\\" + name);
-                if (p.empty()) return;
-                std::string err;
-                const Mesh m = toMesh();
-                const bool ok = kind == 0 ? saveGlb(m, p, exportScale, false, err) : kind == 1 ? saveObj(m, p, exportScale, false, err) : saveStl(m, p, exportScale, false, err);
-                say(ok ? "Saved " + fs::u8path(p).filename().u8string() : err);
-            };
-            if (ImGui::MenuItem("Export GLB (any 3D app)...")) exportAs(L"GLB\0*.glb\0\0", L"glb", "person.glb", 0);
-            if (ImGui::MenuItem("Export OBJ...")) exportAs(L"OBJ\0*.obj\0\0", L"obj", "person.obj", 1);
-            if (ImGui::MenuItem("Export STL (3D printing)...")) exportAs(L"STL\0*.stl\0\0", L"stl", "person.stl", 2);
-            if (ImGui::BeginMenu("Export size")) {
-                if (ImGui::MenuItem("Metres (Blender, game engines)", nullptr, exportScale == 0.1f)) exportScale = 0.1f;
-                if (ImGui::MenuItem("Decimetres (MakeHuman's own)", nullptr, exportScale == 1.0f)) exportScale = 1.0f;
-                if (ImGui::MenuItem("Centimetres", nullptr, exportScale == 10.0f)) exportScale = 10.0f;
-                if (ImGui::MenuItem("Millimetres (3D printing)", nullptr, exportScale == 100.0f)) exportScale = 100.0f;
-                ImGui::EndMenu();
-            }
-            ImGui::Separator();
-            if (ImGui::MenuItem("Quit")) quit = true;
-            ImGui::EndMenu();
-        }
-        if (ImGui::BeginMenu("View")) {
-            Viewer::Look& lk = Viewer::look();
-            if (ImGui::MenuItem("Front")) Viewer::camera(Viewer::CAM_FRONT);
-            if (ImGui::MenuItem("Side")) Viewer::camera(Viewer::CAM_SIDE);
-            if (ImGui::MenuItem("Back")) Viewer::camera(Viewer::CAM_BACK);
-            if (ImGui::MenuItem("Face")) Viewer::camera(Viewer::CAM_FACE);
-            if (ImGui::MenuItem("Face, side")) Viewer::camera(Viewer::CAM_FACE_SIDE);
-            ImGui::Separator();
-            ImGui::MenuItem("Skin (else clay)", nullptr, nullptr);
-            if (ImGui::MenuItem("Clay", nullptr, lk.shading == 1)) lk.shading = lk.shading == 1 ? 0 : 1;
-            ImGui::MenuItem("Wireframe", nullptr, &lk.wire);
-            ImGui::MenuItem("Floor", nullptr, &lk.grid);
-            ImGui::EndMenu();
-        }
-        top = ImGui::GetWindowSize().y;
-        ImGui::EndMainMenuBar();
+    if (!io.WantTextInput) {
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z) && !undo.empty()) { redo.push_back({snapshot(), undo.back().second}); restore(undo.back().first); undo.pop_back(); }
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y) && !redo.empty()) { undo.push_back({snapshot(), redo.back().second}); restore(redo.back().first); redo.pop_back(); }
     }
-    const float statusH = 26, leftW = 360, rightW = 400;
+    // the category tabs along the top, then the category's own tabs
     const ImGuiWindowFlags fixed = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus;
-    ImGui::SetNextWindowPos(ImVec2(0, top)); ImGui::SetNextWindowSize(ImVec2(leftW, H - top - statusH));
-    ImGui::Begin("left", nullptr, fixed);
-    if (!loadErr.empty()) { ImGui::PushTextWrapPos(leftW - 20); ImGui::TextColored(col4(C_PINK), "%s", loadErr.c_str()); ImGui::PopTextWrapPos(); }
-    else leftPanel(leftW - 28);
-    ImGui::End();
-
-    // the sliders by MakeHuman's tabs, on the right
-    ImGui::SetNextWindowPos(ImVec2(W - rightW, top)); ImGui::SetNextWindowSize(ImVec2(rightW, H - top - statusH));
-    ImGui::Begin("right", nullptr, fixed);
-    ImGui::SetNextItemWidth(rightW - 28);
-    ImGui::InputTextWithHint("##search", "find a slider (nose, ear, hip...)", search, sizeof search);
-    if (ImGui::BeginTabBar("tabs", ImGuiTabBarFlags_FittingPolicyScroll)) {
-        for (int k = 0; k < (int)body.tabs.size(); ++k) {
-            const auto& t = body.tabs[k];
-            if (t.name == "Macro modelling") continue;   // those are the MAIN sliders on the left
-            if (ImGui::BeginTabItem(t.name.c_str(), nullptr, forcedTab == k ? ImGuiTabItemFlags_SetSelected : 0)) {
-                tab = k;
-                ImGui::BeginChild("sliders");
-                tabPanel(t, rightW - 40);
-                ImGui::EndChild();
-                ImGui::EndTabItem();
-            }
-        }
+    ImGui::SetNextWindowPos(ImVec2(0, 0)); ImGui::SetNextWindowSize(ImVec2(W, 66));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8, 4));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, col4(C_BG));
+    ImGui::Begin("cats", nullptr, fixed);
+    if (ImGui::BeginTabBar("catbar")) {
+        for (int c = 0; c < CAT_COUNT; ++c) if (ImGui::BeginTabItem(CAT_NAMES[c], nullptr, forcedTab == c ? ImGuiTabItemFlags_SetSelected : 0)) { cat = c; ImGui::EndTabItem(); }
         forcedTab = -1;
         ImGui::EndTabBar();
     }
+    if (ImGui::BeginTabBar("taskbar")) {
+        for (const auto& t : tasksOf(cat)) if (ImGui::BeginTabItem(t.c_str(), nullptr, forcedTask == t ? ImGuiTabItemFlags_SetSelected : 0)) {
+            if (task[cat] != t) { task[cat] = t; if (cat == CAT_MODELLING && t == "Face") lookFor("faceCamera"); }
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+        if (!forcedTask.empty() && task[cat] == forcedTask) forcedTask.clear();
+    }
+    ImGui::End();
+    ImGui::PopStyleColor(); ImGui::PopStyleVar();
+    const float top = 66, statusH = 26, sideW = 340;
+    toolbar(sideW, top, W - 2 * sideW);
+
+    // the left and right panels
+    ImGui::SetNextWindowPos(ImVec2(0, top)); ImGui::SetNextWindowSize(ImVec2(sideW, H - top - statusH));
+    ImGui::Begin("left", nullptr, fixed);
+    const float lw = sideW - 28;
+    const std::string& t = task[cat];
+    if (!loadErr.empty()) { ImGui::PushTextWrapPos(lw); ImGui::TextColored(col4(C_PINK), "%s", loadErr.c_str()); ImGui::PopTextWrapPos(); }
+    else if (cat == CAT_MODELLING) {
+        if (t == "Main") { groupBox("Macros"); macroSliders(lw); }
+        else if (t == "Random") randomLeft(lw);
+        else if (t == "Custom") { groupBox("Custom targets"); notYet(("Put your own .target files in " + homeDir() + "\\custom and they appear here as sliders.").c_str()); }
+        else if (const Human::Tab* tb = tabNamed(t)) modTabLeft(*tb, lw);
+    } else if (cat == CAT_FILES) filesLeft(lw);
+    else if (cat == CAT_SETTINGS) {
+        if (t == "Sliders") {
+            groupBox("Slider behaviour");
+            ImGui::Checkbox("Update in real time", &prefs.realtime);
+            ImGui::Checkbox("Camera follows the slider", &prefs.camFollows);
+            groupBox("Slider appearance");
+            ImGui::Checkbox("Show slider values", &prefs.showValues);
+            ImGui::Checkbox("Show slider images", &prefs.sliderImages);
+        } else if (t == "General") {
+            groupBox("Units");
+            int u = prefs.metric ? 0 : 1;
+            if (ImGui::RadioButton("Metric (cm)", &u, 0)) prefs.metric = true;
+            if (ImGui::RadioButton("Imperial (in)", &u, 1)) prefs.metric = false;
+            groupBox("Models folder");
+            ImGui::TextWrapped("%s", homeDir().c_str());
+        } else if (t == "Mouse") {
+            groupBox("Camera");
+            ImGui::TextWrapped("Left drag: turn. Right or middle drag: move. Wheel: zoom.");
+        } else {
+            groupBox("Shortcuts");
+            ImGui::TextUnformatted("Ctrl+Z  Undo\nCtrl+Y  Redo");
+        }
+    } else if (cat == CAT_UTILITIES) {
+        if (t == "Describe") {
+            groupBox("Describe the person");
+            ImGui::SetNextItemWidth(lw);
+            const bool enter = ImGui::InputTextWithHint("##prompt", "a tall, muscular old woman with a big nose", prompt, sizeof prompt, ImGuiInputTextFlags_EnterReturnsTrue);
+            if (ImGui::Button("Make them", ImVec2(lw, 0)) || enter) { remember("Describe"); redo.clear(); understood = Human::describe(body, prompt); if (understood.empty()) understood = "(no words it knows)"; dirty = true; }
+            if (!understood.empty()) { ImGui::PushTextWrapPos(lw); ImGui::TextDisabled("%s", understood.c_str()); ImGui::PopTextWrapPos(); }
+        } else if (t == "Symmetry") {
+            groupBox("Symmetry");
+            if (ImGui::Button("Right to left", ImVec2(lw, 0))) symmetry(true);
+            if (ImGui::Button("Left to right", ImVec2(lw, 0))) symmetry(false);
+            ImGui::Checkbox("Symmetric modelling", &body.symmetry);
+        } else statistics();
+    } else if (cat == CAT_HELP) {
+        if (t == "About") { groupBox("Pygmalion " PYGMALION_VERSION); ImGui::TextWrapped("People in 3D with sliders: MakeHuman, remade in C++ by Cursed Entertainment. Farica\xe2\x98\x86Kimora \xc2\xa9 Cursed Entertainment."); }
+        else { groupBox("Licence"); ImGui::TextWrapped("The code is AGPL-3.0 (it ports MakeHuman's code). The body, its shapes and the assets are MakeHuman's, CC0."); }
+    } else if (cat == CAT_GEOMETRIES || cat == CAT_MATERIALS) notYet("Clothes, hair, eyebrows, eyelashes, teeth, tongue, topologies, skins and eye colours come with MakeHuman's asset pack: this tab is being built.");
+    else if (cat == CAT_POSE) notYet("The skeleton, poses and face expressions: this tab is being built.");
+    else notYet("Rendering: this tab is being built.");
     ImGui::End();
 
-    // the body in the middle
-    ImGui::SetNextWindowPos(ImVec2(leftW, top)); ImGui::SetNextWindowSize(ImVec2(W - leftW - rightW, H - top - statusH));
+    ImGui::SetNextWindowPos(ImVec2(W - sideW, top)); ImGui::SetNextWindowSize(ImVec2(sideW, H - top - statusH));
+    ImGui::Begin("right", nullptr, fixed);
+    if (loadErr.empty()) {
+        if (cat == CAT_MODELLING) {
+            if (t == "Measure") { if (const Human::Tab* tb = tabNamed(t)) modTabRight(*tb); statistics(); }
+            else if (t != "Main" && t != "Random" && t != "Custom") { if (const Human::Tab* tb = tabNamed(t)) modTabRight(*tb); }
+            else if (t == "Main") statistics();
+        } else if (cat == CAT_FILES) filesRight();
+    }
+    ImGui::End();
+
+    // the person in the middle
+    ImGui::SetNextWindowPos(ImVec2(sideW, top + 34)); ImGui::SetNextWindowSize(ImVec2(W - 2 * sideW, H - top - 34 - statusH));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::Begin("view", nullptr, fixed);
     if (dirty && loadErr.empty()) { Human::apply(body); Viewer::update(body); dirty = false; }
     const ImVec2 a = ImGui::GetCursorScreenPos(), size = ImGui::GetContentRegionAvail();
     ImGui::InvisibleButton("v", size, ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight | ImGuiButtonFlags_MouseButtonMiddle);
     const unsigned tex = Viewer::render((int)size.x, (int)size.y, ImGui::IsItemHovered() || ImGui::IsItemActive());
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddImage((ImTextureID)(intptr_t)tex, a, ImVec2(a.x + size.x, a.y + size.y), ImVec2(0, 1), ImVec2(1, 0));
-    // quick views along the top
-    ImGui::SetCursorScreenPos(ImVec2(a.x + 10, a.y + 10));
-    const char* views[] = {"Front", "Side", "Back", "Face", "Face side"};
-    for (int k = 0; k < 5; ++k) { if (k) ImGui::SameLine(0, 4); if (ImGui::SmallButton(views[k])) Viewer::camera(k); }
-    char info[128]; snprintf(info, sizeof info, "%.0f cm, %.0f years", Human::heightCm(body), Human::ageYears(body));
-    dl->AddText(ImVec2(a.x + 12, a.y + size.y - 26), C_DIM, info);
+    ImGui::GetWindowDrawList()->AddImage((ImTextureID)(intptr_t)tex, a, ImVec2(a.x + size.x, a.y + size.y), ImVec2(0, 1), ImVec2(1, 0));
+    if (wantThumb) {   // a picture of the view: the .thumb beside a saved model, or a screenshot
+        std::vector<unsigned char> px; int w, h; Viewer::readPixels(px, w, h);
+        if (!px.empty()) stbi_write_png(fs::u8path(thumbPath).string().c_str(), w, h, 4, px.data(), w * 4);
+        pics.erase(thumbPath);
+        wantThumb = false;
+    }
     ImGui::End();
     ImGui::PopStyleVar();
 
@@ -385,7 +654,7 @@ static void frame() {
     ImGui::PushStyleColor(ImGuiCol_WindowBg, col4(C_BG));
     ImGui::Begin("status", nullptr, fixed);
     if (now() < toastUntil) ImGui::TextColored(col4(C_PINK), "%s", toast.c_str());
-    else ImGui::TextDisabled("Drag to turn, right-drag to move up and down, wheel to zoom. Right-click a slider to reset it.");
+    else ImGui::TextDisabled("%s, %.0f years. Drag to turn, right-drag to move, wheel to zoom; right-click a slider to reset it.", units(Human::heightCm(body)).c_str(), Human::ageYears(body));
     ImGui::End();
     ImGui::PopStyleColor(); ImGui::PopStyleVar();
 }
@@ -409,6 +678,7 @@ int main(int argc, char** argv) {
         if (args[i] == "--capture" && i + 1 < args.size()) capture = args[++i];
         else if (args[i] == "--describe" && i + 1 < args.size()) describeWords = args[++i];
         else if (args[i] == "--tab" && i + 1 < args.size()) forcedTab = atoi(args[++i].c_str());
+        else if (args[i] == "--task" && i + 1 < args.size()) forcedTask = args[++i];
         else file = args[i];
     }
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) return 1;
@@ -470,6 +740,7 @@ int main(int argc, char** argv) {
         ImGui_ImplSDL2_InitForOpenGL(window, gl);
     } else while (!ready) SDL_Delay(10);
     Viewer::init(dataDir);
+    category.clear();
     if (!file.empty()) { std::string err; if (!Human::loadMhm(body, file, err)) say(err); }
     if (!describeWords.empty()) { snprintf(prompt, sizeof prompt, "%s", describeWords.c_str()); understood = Human::describe(body, describeWords); }
     dirty = true;

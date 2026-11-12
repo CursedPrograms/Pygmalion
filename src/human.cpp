@@ -62,6 +62,9 @@ static bool loadBase(Body& b, const fs::path& obj, std::string& err) {
             group = line.substr(2); while (!group.empty() && (group.back() == '\r' || group.back() == ' ')) group.pop_back();
             // the helpers (tights, skirt, hair and joint markers) are there for fitting clothes and bones: not shown
             visible = group.rfind("helper-", 0) != 0 && group.rfind("joint-", 0) != 0;
+        } else if (line[0] == 'f' && line[1] == ' ' && group.rfind("joint-", 0) == 0) {
+            std::istringstream ls(line.substr(2)); std::string c;
+            while (ls >> c) { const int a = atoi(c.c_str()) - 1; if (a >= 0) b.joints[group].push_back(a); }
         } else if (line[0] == 'f' && line[1] == ' ' && visible) {
             std::vector<int> v, vt;
             std::istringstream ls(line.substr(2));
@@ -124,13 +127,15 @@ static void addTarget(Body& b, const fs::path& file, const fs::path& root) {
 }
 
 // ---------- the modifiers (modifiers/*_modifiers.json) and their sliders (*_sliders.json) ----------
-static std::string niceLabel(const std::string& name) {
-    // "head-oval" -> "Head oval"; "nose-trans-down|up" -> "Nose trans down / up"
-    std::string s = name;
-    for (auto& c : s) if (c == '-') c = ' ';
+// MakeHuman's own rule (modifierslider.py): the name's words, without the last if it holds the "|" choices and
+// without the group's name when it starts with it, each capitalised
+static std::string niceLabel(const std::string& group, const std::string& name) {
+    std::vector<std::string> w; std::stringstream ss(name); std::string p;
+    while (std::getline(ss, p, '-')) w.push_back(p);
+    if (!w.empty() && w.back().find('|') != std::string::npos) w.pop_back();
+    if (w.size() > 1 && w[0] == group) w.erase(w.begin());
     std::string r;
-    for (char c : s) { if (c == '|') r += " / "; else r += c; }
-    if (!r.empty()) r[0] = (char)toupper((unsigned char)r[0]);
+    for (auto& x : w) { if (x.empty()) continue; x[0] = (char)toupper((unsigned char)x[0]); r += (r.empty() ? "" : " ") + x; }
     return r;
 }
 
@@ -166,7 +171,7 @@ static void loadModifiers(Body& b, const fs::path& file) {
             }
             if (const Json::Value* dv = m.get("defaultValue")) mod.defaultValue = (float)dv->n;
             mod.value = mod.defaultValue;
-            mod.label = niceLabel(mod.macro ? mod.variable : mod.name);
+            mod.label = mod.macro ? mod.variable : niceLabel(group, mod.name);
             auto it = desc.find(mod.fullName());
             if (it != desc.end()) mod.description = it->second;
             b.modByName[mod.fullName()] = (int)b.mods.size();
@@ -191,6 +196,7 @@ static void loadSliders(Body& b, const fs::path& file) {
                 auto it = b.modByName.find(s.str("mod"));
                 if (it == b.modByName.end()) continue;
                 if (s.get("label")) b.mods[it->second].label = s.str("label");
+                if (s.get("cam")) b.mods[it->second].cam = s.str("cam");
                 sg.mods.push_back(it->second);
             }
             if (!sg.mods.empty()) tb.groups.push_back(sg);
@@ -283,10 +289,23 @@ bool load(Body& b, const std::string& data, std::string& err, void (*progress)(f
         if (progress && i % 50 == 0) progress(0.1f + 0.75f * i / files.size(), "Loading the shapes...");
     }
     if (b.targets.empty()) { err = "No shapes found in " + (root / "targets").u8string(); return false; }
+    std::map<std::string, std::string> images;
+    for (const auto& e : fs::recursive_directory_iterator(root / "targets", ec))
+        if (e.is_regular_file() && e.path().extension() == ".png") {
+            std::string n = e.path().filename().u8string();
+            for (auto& c : n) c = (char)tolower((unsigned char)c);
+            images[n] = e.path().u8string();
+        }
     if (progress) progress(0.88f, "Loading the sliders...");
     for (const char* f : {"modeling_modifiers.json", "measurement_modifiers.json", "bodyshapes_modifiers.json"}) loadModifiers(b, root / "modifiers" / f);
     for (const char* f : {"modeling_sliders.json", "measurement_sliders.json", "bodyshapes_sliders.json"}) loadSliders(b, root / "modifiers" / f);
     std::stable_sort(b.tabs.begin(), b.tabs.end(), [](const Tab& a, const Tab& c) { return a.order < c.order; });
+    for (auto& m : b.mods) {
+        std::string n = m.name;
+        for (auto& c : n) { if (c == '|') c = '-'; c = (char)tolower((unsigned char)c); }
+        auto it = images.find(n + ".png");
+        if (it != images.end()) m.image = it->second;
+    }
     if (progress) progress(0.94f, "Fitting the eyes...");
     loadProxy(b, root / "eyes" / "high-poly" / "high-poly.mhclo");
     b.val.assign(V_COUNT, 0);
@@ -407,6 +426,54 @@ void fitProxy(const Body& b, const Proxy& p, std::vector<float>& out) {
             for (int k = 0; k < 3; ++k) s += p.w[i * 3 + k] * b.pos[(size_t)p.ref[i * 3 + k] * 3 + a];
             out[i * 3 + a] = s + p.off[i * 3 + a] * scale[a];
         }
+}
+
+// MakeHuman's rulers (plugins/0_modeling_a_measurement.py): vertex paths measured along the body
+static const std::pair<const char*, std::vector<int>> RULERS[] = {
+    {"measure/measure-neck-circ-decr|incr", {7514,10358,7631,7496,7488,7489,7474,7475,7531,7537,7543,7549,7555,7561,7743,7722,856,1030,1051,850,844,838,832,826,820,756,755,770,769,777,929,3690,804,800,808,801,799,803,7513,7515,7521,7514}},
+    {"measure/measure-neck-height-decr|incr", {853,854,855,856,857,858,1496,1491}},
+    {"measure/measure-upperarm-circ-decr|incr", {8383,8393,8392,8391,8390,8394,8395,8399,10455,10516,8396,8397,8398,8388,8387,8386,10431,8385,8384,8389}},
+    {"measure/measure-upperarm-length-decr|incr", {8274,10037}},
+    {"measure/measure-lowerarm-length-decr|incr", {10040,10548}},
+    {"measure/measure-wrist-circ-decr|incr", {10208,10211,10212,10216,10471,10533,10213,10214,10215,10205,10204,10203,10437,10202,10201,10206,10200,10210,10209,10208}},
+    {"measure/measure-frontchest-dist-decr|incr", {1437,8125}},
+    {"measure/measure-bust-circ-decr|incr", {8439,8455,8462,8446,8478,8494,8557,8510,8526,8542,10720,10601,10603,10602,10612,10611,10610,10613,10604,10605,10606,3942,3941,3940,3950,3947,3948,3949,3938,3939,3937,4065,1870,1854,1838,1885,1822,1806,1774,1790,1783,1767,1799,8471}},
+    {"measure/measure-underbust-circ-decr|incr", {10750,10744,10724,10725,10748,10722,10640,10642,10641,10651,10650,10649,10652,10643,10644,10645,10646,10647,10648,3988,3987,3986,3985,3984,3983,3982,3992,3989,3990,3991,3980,3981,3979,4067,4098,4073,4072,4094,4100,4082,4088,4088}},
+    {"measure/measure-waist-circ-decr|incr", {4121,10760,10757,10777,10776,10779,10780,10778,10781,10771,10773,10772,10775,10774,10814,10834,10816,10817,10818,10819,10820,10821,4181,4180,4179,4178,4177,4176,4175,4196,4173,4131,4132,4129,4130,4128,4138,4135,4137,4136,4133,4134,4108,4113,4118,4121}},
+    {"measure/measure-napetowaist-dist-decr|incr", {1491,4181}},
+    {"measure/measure-waisttohip-dist-decr|incr", {4121,4341}},
+    {"measure/measure-shoulder-dist-decr|incr", {7478,8274}},
+    {"measure/measure-hips-circ-decr|incr", {4341,10968,10969,10971,10970,10967,10928,10927,10925,10926,10923,10924,10868,10875,10861,10862,4228,4227,4226,4242,4234,4294,4293,4296,4295,4297,4298,4342,4345,4346,4344,4343,4361,4341}},
+    {"measure/measure-upperleg-height-decr|incr", {10970,11230}},
+    {"measure/measure-thigh-circ-decr|incr", {11071,11080,11081,11086,11076,11077,11074,11075,11072,11073,11069,11070,11087,11085,11084,12994,11083,11082,11079,11071}},
+    {"measure/measure-lowerleg-height-decr|incr", {11225,12820}},
+    {"measure/measure-calf-circ-decr|incr", {11339,11336,11353,11351,11350,13008,11349,11348,11345,11337,11344,11346,11347,11352,11342,11343,11340,11341,11338,11339}},
+    {"measure/measure-ankle-circ-decr|incr", {11460,11464,11458,11459,11419,11418,12958,12965,12960,12963,12961,12962,12964,12927,13028,12957,11463,11461,11457,11460}},
+    {"measure/measure-knee-circ-decr|incr", {11223,11230,11232,11233,11238,11228,11229,11226,11227,11224,11225,11221,11222,11239,11237,11236,13002,11235,11234,11223}},
+};
+
+float measureCm(const Body& b, const std::string& name) {
+    for (const auto& r : RULERS) {
+        if (name != r.first) continue;
+        float m = 0;
+        int a = r.second[0];
+        for (int v : r.second) {
+            const float* p = &b.pos[(size_t)a * 3]; const float* q = &b.pos[(size_t)v * 3];
+            m += std::sqrt((p[0] - q[0]) * (p[0] - q[0]) + (p[1] - q[1]) * (p[1] - q[1]) + (p[2] - q[2]) * (p[2] - q[2]));
+            a = v;
+        }
+        return m * 10;   // decimetres to centimetres
+    }
+    return -1;
+}
+
+bool jointPos(const Body& b, const std::string& joint, float out[3]) {
+    auto it = b.joints.find(joint);
+    if (it == b.joints.end() || it->second.empty()) return false;
+    out[0] = out[1] = out[2] = 0;
+    for (int v : it->second) for (int c = 0; c < 3; ++c) out[c] += b.pos[(size_t)v * 3 + c];
+    for (int c = 0; c < 3; ++c) out[c] /= it->second.size();
+    return true;
 }
 
 float ageYears(const Body& b) {

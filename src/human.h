@@ -23,7 +23,9 @@ struct Target {
 
 struct Modifier {
     std::string group, name;             // "nose", "nose-trans-down|up": shown as group/name, MakeHuman's own
-    std::string label, description;      // for the window
+    std::string label, description;      // for the window (MakeHuman's own label rule, or the sliders file's)
+    std::string image;                   // its picture (targets/*/images), "" if none
+    std::string cam;                     // the view MakeHuman turns to while it's moved (frontView, leftView, faceCamera...)
     bool macro = false;                  // a macro variable (Gender, Age...) rather than targets of its own
     std::string variable;                // the macro's variable: "Gender", "Age", "African"...
     std::string left, right, center;     // target groups at -1, +1 and 0 (left/center empty: 0..1 only)
@@ -51,6 +53,7 @@ struct Body {
     std::vector<float> base, pos;        // 3 floats a vertex: as made, as shaped now
     std::vector<float> uv;               // 2 floats a uv
     std::vector<int> tri, triUv;         // the visible body's triangles (helpers left out), and their uvs
+    std::map<std::string, std::vector<int>> joints;   // the joint markers ("joint-l-hand"...): their vertices
     // targets and modifiers
     std::vector<Target> targets;
     std::map<std::string, std::vector<int>> groupTargets;
@@ -79,7 +82,10 @@ void apply(Body& b);                     // brings pos up to date (only the targ
 void fitProxy(const Body& b, const Proxy& p, std::vector<float>& out);
 
 float ageYears(const Body& b);
-float heightCm(const Body& b);           // measured on the shaped mesh
+float heightCm(const Body& b);
+bool jointPos(const Body& b, const std::string& joint, float out[3]);   // the middle of a joint marker, as shaped now
+// a MakeHuman ruler ("measure/measure-waist-circ-decr|incr"...) in cm; -1 if there's no such ruler
+float measureCm(const Body& b, const std::string& name);           // measured on the shaped mesh
 
 // MakeHuman's own .mhm files ("modifier macrodetails/Gender 0.500000"), so models go both ways
 bool saveMhm(const Body& b, const std::string& path, const std::string& name, std::string& err);

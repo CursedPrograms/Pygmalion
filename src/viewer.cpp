@@ -79,7 +79,8 @@ static GLuint gridVao = 0, gridVbo = 0; static int gridCount = 0;
 static GLuint lit[3] = {0, 0, 0}, litEye = 0, eyeTex = 0;
 static GLuint fbo = 0, fboTex = 0, fboDepth = 0; static int fbW = 0, fbH = 0;
 static float eth[3] = {1 / 3.0f, 1 / 3.0f, 1 / 3.0f};
-static float target[3] = {0, 8.5f, 0}, height = 17;
+static float target[3] = {0, 8.5f, 0}, height = 17, bodyMid = 8.5f;
+static bool framed = false;
 
 static GLuint texture(const std::string& path) {
     int w, h, n;
@@ -118,9 +119,11 @@ uniform sampler2D litA, litB, litC, eyeTex; uniform vec3 eth; uniform int mode; 
 void main() {
   vec3 n = normalize(N); if (!gl_FrontFacing) n = -n;
   vec2 uv = n.xy * 0.495 + 0.5;                          // MakeHuman's litsphere lookup
-  if (mode == 1) {                                       // the eyes: their picture, lit by the eye's sphere
-    vec3 c = texture(eyeTex, T).rgb;
-    o = vec4(c * mix(1.0, texture(litA, uv).r * 1.6, light * 0.5), 1);
+  if (mode == 1) {                                       // the eyes: their picture; the cornea's clear parts let the iris show
+    vec4 c = texture(eyeTex, T);
+    if (c.a < 0.35) discard;
+    vec3 shine = texture(litA, uv).rgb;                  // MakeHuman's eye litsphere, added at half strength
+    o = vec4(c.rgb * 0.8 + shine * 0.5 * 0.35, 1);
     return;
   }
   if (mode == 2) { float d = max(n.z, 0.0); o = vec4(vec3(0.78, 0.76, 0.74) * (0.25 + 0.8 * d), 1); return; }   // clay
@@ -191,20 +194,20 @@ void update(const Human::Body& b) {
     // the height (for framing): MakeHuman's units are decimetres
     float lo = 1e30f, hi = -1e30f;
     for (int v : b.tri) { lo = std::min(lo, b.pos[(size_t)v * 3 + 1]); hi = std::max(hi, b.pos[(size_t)v * 3 + 1]); }
-    height = hi - lo; target[1] = (hi + lo) / 2;
-    if (lk.dist <= 0) lk.dist = height * 1.7f;
+    height = hi - lo; bodyMid = (hi + lo) / 2;
+    if (!framed) { target[1] = bodyMid; lk.dist = height * 1.7f; framed = true; }
     glBindVertexArray_(0);
 }
 
-void camera(int which) {
-    switch (which) {
-    case CAM_FRONT: lk.yaw = 0; lk.pitch = 0.05f; lk.dist = height * 1.7f; target[1] = height * 0.5f + (target[1] - height * 0.5f) * 0; break;
-    case CAM_SIDE: lk.yaw = 1.5708f; lk.pitch = 0.05f; lk.dist = height * 1.7f; break;
-    case CAM_BACK: lk.yaw = 3.1416f; lk.pitch = 0.05f; lk.dist = height * 1.7f; break;
-    case CAM_FACE: lk.yaw = 0; lk.pitch = 0; lk.dist = height * 0.35f; break;
-    case CAM_FACE_SIDE: lk.yaw = 1.5708f; lk.pitch = 0; lk.dist = height * 0.35f; break;
-    }
+void focus(const float at[3], float dist, float yaw, float pitch) {
+    for (int c = 0; c < 3; ++c) target[c] = at[c];
+    lk.dist = dist; lk.yaw = yaw; lk.pitch = pitch;
 }
+void focusBody(float yaw, float pitch) {
+    target[0] = 0; target[1] = bodyMid; target[2] = 0;
+    lk.dist = height * 1.7f; lk.yaw = yaw; lk.pitch = pitch;
+}
+float bodyHeight() { return height; }
 
 static void mul(const float* a, const float* b, float* o) {
     float r[16];
@@ -217,12 +220,13 @@ unsigned render(int w, int h, bool hovered) {
     ImGuiIO& io = ImGui::GetIO();
     if (hovered) {
         if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) { lk.yaw -= io.MouseDelta.x * 0.008f; lk.pitch = std::clamp(lk.pitch + io.MouseDelta.y * 0.006f, -1.4f, 1.4f); }
-        if (ImGui::IsMouseDragging(ImGuiMouseButton_Right) || ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) target[1] += io.MouseDelta.y * lk.dist * 0.0015f;
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Right) || ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
+            const float k = lk.dist * 0.0015f, cy = std::cos(lk.yaw), sy = std::sin(lk.yaw);
+            target[0] -= io.MouseDelta.x * k * cy; target[2] += io.MouseDelta.x * k * sy; target[1] += io.MouseDelta.y * k;
+        }
         if (io.MouseWheel != 0) lk.dist = std::clamp(lk.dist * std::pow(0.88f, io.MouseWheel), height * 0.12f, height * 6);
     }
-    // where the face is: near the top (the zoomed views look at it)
-    const bool close = lk.dist < height * 0.6f;
-    const float ty = close ? target[1] + height * 0.42f : target[1];
+    const float ty = target[1];
     if (w != fbW || h != fbH) {
         if (!fbo) { glGenFramebuffers_(1, &fbo); glGenTextures(1, &fboTex); glGenRenderbuffers_(1, &fboDepth); }
         glBindTexture(GL_TEXTURE_2D, fboTex);
@@ -255,7 +259,7 @@ unsigned render(int w, int h, bool hovered) {
     // the floor
     if (lk.grid) {
         std::vector<float> g;
-        const float y = target[1] - height / 2;
+        const float y = bodyMid - height / 2;
         for (int i = -10; i <= 10; ++i) g.insert(g.end(), {i * 1.0f, y, -10, i * 1.0f, y, 10, -10, y, i * 1.0f, 10, y, i * 1.0f});
         glBindVertexArray_(gridVao); glBindBuffer_(GL_ARRAY_BUFFER, gridVbo);
         glBufferData_(GL_ARRAY_BUFFER, (GLsizeiptr)(g.size() * 4), g.data(), GL_DYNAMIC_DRAW);

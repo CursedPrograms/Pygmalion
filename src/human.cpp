@@ -223,6 +223,11 @@ static void loadModifiers(Body& b, const fs::path& file) {
     }
 }
 
+bool hasGenitals(const Body& b) {
+    for (const auto& p : b.proxies) if (p.kind == "proxymeshes") for (const auto& t : p.tags) if (t == "genitals") return true;
+    return false;
+}
+
 static void loadSliders(Body& b, const fs::path& file) {
     std::string t;
     if (!readAll(file, t)) return;
@@ -240,6 +245,7 @@ static void loadSliders(Body& b, const fs::path& file) {
                 if (it == b.modByName.end()) continue;
                 if (s.get("label")) b.mods[it->second].label = s.str("label");
                 if (s.get("cam")) b.mods[it->second].cam = s.str("cam");
+                if (s.get("enabledCondition")) b.mods[it->second].enabledCondition = s.str("enabledCondition");
                 sg.mods.push_back(it->second);
             }
             if (!sg.mods.empty()) tb.groups.push_back(sg);
@@ -308,6 +314,7 @@ bool loadProxyFile(const std::string& path, Proxy& p, std::string& err) {
         else if (k == "delete_verts") mode = DELETE;
         else if (k == "name") ls >> p.name;
         else if (k == "uuid") ls >> p.uuid;
+        else if (k == "tag") { std::string t; std::getline(ls >> std::ws, t); while (!t.empty() && (t.back() == '' || t.back() == ' ')) t.pop_back(); for (char& c : t) c = (char)tolower((unsigned char)c); if (!t.empty()) p.tags.push_back(t); }
         else if (k == "obj_file") ls >> objFile;
         else if (k == "material") { std::getline(ls >> std::ws, material); }
         else if (k == "z_depth") ls >> p.zDepth;

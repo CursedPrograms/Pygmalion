@@ -59,7 +59,9 @@ MakeHuman's own layout, tab for tab:
 - **Utilities:** Describe ("a tall, muscular old woman with a big nose" sets the sliders), Symmetry, Statistics,
   Material Editor, Expression mixer (save your own mixes as `.mhpose`), Targets, Save targets, Mass produce (hundreds of random people, saved and
   exported), Shell (one command at a time, with history), Scripting (Pygmalion's own commands for every job), Download (MakeHuman's 60+ community asset packs,
-  CC0: clothes, hair, shoes, hats, poses, skins), Data and Logs.
+  CC0 and CC-BY: clothes, hair, shoes, hats, poses, skins; and anything downloaded from MakeHuman's community site,
+  a zip or a folder, installed where it belongs: hair, eyebrows, eyelashes, teeth and the rest are told apart by
+  where they sit on the body), Data and Logs. MakeHuman's own data folder is read too.
 - **The toolbar:** Undo and Redo (shapes, clothes, skin and pose), Reset, Wire, Clay, Floor, Bones, Ortho, Smooth
   (MakeHuman's subdivision), symmetry, and the camera's views.
 - **Settings:** slider behaviour and pictures, units, a background picture to model against, mouse speeds and

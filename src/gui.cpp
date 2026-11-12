@@ -123,9 +123,26 @@ static std::string homeDir() {
     }
     return "";
 }
+// MakeHuman's own user data folder: anything put there (or installed by MakeHuman) shows in Pygmalion too
+static std::string makehumanDataDir() {
+    static std::string found; static bool looked = false;
+    if (looked) return found;
+    looked = true;
+    PWSTR p = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &p))) {
+        const fs::path docs(p); CoTaskMemFree(p);
+        std::error_code ec;
+        for (const char* v : {"makehuman/v1py3/data", "makehuman/v1/data", "makehuman/v2/data"}) {
+            const fs::path d = docs / fs::u8path(v);
+            if (fs::is_directory(d, ec)) { found = d.u8string(); break; }
+        }
+    }
+    return found;
+}
 #else
 static std::string fileDialog(bool, const wchar_t*, const wchar_t*, const std::string&) { return ""; }
 static std::string homeDir() { return "."; }
+static std::string makehumanDataDir() { return ""; }
 #endif
 
 // ---------- state ----------
@@ -336,7 +353,10 @@ static void tip(const std::string& s) { if (!s.empty() && ImGui::IsItemHovered()
 // one slider, MakeHuman's way: its picture beside it, its value on it, right-click resets, the view follows
 static void modSlider(int i, float w, const std::string& tabCam) {
     Human::Modifier& m = body.mods[i];
+    // MakeHuman's condition: the genital sliders work on a topology that has genitals
+    const bool off = m.enabledCondition == "hasGenitals" && !Human::hasGenitals(body);
     ImGui::PushID(i);
+    if (off) ImGui::BeginDisabled();
     const GLuint pic = prefs.sliderImages ? picture(m.image) : 0;
     float sw = w;
     if (pic) { ImGui::Image((ImTextureID)(intptr_t)pic, ImVec2(46, 46)); ImGui::SameLine(); sw = w - 53; ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 12); }
@@ -353,6 +373,7 @@ static void modSlider(int i, float w, const std::string& tabCam) {
     tip(m.description.empty() ? m.label : m.description);
     if (ch) { Human::setModifier(body, i, v); if (prefs.realtime) dirty = true; }
     if (ImGui::IsItemDeactivatedAfterEdit()) dirty = true;
+    if (off) { ImGui::EndDisabled(); if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Wear a topology with genitals first (Geometries > Topologies): MakeHuman's community has them to download."); }
     ImGui::PopID();
 }
 
@@ -379,7 +400,7 @@ static std::string userDataDir() {   // MakeHuman's "data" in the user's own fol
 static std::vector<std::string> filesIn(const std::string& sub, const char* ext) {
     std::vector<std::string> v;
     std::error_code ec;
-    for (const std::string& root : {dataDir, assetsDir(), userDataDir()})
+    for (const std::string& root : {dataDir, assetsDir(), userDataDir(), makehumanDataDir()})
         if (!root.empty())
             for (const auto& e : fs::recursive_directory_iterator(fs::u8path(root) / sub, ec))
                 if (e.is_regular_file() && e.path().extension() == ext) v.push_back(e.path().u8string());
@@ -1255,11 +1276,14 @@ static void massLeftPanel(float lw) {
 }
 
 static bool installPack(const std::string& pack, std::string& err);
+static bool installAsset(const std::string& src, std::string kind, std::string& said, std::string& err);
+static std::string kindOfProxy(const std::string& mhclo);
+extern const char* KINDS[13];
 // Scripting: Pygmalion's own commands, a line each (MakeHuman's is Python; this does the same jobs)
 static char script[8192] = "# a line each; # starts a note\nreset\nmacro Gender 0\nmacro Age 0.4\nmodifier nose/nose-scale-horiz-decr|incr 0.3\nwear hair/bob01/bob01.mhclo\nskin skins/young_caucasian_female/young_caucasian_female.mhmat\nexpression smile01\n";
 static std::string scriptLog;
 static const char* MACRO_NAMES[] = {"Gender", "Age", "Muscle", "Weight", "Height", "BodyProportions", "African", "Asian", "Caucasian", "BreastSize", "BreastFirmness"};
-static const char* COMMANDS = "reset | random 0.5 | describe words\nmacro Gender 0..1 (Age, Muscle, Weight,\n  Height, BodyProportions, African, Asian,\n  Caucasian, BreastSize, BreastFirmness)\nmodifier group/name value\nwear clothes/x/x.mhclo | takeoff hair\nskin skins/x/x.mhmat | skin default\nskeleton game_engine | none\npose standing01 | none\nanimation walk1 | none\nexpression smile01 | none\nbones on | off\nsymmetry on | off\nunits meter (decimeter, centimeter...)\nload file.mhm | save file.mhm\nexport file.fbx (.dae .glb .obj ...)\nrender file.png 1920 1080\nsmooth on | off\nscene studio (makehuman, soft,\n  dramatic, sunset) | scene file.pygscene\n  | scene save file.pygscene\ndownload hair01 (an asset pack)\nget Gender | get group/name (a value)\nlist macros | modifiers | worn | poses\ninfo (the size of everything)";
+static const char* COMMANDS = "reset | random 0.5 | describe words\nmacro Gender 0..1 (Age, Muscle, Weight,\n  Height, BodyProportions, African, Asian,\n  Caucasian, BreastSize, BreastFirmness)\nmodifier group/name value\nwear clothes/x/x.mhclo | takeoff hair\nskin skins/x/x.mhmat | skin default\nskeleton game_engine | none\npose standing01 | none\nanimation walk1 | none\nexpression smile01 | none\nbones on | off\nsymmetry on | off\nunits meter (decimeter, centimeter...)\nload file.mhm | save file.mhm\nexport file.fbx (.dae .glb .obj ...)\nrender file.png 1920 1080\nsmooth on | off\nscene studio (makehuman, soft,\n  dramatic, sunset) | scene file.pygscene\n  | scene save file.pygscene\ndownload hair01 (an asset pack)\ninstall file.zip | folder [clothes, hair...]\nget Gender | get group/name (a value)\nlist macros | modifiers | worn | poses\ninfo (the size of everything)";
 // one command; anything it prints goes to out
 static bool runCommand(const std::string& line, std::string& err, const std::function<void(const std::string&)>& out) {
     std::istringstream ls(line); std::string cmd; ls >> cmd;
@@ -1274,9 +1298,17 @@ static bool runCommand(const std::string& line, std::string& err, const std::fun
     else if (cmd == "wear") { const std::string f = Human::absPath(body, rest); ok = !f.empty() && Human::wear(body, f, err); if (f.empty()) err = "no " + rest; }
     else if (cmd == "takeoff") Human::takeOff(body, rest);
     else if (cmd == "skin") { const std::string f = rest == "default" ? std::string() : Human::absPath(body, rest); ok = Human::setSkin(body, f); }
-    else if (cmd == "skeleton") setSkeletonFile(rest == "none" ? std::string() : findData("rigs/" + rest + (rest.find('.') == std::string::npos ? ".mhskel" : ""), "rigs"));
-    else if (cmd == "pose") setPoseFile(rest == "none" ? std::string() : findData("poses/" + rest + (rest.find('.') == std::string::npos ? ".bvh" : ""), "poses"));
-    else if (cmd == "expression") setExpressionFile(rest == "none" ? std::string() : findData("expressions/" + rest + (rest.find('.') == std::string::npos ? ".mhpose" : ""), "expressions"));
+    else if (cmd == "skeleton" || cmd == "pose" || cmd == "expression") {
+        const std::string sub = cmd == "skeleton" ? "rigs" : cmd == "pose" ? "poses" : "expressions";
+        const std::string ext = cmd == "skeleton" ? ".mhskel" : cmd == "pose" ? ".bvh" : ".mhpose";
+        std::string f;
+        if (rest != "none") {
+            f = findData(sub + "/" + rest + (rest.find('.') == std::string::npos ? ext : ""), sub.c_str());
+            if (f.empty()) for (const auto& c : filesIn(sub, ext.c_str())) if (fs::u8path(c).stem().u8string() == rest) f = c;   // in a folder of its own
+            if (f.empty()) { ok = false; err = "no " + cmd + " " + rest; }
+        }
+        if (ok) { if (cmd == "skeleton") setSkeletonFile(f); else if (cmd == "pose") setPoseFile(f); else setExpressionFile(f); }
+    }
     else if (cmd == "random") { std::random_device rd; Human::randomize(body, rest.empty() ? 0.5f : (float)atof(rest.c_str()), true, true, true, rd()); }
     else if (cmd == "describe") Human::describe(body, rest);
     else if (cmd == "info") {   // the size of everything (for checking scripts)
@@ -1296,6 +1328,12 @@ static bool runCommand(const std::string& line, std::string& err, const std::fun
     else if (cmd == "bones") { showBones = rest != "off"; Viewer::look().bones = showBones; }
     else if (cmd == "smooth") Viewer::look().smooth = rest != "off";
     else if (cmd == "download") ok = installPack(rest, err);
+    else if (cmd == "kindof") out(kindOfProxy(rest));   // what Install would call a .mhclo
+    else if (cmd == "install") {
+        std::string path = rest, kind;
+        for (const char* k : KINDS) { const std::string kk = std::string(" ") + k; if (path.size() > kk.size() && path.compare(path.size() - kk.size(), kk.size(), kk) == 0) { kind = k; path.resize(path.size() - kk.size()); } }
+        std::string said; ok = installAsset(path, kind, said, err); if (ok) out(said);
+    }
     else if (cmd == "animation") {
         if (rest == "none") setAnimation("");
         else { std::string f; for (const auto& c : filesIn("animations", ".bvh")) if (fs::u8path(c).stem().u8string() == rest) f = c; if (f.empty()) { ok = false; err = "no animation " + rest; } else setAnimation(f); }
@@ -1448,7 +1486,18 @@ static void loadPacksHave() {
 }
 static bool installPack(const std::string& pack, std::string& err) {
 #ifdef _WIN32
-    const std::string url = std::string(MIRROR) + pack + "/" + pack + "_cc0.zip";
+    // the pack's own page names its zip: _cc0, _ccby or _cc-by (the licence: CC-BY packs want their authors credited)
+    std::string zipName = pack + "_cc0.zip";
+    {
+        const Http::Response r = Http::get(std::string(MIRROR) + pack + "/");
+        size_t at = 0;
+        while ((at = r.body.find("href=\"", at)) != std::string::npos) {
+            at += 6; const size_t e = r.body.find('"', at); if (e == std::string::npos) break;
+            const std::string h = r.body.substr(at, e - at);
+            if (h.size() > 4 && h.compare(h.size() - 4, 4, ".zip") == 0 && h.find('/') == std::string::npos) { zipName = h; break; }
+        }
+    }
+    const std::string url = std::string(MIRROR) + pack + "/" + zipName;
     const fs::path zip = fs::temp_directory_path() / ("pygmalion-" + pack + ".zip");
     if (!Http::download(url, zip.u8string(), [](int64_t d, int64_t t) { dlDone = d; dlTotal = t; }, &dlStop, err)) { if (err.empty()) err = "Download stopped"; return false; }
     // Windows' own tar opens zips
@@ -1492,7 +1541,150 @@ static void startDownload(const std::string& pack, bool listOnly) {
     (void)pack; (void)listOnly;
 #endif
 }
+// what kind of asset a folder holds, from its files (MakeHuman's folder names are its kinds)
+const char* KINDS[13] = {"clothes", "hair", "eyebrows", "eyelashes", "teeth", "tongue", "eyes", "proxymeshes", "skins", "poses", "expressions", "rigs", "custom"};
+// what a .mhclo is: its name if that says, else where it sits on the body (MakeHuman's files don't record it)
+static std::string kindOfProxy(const std::string& mhclo) {
+    std::string nm = fs::u8path(mhclo).stem().u8string(); for (char& c : nm) c = (char)tolower((unsigned char)c);
+    for (const auto& [word, kind] : std::vector<std::pair<const char*, const char*>>{{"eyebrow", "eyebrows"}, {"brow", "eyebrows"}, {"eyelash", "eyelashes"}, {"lash", "eyelashes"},
+                                                                                      {"teeth", "teeth"}, {"tooth", "teeth"}, {"tongue", "tongue"}, {"hair", "hair"}})
+        if (nm.find(word) != std::string::npos) return kind;
+    // its reference vertices, and its material's see-through flag
+    std::ifstream in(fs::u8path(mhclo)); std::string l, mat; bool verts = false; std::vector<int> refs;
+    while (std::getline(in, l)) {
+        if (!l.empty() && l.back() == '\r') l.pop_back();
+        if (l.rfind("material ", 0) == 0) mat = l.substr(9);
+        if (l.rfind("verts", 0) == 0) { verts = true; continue; }
+        if (l.rfind("delete_verts", 0) == 0) verts = false;
+        if (verts) {   // "a b c  wa wb wc  dx dy dz" or "a" (a material line can sit among them)
+            const size_t k = l.find_first_not_of(" 	");
+            if (k == std::string::npos || !isdigit((unsigned char)l[k])) continue;
+            std::istringstream ls(l); int v; if (ls >> v) refs.push_back(v);
+        }
+    }
+    bool seeThrough = false;
+    if (!mat.empty()) { std::ifstream m(fs::u8path(mhclo).parent_path() / fs::u8path(mat)); std::string ml; while (std::getline(m, ml)) { for (char& c : ml) c = (char)tolower((unsigned char)c); if (ml.rfind("transparent true", 0) == 0) seeThrough = true; } }
+    const std::vector<float>& B = body.base;
+    if (refs.empty() || B.empty()) return "clothes";
+    float y0 = 1e9f, y1 = -1e9f; for (size_t i = 1; i < B.size(); i += 3) { y0 = std::min(y0, B[i]); y1 = std::max(y1, B[i]); }
+    const float H = y1 - y0;
+    float lo = 1e9f, hi = -1e9f, cy = 0, cz = 0; int n = 0;
+    for (int r : refs) if (r >= 0 && (size_t)r * 3 + 2 < B.size()) { const float y = B[(size_t)r * 3 + 1]; lo = std::min(lo, y); hi = std::max(hi, y); cy += y; cz += B[(size_t)r * 3 + 2]; ++n; }
+    if (!n) return "clothes";
+    cy /= n; cz /= n;
+    float eyeY = y0 + 0.93f * H;   // the eyes' height, from their joint markers if there
+    { auto it = body.joints.find("joint-l-eye"); if (it != body.joints.end() && !it->second.empty()) { float sy = 0; for (int v : it->second) sy += B[(size_t)v * 3 + 1]; eyeY = sy / it->second.size(); } }
+    const bool head = lo > y0 + 0.84f * H, tiny = hi - lo < 0.045f * H;
+    if (head && tiny) {   // something small on the face: by its height against the eyes, and how far forward
+        if (seeThrough) return cy > eyeY + 0.0035f * H ? "eyebrows" : "eyelashes";
+        if (cy > eyeY - 0.012f * H) return cy > eyeY + 0.01f * H ? "clothes" : "eyes";
+        return cz < 1.22f ? "tongue" : "teeth";
+    }
+    // see-through, up to the top of the head: hair (long hair hangs down the back)
+    if (seeThrough && hi > y0 + 0.97f * H && cy > y0 + 0.75f * H) return "hair";
+    return "clothes";
+}
+static std::string guessKind(const fs::path& dir) {
+    std::error_code ec;
+    std::string mhclo, ext;
+    for (const auto& e : fs::recursive_directory_iterator(dir, ec)) {
+        if (!e.is_regular_file()) continue;
+        const std::string x = e.path().extension().u8string();
+        if (x == ".mhclo" && mhclo.empty()) mhclo = e.path().u8string();
+        else if (x == ".proxy") return "proxymeshes";
+        else if (x == ".mhskel") return "rigs";
+        else if (x == ".target") ext = "custom";
+        else if (x == ".bvh" && ext.empty()) ext = "poses";
+        else if (x == ".mhpose" && ext.empty()) ext = "expressions";
+        else if (x == ".mhmat" && ext.empty()) ext = "skins";
+    }
+    if (!mhclo.empty()) return kindOfProxy(mhclo);
+    return ext.empty() ? "clothes" : ext;
+}
+#ifdef _WIN32
+static bool runQuiet(const std::wstring& cmd) {
+    STARTUPINFOW si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> buf(cmd.begin(), cmd.end()); buf.push_back(0);
+    DWORD code = 1;
+    if (CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, INFINITE); GetExitCodeProcess(pi.hProcess, &code); CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    }
+    return code == 0;
+}
+#endif
+// a downloaded asset (a .zip, or a folder) into your data folder, where its kind goes. kind "" = work it out.
+// A zip with MakeHuman's kind folders at the top (clothes/, hair/...) goes in as it is.
+static bool installAsset(const std::string& src, std::string kind, std::string& said, std::string& err) {
+    std::error_code ec;
+    const fs::path in = fs::u8path(src);
+    fs::path dir = in;
+    fs::path tmp;
+    if (fs::is_regular_file(in, ec)) {
+#ifdef _WIN32
+        tmp = fs::temp_directory_path() / ("pygmalion-asset-" + std::to_string(GetTickCount64()));
+        fs::create_directories(tmp, ec);
+        if (!runQuiet(L"tar.exe -xf \"" + in.wstring() + L"\" -C \"" + tmp.wstring() + L"\"")) { fs::remove_all(tmp, ec); err = "Couldn't unpack " + in.filename().u8string(); return false; }
+        dir = tmp;
+#else
+        err = "Unzip it first, then install the folder"; return false;
+#endif
+    }
+    if (!fs::is_directory(dir, ec)) { err = "Not a zip or a folder: " + src; return false; }
+    // a single folder inside (as most downloads are): use it
+    auto only = [&](const fs::path& d) { fs::path one; int n = 0; for (const auto& e : fs::directory_iterator(d, ec)) { ++n; one = e.path(); } return n == 1 && fs::is_directory(one, ec) ? one : fs::path(); };
+    const fs::path data = fs::u8path(userDataDir());
+    // kind folders at the top: copy as they are
+    bool kindsTop = false;
+    for (const char* k : KINDS) if (fs::is_directory(dir / k, ec)) kindsTop = true;
+    if (!kindsTop) { const fs::path o = only(dir); if (!o.empty()) { bool kt = false; for (const char* k : KINDS) if (fs::is_directory(o / k, ec)) kt = true; if (kt) { dir = o; kindsTop = true; } } }
+    if (kindsTop && kind.empty()) {
+        fs::copy(dir, data, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+        said = "Installed into " + data.u8string();
+    } else {
+        fs::path item = dir; { const fs::path o = only(dir); if (!o.empty()) item = o; }
+        if (kind.empty()) kind = guessKind(item);
+        std::string name = item.filename().u8string();
+        if (item == tmp || name.empty()) name = in.stem().u8string();
+        const fs::path to = data / kind / fs::u8path(name);
+        fs::create_directories(to, ec);
+        fs::copy(item, to, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+        said = "Installed " + name + " as " + kind;
+    }
+    if (!tmp.empty()) fs::remove_all(tmp, ec);
+    if (ec) { err = "Couldn't copy: " + ec.message(); return false; }
+    libCache.clear();
+    return true;
+}
+static int installKind = 0;   // 0: work it out, else KINDS[k - 1]
+static void installLeft(float lw) {
+    groupBox("Install a downloaded asset");
+    notYet("Clothes, hair, skins, poses... downloaded from MakeHuman's community site (or anywhere) as a zip or a folder. They show in their tab straight away.");
+    std::vector<const char*> k = {"Work out what it is"}; for (const char* n : KINDS) k.push_back(n);
+    ImGui::SetNextItemWidth(lw); ImGui::Combo("##ik", &installKind, k.data(), (int)k.size());
+    auto go = [&](const std::string& p) {
+        if (p.empty()) return;
+        std::string said, err;
+        if (installAsset(p, installKind ? KINDS[installKind - 1] : "", said, err)) say(said); else say(err);
+    };
+    if (ImGui::Button("Install a zip...", ImVec2(lw / 2 - 4, 0))) go(fileDialog(false, L"Downloaded asset\0*.zip\0\0", L"zip", homeDir() + "\\"));
+    ImGui::SameLine();
+    if (ImGui::Button("Install a folder...", ImVec2(lw / 2 - 4, 0))) {
+#ifdef _WIN32
+        // a folder: pick any file inside it
+        const std::string f = fileDialog(false, L"Any file in the asset's folder\0*.mhclo;*.mhmat;*.obj;*.bvh;*.mhpose;*.target;*.proxy;*.png\0\0", L"mhclo", homeDir() + "\\");
+        if (!f.empty()) go(fs::u8path(f).parent_path().u8string());
+#endif
+    }
+    if (ImGui::Button("Open your data folder", ImVec2(lw, 0))) {
+#ifdef _WIN32
+        ShellExecuteW(nullptr, L"open", fs::u8path(userDataDir()).wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#endif
+    }
+    ImGui::TextDisabled("Dropping a .zip on the window installs it too.");
+}
+
 static void downloadLeft(float lw) {
+    installLeft(lw);
     groupBox("MakeHuman's asset packs");
     notYet("Clothes, hair, shoes, hats, poses, skins and more from MakeHuman's community (all CC0), into your own data folder.");
     if (dlBusy) {
@@ -1529,6 +1721,7 @@ static void dataView() {
     ImGui::TextWrapped("Program data: %s", dataDir.c_str());
     ImGui::TextWrapped("MakeHuman assets: %s", assetsDir().empty() ? "(none)" : assetsDir().c_str());
     ImGui::TextWrapped("Your data: %s", userDataDir().c_str());
+    ImGui::TextWrapped("MakeHuman's own data: %s", makehumanDataDir().empty() ? "(MakeHuman isn't installed)" : makehumanDataDir().c_str());
 }
 static void logsView() {
     groupBox("Logs");
@@ -1885,6 +2078,7 @@ int main(int argc, char** argv) {
     body.roots.clear();
     if (!assetsDir().empty()) body.roots.push_back(assetsDir());
     if (!userDataDir().empty()) body.roots.push_back(userDataDir());
+    if (!makehumanDataDir().empty()) body.roots.push_back(makehumanDataDir());
     body.roots.push_back(dataDir);
     loadSettings();
     loadCustomTargets();
@@ -1913,7 +2107,14 @@ int main(int argc, char** argv) {
         while (SDL_PollEvent(&e)) {
             ImGui_ImplSDL2_ProcessEvent(&e);
             if (e.type == SDL_QUIT) quit = true;
-            if (e.type == SDL_DROPFILE) { std::string err; remember("Open"); if (loadModel(e.drop.file, err)) dirty = true; else say(err); SDL_free(e.drop.file); }
+            if (e.type == SDL_DROPFILE) {
+                const std::string f = e.drop.file; std::string err;
+                std::string x = fs::u8path(f).extension().u8string(); for (char& c : x) c = (char)tolower((unsigned char)c);
+                std::error_code ec;
+                if (x == ".zip" || fs::is_directory(fs::u8path(f), ec)) { std::string said; if (installAsset(f, "", said, err)) say(said); else say(err); }
+                else { remember("Open"); if (loadModel(f, err)) dirty = true; else say(err); }
+                SDL_free(e.drop.file);
+            }
         }
         ImGui_ImplOpenGL3_NewFrame(); ImGui_ImplSDL2_NewFrame(); ImGui::NewFrame();
         frame();

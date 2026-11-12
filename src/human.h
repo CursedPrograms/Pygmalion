@@ -26,6 +26,7 @@ struct Modifier {
     std::string label, description;      // for the window (MakeHuman's own label rule, or the sliders file's)
     std::string image;                   // its picture (targets/*/images), "" if none
     std::string cam;                     // the view MakeHuman turns to while it's moved (frontView, leftView, faceCamera...)
+    std::string enabledCondition;        // MakeHuman's: "hasGenitals" (only with a topology that has them)
     bool macro = false;                  // a macro variable (Gender, Age...) rather than targets of its own
     std::string variable;                // the macro's variable: "Gender", "Age", "African"...
     std::string left, right, center;     // target groups at -1, +1 and 0 (left/center empty: 0..1 only)
@@ -50,6 +51,7 @@ struct Proxy {                           // something fitted to the body (MakeHu
     int zDepth = 50;                     // drawing order (MakeHuman's z_depth: lower first)
     std::vector<int> deleteVerts;        // the body's vertices it covers (hidden under it)
     float tint[3] = {1, 1, 1};           // Material Editor: its colour multiplied in
+    std::vector<std::string> tags;       // its "tag" lines (a topology tagged "genitals" has them)
 };
 bool loadProxyFile(const std::string& mhclo, Proxy& p, std::string& err);
 // a material: its diffuse texture (absolute path) and whether it's see-through
@@ -88,6 +90,8 @@ int varIndex(const std::string& v);
 // data: the folder holding 3dobjs/, targets/, modifiers/ and eyes/. progress: 0..1 as it loads (may be null)
 bool load(Body& b, const std::string& data, std::string& err, void (*progress)(float, const char*) = nullptr);
 
+// MakeHuman's hasGenitals: the topology worn has the tag "genitals" (their convention)
+bool hasGenitals(const Body& b);
 void setModifier(Body& b, int m, float value);    // and its mirror, with symmetry on
 void setMacro(Body& b, const std::string& variable, float value);
 void resetAll(Body& b);

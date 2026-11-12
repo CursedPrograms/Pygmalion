@@ -43,7 +43,8 @@ void setPose(Skeleton& s, const Pose* p);                              // nullpt
 void skin(const Skeleton& s, const std::vector<float>& rest, std::vector<float>& out);
 
 // a .bvh: its frames as poses (MakeHuman's poses use frame 0; face-poseunits.bvh holds one unit per frame)
-bool loadBvh(const std::string& path, std::vector<Pose>& frames, std::string& err, float* frameTime = nullptr);
+// target: the skeleton other skeletons' BVHs are turned onto (MakeHuman's old animations, CMU or Mixamo motion capture)
+bool loadBvh(const std::string& path, std::vector<Pose>& frames, std::string& err, float* frameTime = nullptr, const Skeleton* target = nullptr);
 // a skeleton without its own weights takes them from the default one, through each bone's reference bones
 void inheritWeights(Skeleton& s, const Skeleton& reference);
 // a skeleton posed like the default one: each bone turns with its first reference bone (bones without one follow

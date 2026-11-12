@@ -413,7 +413,8 @@ static void setPoseFile(const std::string& f) {
     bodyPose = Skel::Pose();
     if (!f.empty()) {
         std::vector<Skel::Pose> fr; std::string err;
-        if (Skel::loadBvh(f, fr, err)) bodyPose = fr[0]; else say(err);
+        if (!rig.empty()) { Human::apply(body); Skel::build(rig, body.pos); }
+        if (Skel::loadBvh(f, fr, err, nullptr, rig.empty() ? nullptr : &rig)) bodyPose = fr[0]; else say(err);
     }
     dirty = true;
 }
@@ -445,7 +446,8 @@ static void setAnimation(const std::string& f) {
     animFile = f; animFrames.clear(); animPlaying = false; animFrame = 0;
     if (f.empty()) { bodyPose = Skel::Pose(); poseFile.clear(); dirty = true; return; }
     std::string err;
-    if (!Skel::loadBvh(f, animFrames, err, &animFrameTime)) { say(err); animFile.clear(); return; }
+    if (!rig.empty()) { Human::apply(body); Skel::build(rig, body.pos); }
+    if (!Skel::loadBvh(f, animFrames, err, &animFrameTime, rig.empty() ? nullptr : &rig)) { say(err); animFile.clear(); return; }
     bodyPose = animFrames[0]; poseFile.clear(); animPlaying = true; dirty = true;
 }
 static void animate(float dt) {
@@ -1137,6 +1139,11 @@ static void runScript(const std::string& text) {
             for (const auto& px : body.proxies) { std::vector<float> f; Human::fitProxy(body, px, f); box(px.name.c_str(), f, nullptr); std::vector<float> r; Human::fitProxy(body, px, r, true); box((px.name + " rest").c_str(), r, nullptr); }
         }
         else if (cmd == "symmetry") body.symmetry = rest != "off";
+        else if (cmd == "bones") { showBones = rest != "off"; Viewer::look().bones = showBones; }
+        else if (cmd == "animation") {
+            if (rest == "none") setAnimation("");
+            else { std::string f; for (const auto& c : filesIn("animations", ".bvh")) if (fs::u8path(c).stem().u8string() == rest) f = c; if (f.empty()) { ok = false; err = "no animation " + rest; } else setAnimation(f); }
+        }
         else if (cmd == "units") { ok = false; for (int k = 0; k < 5; ++k) if (rest == UNIT_NAMES[k]) { exportUnits = k; ok = true; } if (!ok) err = "units: decimeter, meter, centimeter, millimeter or inch"; }
         else if (cmd == "load") ok = loadModel(rest, err);
         else if (cmd == "save") ok = saveModel(rest, fs::u8path(rest).stem().u8string(), err);
@@ -1173,7 +1180,7 @@ static void scriptingLeft(float lw) {
 }
 static void scriptingRight() {
     groupBox("Commands");
-    ImGui::TextDisabled("reset | random 0.5 | describe words\nmacro Gender 0..1 (Age, Muscle, Weight,\n  Height, BodyProportions, African, Asian,\n  Caucasian, BreastSize, BreastFirmness)\nmodifier group/name value\nwear clothes/x/x.mhclo | takeoff hair\nskin skins/x/x.mhmat | skin default\nskeleton game_engine | none\npose standing01 | none\nexpression smile01 | none\nsymmetry on | off\nload file.mhm | save file.mhm\nexport file.fbx (.dae .glb .obj ...)\nrender file.png 1920 1080");
+    ImGui::TextDisabled("reset | random 0.5 | describe words\nmacro Gender 0..1 (Age, Muscle, Weight,\n  Height, BodyProportions, African, Asian,\n  Caucasian, BreastSize, BreastFirmness)\nmodifier group/name value\nwear clothes/x/x.mhclo | takeoff hair\nskin skins/x/x.mhmat | skin default\nskeleton game_engine | none\npose standing01 | none\nanimation walk1 | none\nexpression smile01 | none\nbones on | off\nsymmetry on | off\nunits meter (decimeter, centimeter...)\nload file.mhm | save file.mhm\nexport file.fbx (.dae .glb .obj ...)\nrender file.png 1920 1080");
     if (!scriptLog.empty()) { groupBox("Output"); ImGui::BeginChild("so"); ImGui::TextUnformatted(scriptLog.c_str()); ImGui::EndChild(); }
 }
 

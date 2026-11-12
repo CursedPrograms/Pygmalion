@@ -188,7 +188,7 @@ static Mat4 axisRot(char axis, float a) {
     return m;
 }
 
-bool loadBvh(const std::string& path, std::vector<Pose>& frames, std::string& err, float* frameTimeOut) {
+bool loadBvh(const std::string& path, std::vector<Pose>& frames, std::string& err, float* frameTimeOut, const Skeleton* target) {
     frames.clear();
     std::string t;
     if (!readAll(path, t)) { err = "Couldn't read " + path; return false; }
@@ -251,6 +251,129 @@ bool loadBvh(const std::string& path, std::vector<Pose>& frames, std::string& er
         frames.push_back(std::move(p));
     }
     if (frameTimeOut) *frameTimeOut = frameTime > 0 ? frameTime : 1 / 24.0f;
+    // other skeletons' BVHs: MakeHuman's own animations (made for its old "soft1" skeleton) and motion capture
+    // named the CMU or Mixamo way. Their bones go by the default's names, each turned the way the file's bone points
+    // (their rest pose may be a T where MakeHuman's is an A)
+    auto strip = [](const std::string& n) { const size_t c = n.rfind(':'); return c == std::string::npos ? n : n.substr(c + 1); };
+    bool soft1 = false, mocap = false;
+    for (const auto& j : js) { const std::string n = strip(j.name); if (n == "UpArm_L") soft1 = true; if (n == "LeftArm" || n == "LeftUpLeg") mocap = true; }
+    std::map<std::string, std::vector<std::string>> map;
+    const char* fingers[] = {"Thumb", "Index", "Middle", "Ring", "Pinky"};
+    if (soft1) {
+        map = {{"Root", {"root"}}, {"Hips", {"pelvis.L", "pelvis.R"}}, {"Spine1", {"spine04"}}, {"Spine2", {"spine03"}}, {"Spine3", {"spine01"}},
+               {"Neck", {"neck01"}}, {"Head", {"head"}}, {"Jaw", {"jaw"}}};
+        for (const char* side : {"L", "R"}) {
+            const std::string S = side, s2 = std::string(".") + side;
+            map["Eye_" + S] = {"eye" + s2}; map["Clavicle_" + S] = {"clavicle" + s2}; map["UpArm_" + S] = {"upperarm01" + s2};
+            map["LoArm_" + S] = {"lowerarm01" + s2}; map["Hand_" + S] = {"wrist" + s2}; map["UpLeg_" + S] = {"upperleg01" + s2};
+            map["LoLeg_" + S] = {"lowerleg01" + s2}; map["Foot_" + S] = {"foot" + s2};
+            map["Toe_" + S] = {"toe1-1" + s2, "toe2-1" + s2, "toe3-1" + s2, "toe4-1" + s2, "toe5-1" + s2};
+            for (int f = 0; f < 5; ++f) for (int k = 1; k <= 3; ++k) map[fingers[f] + std::to_string(k) + "_" + S] = {"finger" + std::to_string(f + 1) + "-" + std::to_string(k) + s2};
+        }
+    } else if (mocap) {
+        map = {{"Hips", {"root"}}, {"LowerBack", {"spine05"}}, {"Spine", {"spine04"}}, {"Spine1", {"spine02"}}, {"Spine2", {"spine01"}},
+               {"Neck", {"neck01"}}, {"Neck1", {"neck02"}}, {"Head", {"head"}}};
+        for (const char* side : {"Left", "Right"}) {
+            const std::string S = side, s2 = S == "Left" ? ".L" : ".R";
+            map[S + "Shoulder"] = {"clavicle" + s2}; map[S + "Arm"] = {"upperarm01" + s2}; map[S + "ForeArm"] = {"lowerarm01" + s2};
+            map[S + "Hand"] = {"wrist" + s2}; map[S + "UpLeg"] = {"upperleg01" + s2}; map[S + "Leg"] = {"lowerleg01" + s2};
+            map[S + "Foot"] = {"foot" + s2}; map[S + "ToeBase"] = {"toe1-1" + s2, "toe2-1" + s2, "toe3-1" + s2, "toe4-1" + s2, "toe5-1" + s2};
+            for (int f = 0; f < 5; ++f) for (int k = 1; k <= 3; ++k) map[S + "Hand" + fingers[f] + std::to_string(k)] = {"finger" + std::to_string(f + 1) + "-" + std::to_string(k) + s2};
+        }
+    }
+    if (!map.empty()) {
+        auto conv = [&](const float* o, float* r) { if (zUp) { r[0] = o[0]; r[1] = o[2]; r[2] = -o[1]; } else { r[0] = o[0]; r[1] = o[1]; r[2] = o[2]; } };
+        // the file's rest direction of each joint: towards its first child
+        std::vector<std::array<float, 3>> dir(js.size());
+        std::vector<char> hasDir(js.size(), 0);
+        for (size_t k = 0; k < js.size(); ++k)
+            for (size_t c = k + 1; c < js.size(); ++c)
+                if (js[c].parent == (int)k) {
+                    float r[3]; conv(js[c].off, r);
+                    const float l = std::sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+                    if (l > 1e-6f) { for (int q = 0; q < 3; ++q) dir[k][q] = r[q] / l; hasDir[k] = 1; }
+                    break;
+                }
+        // root moves: motion capture is in its own units (from its leg's length), from where it starts
+        float scale = 1;
+        if (mocap && target && !target->empty()) {
+            float bvhLeg = 0;
+            for (const auto& j : js) { const std::string n = strip(j.name); if (n == "LeftLeg" || n == "LeftFoot") bvhLeg += std::sqrt(j.off[0] * j.off[0] + j.off[1] * j.off[1] + j.off[2] * j.off[2]); }
+            auto a = target->byName.find("upperleg01.L"), z = target->byName.find("foot.L");
+            if (a != target->byName.end() && z != target->byName.end() && bvhLeg > 0) {
+                const float* h1 = target->bones[a->second].head; const float* h2 = target->bones[z->second].head;
+                scale = std::sqrt((h1[0] - h2[0]) * (h1[0] - h2[0]) + (h1[1] - h2[1]) * (h1[1] - h2[1]) + (h1[2] - h2[2]) * (h1[2] - h2[2])) / bvhLeg;
+            }
+        }
+        // the turn taking direction a onto b (the shortest)
+        auto between = [](const float* a, const float* b) {
+            Mat4 r = ident();
+            float v[3]; cross(a, b, v);
+            const float c = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+            if (c < -0.9999f) {
+                float pp[3] = {1, 0, 0}; if (std::fabs(a[0]) > 0.9f) { pp[0] = 0; pp[1] = 1; }
+                float ax[3]; cross(a, pp, ax); norm3(ax);
+                for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) r[j * 4 + i] = 2 * ax[i] * ax[j] - (i == j ? 1.0f : 0.0f);
+                return r;
+            }
+            const float k = 1 / (1 + c);
+            const float vx[9] = {0, v[2], -v[1], -v[2], 0, v[0], v[1], -v[0], 0};   // column major [v]x
+            for (int col = 0; col < 3; ++col) for (int row = 0; row < 3; ++row) {
+                float sq = 0; for (int t = 0; t < 3; ++t) sq += vx[t * 3 + row] * vx[col * 3 + t];
+                r[col * 4 + row] = (row == col ? 1.0f : 0.0f) + vx[col * 3 + row] + sq * k;
+            }
+            return r;
+        };
+        float t0[3] = {0, 0, 0}; bool haveT0 = false;
+        for (auto& p : frames) {
+            Pose q; q.name = p.name;
+            if (!target || target->empty()) {
+                for (const auto& kv : p.bones) { auto it = map.find(strip(kv.first)); if (it != map.end()) for (const auto& n : it->second) q.bones[n] = kv.second; }
+                p = std::move(q);
+                continue;
+            }
+            std::vector<Mat4> G(js.size(), ident());
+            std::map<std::string, Mat4> Q;
+            for (size_t k = 0; k < js.size(); ++k) {
+                if (js[k].end) continue;
+                Mat4 R = p.bones[js[k].name]; R[12] = R[13] = R[14] = 0;
+                G[k] = js[k].parent >= 0 ? mul(G[js[k].parent], R) : R;
+                auto it = map.find(strip(js[k].name));
+                if (it == map.end()) continue;
+                for (const auto& bn : it->second) {
+                    auto bi = target->byName.find(bn);
+                    if (bi == target->byName.end()) continue;
+                    Mat4 A = ident();
+                    if (it->second.size() == 1 && hasDir[k]) {
+                        const Mat4& rg = target->bones[bi->second].restGlobal;
+                        float d[3] = {rg[4], rg[5], rg[6]}; norm3(d);
+                        A = between(d, dir[k].data());
+                    }
+                    Q[bn] = mul(G[k], A);
+                }
+            }
+            for (const auto& b : target->bones) {
+                auto it = Q.find(b.name);
+                if (it == Q.end()) continue;
+                Mat4 up = ident();
+                for (int a = b.parent; a >= 0; a = target->bones[a].parent) { auto pa = Q.find(target->bones[a].name); if (pa != Q.end()) { up = pa->second; break; } }
+                q.bones[b.name] = mul(inv(up), it->second);
+            }
+            // the root's move
+            for (size_t k = 0; k < js.size(); ++k) {
+                if (js[k].parent >= 0) continue;
+                auto it = map.find(strip(js[k].name));
+                if (it == map.end() || it->second.empty() || !q.bones.count(it->second[0])) break;
+                const Mat4& src = p.bones[js[k].name];
+                float t[3] = {src[12], src[13], src[14]};
+                if (mocap) { if (!haveT0) { for (int c = 0; c < 3; ++c) t0[c] = t[c]; haveT0 = true; } for (int c = 0; c < 3; ++c) t[c] = (t[c] - t0[c]) * scale; }
+                Mat4& m = q.bones[it->second[0]];
+                m[12] = t[0]; m[13] = t[1]; m[14] = t[2];
+                break;
+            }
+            p = std::move(q);
+        }
+    }
     if (frames.empty()) { err = "The BVH has no frames"; return false; }
     return true;
 }

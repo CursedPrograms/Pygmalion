@@ -18,6 +18,8 @@ struct Look {
     bool smooth = false;                            // MakeHuman's Smooth: one Catmull-Clark subdivision
     std::string bgImage;                            // a picture behind the person (Settings > Background)
     float bgOpacity = 1;
+    float turnSpeed = 1, moveSpeed = 1, zoomSpeed = 1;   // Settings > Mouse
+    bool invertTurn = false, invertZoom = false;
 };
 Look& look();
 // look at a point from a direction (yaw 0: the front; pi/2: the person's left side), from dist away

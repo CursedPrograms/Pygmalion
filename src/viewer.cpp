@@ -348,12 +348,12 @@ unsigned render(int w, int h, bool hovered) {
     if (w < 8 || h < 8) return fboTex;
     ImGuiIO& io = ImGui::GetIO();
     if (hovered) {
-        if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) { lk.yaw -= io.MouseDelta.x * 0.008f; lk.pitch = std::clamp(lk.pitch + io.MouseDelta.y * 0.006f, -1.4f, 1.4f); }
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) { const float sg = lk.invertTurn ? -lk.turnSpeed : lk.turnSpeed; lk.yaw -= io.MouseDelta.x * 0.008f * sg; lk.pitch = std::clamp(lk.pitch + io.MouseDelta.y * 0.006f * sg, -1.4f, 1.4f); }
         if (ImGui::IsMouseDragging(ImGuiMouseButton_Right) || ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
-            const float k = lk.dist * 0.0015f, cy = std::cos(lk.yaw), sy = std::sin(lk.yaw);
+            const float k = lk.dist * 0.0015f * lk.moveSpeed, cy = std::cos(lk.yaw), sy = std::sin(lk.yaw);
             target[0] -= io.MouseDelta.x * k * cy; target[2] += io.MouseDelta.x * k * sy; target[1] += io.MouseDelta.y * k;
         }
-        if (io.MouseWheel != 0) lk.dist = std::clamp(lk.dist * std::pow(0.88f, io.MouseWheel), height * 0.12f, height * 6);
+        if (io.MouseWheel != 0) lk.dist = std::clamp(lk.dist * std::pow(std::pow(0.88f, lk.zoomSpeed), lk.invertZoom ? -io.MouseWheel : io.MouseWheel), height * 0.12f, height * 6);
     }
     const float ty = target[1];
     if (w != fbW || h != fbH) {

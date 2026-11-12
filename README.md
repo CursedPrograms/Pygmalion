@@ -55,12 +55,13 @@ MakeHuman's own layout, tab for tab:
 - **Exports:** Collada (`.dae`), FBX, glTF (`.glb`), OBJ, Ogre3D, STL, BVH and the UV map, with the skeleton, its
   weights and the textures, posed or not, feet on the ground, in any units. Tested by importing into Blender.
 - **Utilities:** Describe ("a tall, muscular old woman with a big nose" sets the sliders), Symmetry, Statistics,
-  Material Editor, Expression mixer, Targets, Save targets, Mass produce (hundreds of random people, saved and
-  exported), Scripting (Pygmalion's own commands for every job), Download (MakeHuman's 60+ community asset packs,
+  Material Editor, Expression mixer (save your own mixes as `.mhpose`), Targets, Save targets, Mass produce (hundreds of random people, saved and
+  exported), Shell (one command at a time, with history), Scripting (Pygmalion's own commands for every job), Download (MakeHuman's 60+ community asset packs,
   CC0: clothes, hair, shoes, hats, poses, skins), Data and Logs.
 - **The toolbar:** Undo and Redo (shapes, clothes, skin and pose), Reset, Wire, Clay, Floor, Bones, Ortho, Smooth
   (MakeHuman's subdivision), symmetry, and the camera's views.
-- **Settings:** slider behaviour and pictures, units, a background picture to model against, mouse and shortcuts.
+- **Settings:** slider behaviour and pictures, units, a background picture to model against, mouse speeds and
+  inverting, and MakeHuman's shortcuts (Ctrl+S save, Ctrl+E export, 1/3/7 front/side/top...). Kept between runs.
 
 ## Download and run
 

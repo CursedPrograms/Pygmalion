@@ -34,6 +34,7 @@ GLF(void, glUniformMatrix4fv, (GLint, GLsizei, GLboolean, const GLfloat*))
 GLF(void, glUniform1i, (GLint, GLint))
 GLF(void, glUniform1f, (GLint, GLfloat))
 GLF(void, glUniform3f, (GLint, GLfloat, GLfloat, GLfloat))
+GLF(void, glUniform2f, (GLint, GLfloat, GLfloat))
 GLF(void, glGenVertexArrays, (GLsizei, GLuint*))
 GLF(void, glBindVertexArray, (GLuint))
 GLF(void, glGenBuffers, (GLsizei, GLuint*))
@@ -76,11 +77,13 @@ static Look lk;
 Look& look() { return lk; }
 static GLuint prog = 0, progLine = 0;
 // a mesh drawn corner by corner (uvs are per corner): the body, and each proxy (eyes, clothes, hair...)
-struct Part { GLuint vao = 0, pos = 0, nrm = 0, uv = 0, tex = 0; int count = 0, mode = 3; bool cutout = false; };
+struct Part { GLuint vao = 0, pos = 0, nrm = 0, uv = 0, tex = 0; int count = 0, mode = 3; bool cutout = false; float tint[3] = {1, 1, 1}; };
 static Part bodyPart;
 static std::vector<Part> parts;
 static std::map<std::string, GLuint> texCache;
 static GLuint gridVao = 0, gridVbo = 0; static int gridCount = 0;
+static GLuint progBg = 0, bgVao = 0, bgTex = 0; static std::string bgLoaded;
+static std::vector<float> boneSegs;
 static GLuint lit[3] = {0, 0, 0}, litEye = 0;
 static GLuint fbo = 0, fboTex = 0, fboDepth = 0; static int fbW = 0, fbH = 0;
 static float eth[3] = {1 / 3.0f, 1 / 3.0f, 1 / 3.0f};
@@ -114,7 +117,7 @@ static GLuint textureLoad(const std::string& path) {
 bool init(const std::string& data) {
 #define L(name) name##_ = (PFN_##name)SDL_GL_GetProcAddress(#name); if (!name##_) return false;
     L(glCreateShader) L(glShaderSource) L(glCompileShader) L(glCreateProgram) L(glAttachShader) L(glLinkProgram) L(glUseProgram)
-    L(glGetUniformLocation) L(glUniformMatrix4fv) L(glUniform1i) L(glUniform1f) L(glUniform3f) L(glGenVertexArrays) L(glBindVertexArray)
+    L(glGetUniformLocation) L(glUniformMatrix4fv) L(glUniform1i) L(glUniform1f) L(glUniform3f) L(glUniform2f) L(glGenVertexArrays) L(glBindVertexArray)
     L(glGenBuffers) L(glBindBuffer) L(glBufferData) L(glEnableVertexAttribArray) L(glVertexAttribPointer) L(glGenFramebuffers)
     L(glBindFramebuffer) L(glFramebufferTexture2D) L(glGenRenderbuffers) L(glBindRenderbuffer) L(glRenderbufferStorage)
     L(glFramebufferRenderbuffer) L(glGenerateMipmap) L(glActiveTexture)
@@ -127,8 +130,10 @@ uniform mat4 mvp, view; out vec3 N; out vec2 T;
 void main() { N = mat3(view) * n; T = t; gl_Position = mvp * vec4(p, 1); })",
                 R"(#version 330
 in vec3 N; in vec2 T; out vec4 o;
-uniform sampler2D litA, litB, litC, tex; uniform vec3 eth; uniform int mode, hasTex, cutout; uniform float light;
-void main() {
+uniform sampler2D litA, litB, litC, tex; uniform vec3 eth; uniform int mode, hasTex, cutout; uniform float light; uniform vec3 lcol, tint;
+void shade();
+void main() { shade(); o.rgb *= light * lcol * tint; }
+void shade() {
   vec3 n = normalize(N); if (!gl_FrontFacing) n = -n;
   vec2 uv = n.xy * 0.495 + 0.5;                          // MakeHuman's litsphere lookup
   vec4 tc = hasTex == 1 ? texture(tex, T) : vec4(0.62, 0.62, 0.64, 1);
@@ -147,6 +152,12 @@ void main() {
   vec3 skin = texture(litA, uv).rgb * eth.x + texture(litB, uv).rgb * eth.y + texture(litC, uv).rgb * eth.z;
   o = vec4(mix(vec3(dot(skin, vec3(0.33))), skin, 1.0) * mix(1.0, 1.0, light), 1);
 })");
+    progBg = make(R"(#version 330
+out vec2 T; void main() { vec2 p = vec2((gl_VertexID & 1) * 2 - 1, (gl_VertexID >> 1) * 2 - 1); T = p * 0.5 + 0.5; gl_Position = vec4(p, 0.999, 1); })",
+                  R"(#version 330
+in vec2 T; out vec4 o; uniform sampler2D img; uniform float alpha; uniform vec2 fit; uniform vec3 bg;
+void main() { vec2 t = (T - 0.5) / fit + 0.5; if (t.x < 0.0 || t.x > 1.0 || t.y < 0.0 || t.y > 1.0) { o = vec4(bg, 1); return; } o = vec4(mix(bg, texture(img, t).rgb, alpha), 1); })");
+    glGenVertexArrays_(1, &bgVao);
     progLine = make(R"(#version 330
 layout(location=0) in vec3 p; uniform mat4 mvp; void main() { gl_Position = mvp * vec4(p, 1); })",
                     R"(#version 330
@@ -209,6 +220,7 @@ void update(const Human::Body& b) {
         fill(bodyPart, P, N, U);
         bodyPart.tex = texture(b.skinTexture);
         bodyPart.mode = bodyPart.tex ? 4 : 0;
+        for (int c = 0; c < 3; ++c) bodyPart.tint[c] = b.skinTint[c];
     }
     // the proxies, fitted to the body as it is now, in MakeHuman's z_depth order
     parts.resize(std::max(parts.size(), b.proxies.size()));
@@ -226,6 +238,7 @@ void update(const Human::Body& b) {
         pt.tex = texture(topology ? b.skinTexture : p.texture);
         pt.mode = p.kind == "eyes" ? 1 : topology ? (pt.tex ? 4 : 0) : 3;
         pt.cutout = p.transparent || p.kind == "hair" || p.kind == "eyebrows" || p.kind == "eyelashes";
+        for (int c = 0; c < 3; ++c) pt.tint[c] = topology ? b.skinTint[c] : p.tint[c];
     }
     // the height (for framing): MakeHuman's units are decimetres
     float lo = 1e30f, hi = -1e30f;
@@ -277,8 +290,28 @@ unsigned render(int w, int h, bool hovered) {
     }
     glBindFramebuffer_(GL_FRAMEBUFFER, fbo);
     glViewport(0, 0, w, h);
-    glClearColor(0x14 / 255.0f, 0x14 / 255.0f, 0x14 / 255.0f, 1);
+    glClearColor(lk.bg[0], lk.bg[1], lk.bg[2], lk.transparent ? 0.0f : 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    // a picture behind the person, fitted inside the view
+    if (!lk.transparent && !lk.bgImage.empty()) {
+        if (bgLoaded != lk.bgImage) { bgLoaded = lk.bgImage; bgTex = texture(lk.bgImage); }
+        if (bgTex) {
+            int iw = 1, ih = 1;
+            glBindTexture(GL_TEXTURE_2D, bgTex);
+            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &iw); glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &ih);
+            const float va = (float)w / h, ia = (float)iw / std::max(ih, 1);
+            glUseProgram_(progBg);
+            glUniform1i_(glGetUniformLocation_(progBg, "img"), 0);
+            glUniform1f_(glGetUniformLocation_(progBg, "alpha"), lk.bgOpacity);
+            glUniform3f_(glGetUniformLocation_(progBg, "bg"), lk.bg[0], lk.bg[1], lk.bg[2]);
+            glUniform2f_(glGetUniformLocation_(progBg, "fit"), ia > va ? 1.0f : ia / va, ia > va ? va / ia : 1.0f);
+            glActiveTexture_(GL_TEXTURE0);
+            glDisable(GL_DEPTH_TEST);
+            glBindVertexArray_(bgVao);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glEnable(GL_DEPTH_TEST);
+        }
+    }
     glEnable(GL_DEPTH_TEST);
     // the view: orbit round the body's middle
     const float cp = std::cos(lk.pitch), sp = std::sin(lk.pitch), cy = std::cos(lk.yaw), sy = std::sin(lk.yaw);
@@ -290,10 +323,15 @@ unsigned render(int w, int h, bool hovered) {
     const float V[16] = {s[0], u[0], -f[0], 0, s[1], u[1], -f[1], 0, s[2], u[2], -f[2], 0,
                          -(s[0] * e[0] + s[1] * e[1] + s[2] * e[2]), -(u[0] * e[0] + u[1] * e[1] + u[2] * e[2]), f[0] * e[0] + f[1] * e[1] + f[2] * e[2], 1};
     const float n = 0.05f, fr = 400, t = 1.0f / std::tan(0.38f), a = (float)w / h;
-    const float P[16] = {t / a, 0, 0, 0, 0, t, 0, 0, 0, 0, -(fr + n) / (fr - n), -1, 0, 0, -2 * fr * n / (fr - n), 0};
+    float P[16] = {t / a, 0, 0, 0, 0, t, 0, 0, 0, 0, -(fr + n) / (fr - n), -1, 0, 0, -2 * fr * n / (fr - n), 0};
+    if (lk.ortho) {   // the same framing as the perspective view at the target's distance
+        const float hh = lk.dist / t;
+        const float O[16] = {1 / (hh * a), 0, 0, 0, 0, 1 / hh, 0, 0, 0, 0, -2 / (fr - n), 0, 0, 0, -(fr + n) / (fr - n), 1};
+        memcpy(P, O, sizeof O);
+    }
     float mvp[16]; mul(P, V, mvp);
     // the floor
-    if (lk.grid) {
+    if (lk.grid && !lk.transparent) {
         std::vector<float> g;
         const float y = bodyMid - height / 2;
         for (int i = -10; i <= 10; ++i) g.insert(g.end(), {i * 1.0f, y, -10, i * 1.0f, y, 10, -10, y, i * 1.0f, 10, y, i * 1.0f});
@@ -311,6 +349,7 @@ unsigned render(int w, int h, bool hovered) {
     glUniformMatrix4fv_(glGetUniformLocation_(prog, "view"), 1, GL_FALSE, V);
     glUniform3f_(glGetUniformLocation_(prog, "eth"), eth[0], eth[1], eth[2]);
     glUniform1f_(glGetUniformLocation_(prog, "light"), lk.light);
+    glUniform3f_(glGetUniformLocation_(prog, "lcol"), lk.lightCol[0], lk.lightCol[1], lk.lightCol[2]);
     glUniform1i_(glGetUniformLocation_(prog, "litA"), 0); glUniform1i_(glGetUniformLocation_(prog, "litB"), 1);
     glUniform1i_(glGetUniformLocation_(prog, "litC"), 2); glUniform1i_(glGetUniformLocation_(prog, "tex"), 3);
     const GLint uMode = glGetUniformLocation_(prog, "mode"), uHas = glGetUniformLocation_(prog, "hasTex"), uCut = glGetUniformLocation_(prog, "cutout");
@@ -322,6 +361,7 @@ unsigned render(int w, int h, bool hovered) {
         glUniform1i_(uMode, clay ? 2 : pt.mode);
         glUniform1i_(uHas, pt.tex ? 1 : 0);
         glUniform1i_(uCut, pt.cutout && pt.tex ? 1 : 0);
+        glUniform3f_(glGetUniformLocation_(prog, "tint"), pt.tint[0], pt.tint[1], pt.tint[2]);
         glBindVertexArray_(pt.vao);
         glDrawArrays(GL_TRIANGLES, 0, pt.count);
         if (lines) {
@@ -336,6 +376,21 @@ unsigned render(int w, int h, bool hovered) {
     };
     draw(bodyPart, lk.wire);
     for (const Part& pt : parts) draw(pt, lk.wire && pt.mode != 1 && !pt.cutout);
+    if (lk.bones && !boneSegs.empty()) {
+        glDisable(GL_DEPTH_TEST);
+        glBindVertexArray_(gridVao); glBindBuffer_(GL_ARRAY_BUFFER, gridVbo);
+        glBufferData_(GL_ARRAY_BUFFER, (GLsizeiptr)(boneSegs.size() * 4), boneSegs.data(), GL_DYNAMIC_DRAW);
+        glEnableVertexAttribArray_(0); glVertexAttribPointer_(0, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
+        glUseProgram_(progLine);
+        glUniformMatrix4fv_(glGetUniformLocation_(progLine, "mvp"), 1, GL_FALSE, mvp);
+        glUniform3f_(glGetUniformLocation_(progLine, "col"), 0.88f, 0.25f, 0.54f);
+        glLineWidth(2);
+        glDrawArrays(GL_LINES, 0, (GLsizei)(boneSegs.size() / 3));
+        glUniform3f_(glGetUniformLocation_(progLine, "col"), 1.0f, 1.0f, 1.0f);
+        glPointSize(5);
+        glDrawArrays(GL_POINTS, 0, (GLsizei)(boneSegs.size() / 3));
+        glLineWidth(1);
+    }
     glBindVertexArray_(0); glUseProgram_(0);
     glDisable(GL_DEPTH_TEST);
     glBindFramebuffer_(GL_FRAMEBUFFER, 0);
@@ -351,6 +406,29 @@ void readPixels(std::vector<unsigned char>& rgba, int& w, int& h) {
     glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, raw.data());
     glBindFramebuffer_(GL_FRAMEBUFFER, 0);
     for (int y = 0; y < h; ++y) memcpy(&rgba[(size_t)y * w * 4], &raw[(size_t)(h - 1 - y) * w * 4], (size_t)w * 4);
+}
+
+void setBones(const std::vector<float>& lines) { boneSegs = lines; }
+
+bool renderImage(int w, int h, int ss, std::vector<unsigned char>& rgba) {
+    ss = std::clamp(ss, 1, 4);
+    GLint maxSize = 4096; glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &maxSize);
+    while (ss > 1 && (w * ss > maxSize || h * ss > maxSize)) --ss;
+    if (w * ss > maxSize || h * ss > maxSize || w < 8 || h < 8) return false;
+    const int oldW = fbW, oldH = fbH;
+    render(w * ss, h * ss, false);
+    std::vector<unsigned char> big; int bw, bh;
+    readPixels(big, bw, bh);
+    rgba.assign((size_t)w * h * 4, 0);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            for (int c = 0; c < 4; ++c) {
+                unsigned sum = 0;
+                for (int j = 0; j < ss; ++j) for (int i = 0; i < ss; ++i) sum += big[((size_t)(y * ss + j) * bw + (x * ss + i)) * 4 + c];
+                rgba[((size_t)y * w + x) * 4 + c] = (unsigned char)(sum / (ss * ss));
+            }
+    if (oldW >= 8 && oldH >= 8) render(oldW, oldH, false);
+    return true;
 }
 
 }

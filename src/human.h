@@ -49,6 +49,7 @@ struct Proxy {                           // something fitted to the body (MakeHu
     bool transparent = false;            // its texture has see-through parts (hair, eyebrows, lashes)
     int zDepth = 50;                     // drawing order (MakeHuman's z_depth: lower first)
     std::vector<int> deleteVerts;        // the body's vertices it covers (hidden under it)
+    float tint[3] = {1, 1, 1};           // Material Editor: its colour multiplied in
 };
 bool loadProxyFile(const std::string& mhclo, Proxy& p, std::string& err);
 // a material: its diffuse texture (absolute path) and whether it's see-through
@@ -78,6 +79,7 @@ struct Body {
     std::vector<std::string> roots;      // where assets are looked for (data, MakeHuman's asset pack)
     std::string skinMaterial, skinTexture;   // "" : the litsphere skin by ethnicity
     bool hideUnderClothes = true;        // clothes hide the body's faces under them
+    float skinTint[3] = {1, 1, 1};       // Material Editor: the skin's colour multiplied in
 };
 
 extern const char* VAR_NAMES[];          // the macro value names, in val's order
@@ -90,7 +92,7 @@ void setModifier(Body& b, int m, float value);    // and its mirror, with symmet
 void setMacro(Body& b, const std::string& variable, float value);
 void resetAll(Body& b);
 void apply(Body& b);                     // brings pos up to date (only the targets whose weight changed)
-void fitProxy(const Body& b, const Proxy& p, std::vector<float>& out);   // to what's shown (posed if posed)
+void fitProxy(const Body& b, const Proxy& p, std::vector<float>& out, bool rest = false);   // to what's shown (posed if posed), or the rest
 
 // the gear: MakeHuman's proxy libraries. kind: clothes (several), the rest one at a time ("proxymeshes": a topology)
 bool wear(Body& b, const std::string& file, std::string& err);      // clothes: on, or off if already worn
@@ -103,6 +105,11 @@ void defaultGear(Body& b);                                          // MakeHuman
 std::vector<char> hiddenVerts(const Body& b);                        // body vertices under clothes (or all, with a topology)
 std::string relPath(const Body& b, const std::string& abs);         // as MakeHuman writes paths: from the asset root
 std::string absPath(const Body& b, const std::string& rel);
+
+// Modelling > Custom: a .target of your own as a 0..1 slider ("custom/<name>"); -1 if it couldn't be read
+int addCustomTarget(Body& b, const std::string& targetFile);
+// Utilities > Save targets: the shape as it is now (against the base mesh) as a .target file
+bool saveTarget(const Body& b, const std::string& path, std::string& err);
 
 float ageYears(const Body& b);
 float heightCm(const Body& b);

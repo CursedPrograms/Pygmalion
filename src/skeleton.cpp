@@ -5,11 +5,13 @@
 #include "json.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <set>
 #include <sstream>
 
@@ -63,16 +65,20 @@ bool load(Skeleton& s, const std::string& path, std::string& err) {
     if (const Json::Value* p = root.get("planes"))
         for (const auto& kv : p->o) if (kv.second.a.size() == 3) s.planes[kv.first] = {kv.second.a[0].s, kv.second.a[1].s, kv.second.a[2].s};
     // the bones, parents first
-    struct Raw { std::string name, parent, head, tail, plane; };
+    struct Raw { std::string name, parent, head, tail, plane; std::vector<std::string> ref; };
     std::vector<Raw> raw;
     if (const Json::Value* b = root.get("bones"))
-        for (const auto& kv : b->o) raw.push_back({kv.first, kv.second.str("parent"), kv.second.str("head"), kv.second.str("tail"), kv.second.str("rotation_plane")});
+        for (const auto& kv : b->o) {
+            Raw r{kv.first, kv.second.str("parent"), kv.second.str("head"), kv.second.str("tail"), kv.second.str("rotation_plane"), {}};
+            if (const Json::Value* rf = kv.second.get("reference")) for (const auto& x : rf->a) r.ref.push_back(x.s);
+            raw.push_back(r);
+        }
     std::set<std::string> placed;
     while (s.bones.size() < raw.size()) {
         bool any = false;
         for (const auto& r : raw) {
             if (placed.count(r.name) || (!r.parent.empty() && !placed.count(r.parent))) continue;
-            Bone bn; bn.name = r.name; bn.headJoint = r.head; bn.tailJoint = r.tail; bn.plane = r.plane;
+            Bone bn; bn.name = r.name; bn.headJoint = r.head; bn.tailJoint = r.tail; bn.plane = r.plane; bn.reference = r.ref;
             bn.parent = r.parent.empty() ? -1 : s.byName[r.parent];
             s.byName[r.name] = (int)s.bones.size();
             s.bones.push_back(bn); placed.insert(r.name); any = true;
@@ -91,6 +97,7 @@ bool load(Skeleton& s, const std::string& path, std::string& err) {
                     auto it = s.byName.find(kv.first);
                     if (it == s.byName.end()) continue;
                     for (const auto& pr : kv.second.a) if (pr.a.size() == 2) s.weights[it->second].push_back({(int)pr.a[0].n, (float)pr.a[1].n});
+                    s.hasWeights = true;
                 }
     }
     for (auto& b : s.bones) b.pose = ident();
@@ -164,8 +171,11 @@ void skin(const Skeleton& s, const std::vector<float>& rest, std::vector<float>&
             wsum[v] += w;
         }
     }
-    // vertices no bone holds (the helpers) stay where they are
-    for (size_t v = 0; v < wsum.size(); ++v) if (wsum[v] <= 0) for (int i = 0; i < 3; ++i) out[v * 3 + i] = rest[v * 3 + i];
+    // weights that don't add up to 1 are evened out (some helper vertices' do not); vertices no bone holds stay
+    for (size_t v = 0; v < wsum.size(); ++v) {
+        if (wsum[v] <= 0) for (int i = 0; i < 3; ++i) out[v * 3 + i] = rest[v * 3 + i];
+        else if (std::fabs(wsum[v] - 1) > 1e-4f) for (int i = 0; i < 3; ++i) out[v * 3 + i] /= wsum[v];
+    }
 }
 
 // ---------- BVH ----------
@@ -178,7 +188,7 @@ static Mat4 axisRot(char axis, float a) {
     return m;
 }
 
-bool loadBvh(const std::string& path, std::vector<Pose>& frames, std::string& err) {
+bool loadBvh(const std::string& path, std::vector<Pose>& frames, std::string& err, float* frameTimeOut) {
     frames.clear();
     std::string t;
     if (!readAll(path, t)) { err = "Couldn't read " + path; return false; }
@@ -201,9 +211,19 @@ bool loadBvh(const std::string& path, std::vector<Pose>& frames, std::string& er
     int nFrames = 0; float frameTime = 0;
     in >> w >> nFrames >> w >> w >> frameTime;   // Frames: N  Frame Time: T
     // Z up or Y up (bvh.py _autoGuessCoordinateSystem): the longest offsets go up
-    float sum[3] = {0, 0, 0};
-    for (const auto& j : js) for (int c = 0; c < 3; ++c) sum[c] += std::fabs(j.off[c]);
-    const bool zUp = sum[2] > sum[1] && sum[2] > sum[0];
+    // (bvh.py _autoGuessCoordinateSystem: a leg or spine joint's first child; the longer of its Y and Z is up)
+    bool zUp = false;
+    for (const char* n : {"lowerleg02.L", "upperleg02.L", "spine01", "spine02", "spine03", "head"}) {
+        std::string cap = n; cap[0] = (char)toupper((unsigned char)cap[0]);
+        int ref = -1;
+        for (size_t k = 0; k < js.size(); ++k) if (!js[k].end && (js[k].name == n || js[k].name == cap)) ref = (int)k;
+        if (ref < 0) continue;
+        int child = -1;
+        for (size_t k = 0; k < js.size(); ++k) if (js[k].parent == ref) { child = (int)k; break; }
+        if (child < 0 || js[child].end) continue;
+        zUp = std::fabs(js[child].off[2]) > std::fabs(js[child].off[1]);
+        break;
+    }
     const float D = 3.14159265f / 180;
     for (int f = 0; f < nFrames; ++f) {
         Pose p; p.name = fs::u8path(path).stem().u8string();
@@ -230,7 +250,7 @@ bool loadBvh(const std::string& path, std::vector<Pose>& frames, std::string& er
         }
         frames.push_back(std::move(p));
     }
-    (void)frameTime;
+    if (frameTimeOut) *frameTimeOut = frameTime > 0 ? frameTime : 1 / 24.0f;
     if (frames.empty()) { err = "The BVH has no frames"; return false; }
     return true;
 }
@@ -281,6 +301,128 @@ Pose blend(const std::vector<std::pair<const Pose*, float>>& parts) {
         out.bones[n] = toMat(acc);
     }
     return out;
+}
+
+
+// ---------- more for the skeleton library and the exports ----------
+Mat4 identity() { return ident(); }
+Mat4 multiply(const Mat4& a, const Mat4& b) { return mul(a, b); }
+Mat4 inverseRigid(const Mat4& m) { return inv(m); }
+
+void inheritWeights(Skeleton& s, const Skeleton& ref) {
+    if (s.hasWeights) return;
+    s.weights.assign(s.bones.size(), {});
+    // each default bone gives its weights to the bone that stands for it, else to the one standing for its parent...
+    std::vector<int> owner(ref.bones.size(), -1);
+    for (size_t i = 0; i < s.bones.size(); ++i)
+        for (const auto& r : s.bones[i].reference) { auto it = ref.byName.find(r); if (it != ref.byName.end() && owner[it->second] < 0) owner[it->second] = (int)i; }
+    for (size_t k = 0; k < ref.bones.size(); ++k)   // (parents come first)
+        if (owner[k] < 0 && ref.bones[k].parent >= 0) owner[k] = owner[ref.bones[k].parent];
+    std::vector<std::map<int, float>> acc(s.bones.size());
+    for (size_t k = 0; k < ref.bones.size(); ++k) {
+        const int o = owner[k] >= 0 ? owner[k] : 0;
+        for (const auto& [v, w] : ref.weights[k]) acc[o][v] += w;
+    }
+    for (size_t i = 0; i < s.bones.size(); ++i) for (const auto& [v, w] : acc[i]) s.weights[i].push_back({v, w});
+    s.hasWeights = true;
+}
+
+bool usesReferences(const Skeleton& s) {
+    for (const auto& b : s.bones) if (!b.reference.empty()) return true;
+    return false;
+}
+void retarget(Skeleton& s, const Skeleton& src) {
+    for (auto& b : s.bones) {
+        Mat4 pv = ident();
+        int ref = -1;
+        for (const auto& r : b.reference) { auto it = src.byName.find(r); if (it != src.byName.end()) { ref = it->second; break; } }
+        if (ref >= 0) pv = src.bones[ref].poseVerts;
+        else if (b.parent >= 0) pv = s.bones[b.parent].poseVerts;
+        b.poseGlobal = mul(pv, b.restGlobal);
+        b.poseVerts = pv;
+        b.pose = b.parent >= 0 ? mul(inv(mul(s.bones[b.parent].poseGlobal, b.restRelative)), b.poseGlobal) : mul(inv(b.restRelative), b.poseGlobal);
+    }
+}
+
+void boneLines(const Skeleton& s, std::vector<float>& lines) {
+    lines.clear();
+    for (const auto& b : s.bones) {
+        const float len = std::sqrt((b.tail[0] - b.head[0]) * (b.tail[0] - b.head[0]) + (b.tail[1] - b.head[1]) * (b.tail[1] - b.head[1]) + (b.tail[2] - b.head[2]) * (b.tail[2] - b.head[2]));
+        const Mat4& g = b.poseGlobal;
+        lines.insert(lines.end(), {g[12], g[13], g[14], g[12] + g[4] * len, g[13] + g[5] * len, g[14] + g[6] * len});
+    }
+}
+
+// a rotation matrix as BVH's Z, X, Y channels (R = Rz Rx Ry), in degrees
+static void zxy(const Mat4& m, float& z, float& x, float& y) {
+    // column major: m[c*4+r]. R = Rz Rx Ry: R[2][1] = sin x
+    const float r21 = m[1 * 4 + 2];
+    x = std::asin(std::clamp(r21, -1.0f, 1.0f));
+    if (std::fabs(r21) < 0.9999f) {
+        y = std::atan2(-m[0 * 4 + 2], m[2 * 4 + 2]);   // -R[2][0], R[2][2]
+        z = std::atan2(-m[1 * 4 + 0], m[1 * 4 + 1]);   // -R[0][1], R[1][1]
+    } else { y = 0; z = std::atan2(m[0 * 4 + 1], m[0 * 4 + 0]); }
+    const float D = 180 / 3.14159265f;
+    x *= D; y *= D; z *= D;
+}
+
+bool saveBvh(const Skeleton& s0, const std::vector<Pose>& frames, const std::string& path, float scale, float frameTime, std::string& err, const Skeleton* through) {
+    Skeleton s = s0;
+    Skeleton src; if (through) src = *through;
+    std::ofstream o(fs::u8path(path));
+    if (!o) { err = "Couldn't write " + path; return false; }
+    std::vector<std::vector<int>> kids(s.bones.size());
+    for (size_t i = 0; i < s.bones.size(); ++i) if (s.bones[i].parent >= 0) kids[s.bones[i].parent].push_back((int)i);
+    char buf[256];
+    std::function<void(int, int)> joint = [&](int i, int depth) {
+        const Bone& b = s.bones[i];
+        const std::string pad(depth * 2, ' ');
+        float off[3];
+        for (int c = 0; c < 3; ++c) off[c] = (b.parent >= 0 ? b.head[c] - s.bones[b.parent].head[c] : b.head[c]) * scale;
+        o << pad << (b.parent < 0 ? "ROOT " : "JOINT ") << b.name << "\n" << pad << "{\n";
+        snprintf(buf, sizeof buf, "%s  OFFSET %.6f %.6f %.6f\n", pad.c_str(), off[0], off[1], off[2]); o << buf;
+        o << pad << (b.parent < 0 ? "  CHANNELS 6 Xposition Yposition Zposition Zrotation Xrotation Yrotation\n" : "  CHANNELS 3 Zrotation Xrotation Yrotation\n");
+        if (kids[i].empty()) {
+            snprintf(buf, sizeof buf, "%s  End Site\n%s  {\n%s    OFFSET %.6f %.6f %.6f\n%s  }\n", pad.c_str(), pad.c_str(), pad.c_str(),
+                     (b.tail[0] - b.head[0]) * scale, (b.tail[1] - b.head[1]) * scale, (b.tail[2] - b.head[2]) * scale, pad.c_str());
+            o << buf;
+        }
+        for (int k : kids[i]) joint(k, depth + 1);
+        o << pad << "}\n";
+    };
+    o << "HIERARCHY\n";
+    for (size_t i = 0; i < s.bones.size(); ++i) if (s.bones[i].parent < 0) joint((int)i, 0);
+    std::vector<Pose> fr = frames;
+    if (fr.empty()) fr.push_back(Pose());
+    o << "MOTION\nFrames: " << fr.size() << "\n";
+    snprintf(buf, sizeof buf, "Frame Time: %.6f\n", frameTime); o << buf;
+    // order of the channels in a frame: the same depth-first walk
+    std::vector<int> order;
+    std::function<void(int)> walk = [&](int i) { order.push_back(i); for (int k : kids[i]) walk(k); };
+    for (size_t i = 0; i < s.bones.size(); ++i) if (s.bones[i].parent < 0) walk((int)i);
+    for (const auto& p : fr) {
+        if (through) { setPose(src, p.empty() ? nullptr : &p); retarget(s, src); }
+        else setPose(s, p.empty() ? nullptr : &p);
+        std::string line;
+        for (int i : order) {
+            const Bone& b = s.bones[i];
+            // the bone's turn in world axes (BVH's rest is the world's axes), relative to its parent's
+            Mat4 g = b.poseVerts; g[12] = g[13] = g[14] = 0;
+            Mat4 local = g;
+            if (b.parent >= 0) { Mat4 pg = s.bones[b.parent].poseVerts; pg[12] = pg[13] = pg[14] = 0; local = mul(inv(pg), g); }
+            float z, x, y; zxy(local, z, x, y);
+            if (b.parent < 0) {
+                const Mat4& m = b.poseVerts;
+                // (as MakeHuman's bvh.py writes it: the root's move from where it rests)
+                float h[3]; for (int c = 0; c < 3; ++c) h[c] = (m[c] * b.head[0] + m[4 + c] * b.head[1] + m[8 + c] * b.head[2] + m[12 + c] - b.head[c]) * scale;
+                snprintf(buf, sizeof buf, "%.6f %.6f %.6f ", h[0], h[1], h[2]); line += buf;
+            }
+            snprintf(buf, sizeof buf, "%.6f %.6f %.6f ", z, x, y); line += buf;
+        }
+        line.back() = '\n';
+        o << line;
+    }
+    return true;
 }
 
 }

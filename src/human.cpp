@@ -127,6 +127,48 @@ static void addTarget(Body& b, const fs::path& file, const fs::path& root) {
     b.targets.push_back(std::move(t));
 }
 
+int addCustomTarget(Body& b, const std::string& file) {
+    const fs::path f = fs::u8path(file);
+    const std::string stem = f.stem().u8string();
+    const std::string full = "custom/" + stem;
+    auto it = b.modByName.find(full);
+    if (it != b.modByName.end()) return it->second;
+    std::string txt;
+    if (!readAll(f, txt)) return -1;
+    Target t;
+    t.path = "custom/" + f.filename().u8string();
+    t.group = "custom-" + stem;
+    std::istringstream in(txt); std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream ls(line); int i; float x, y, z;
+        if (ls >> i >> x >> y >> z && i >= 0 && (size_t)i * 3 + 2 < b.base.size()) { t.idx.push_back(i); t.d.insert(t.d.end(), {x, y, z}); }
+    }
+    if (t.idx.empty()) return -1;
+    b.groupTargets[t.group].push_back((int)b.targets.size());
+    b.targets.push_back(std::move(t));
+    Modifier m;
+    m.group = "custom"; m.name = stem; m.label = stem; m.right = "custom-" + stem;
+    m.description = "Your own shape: " + f.filename().u8string();
+    b.modByName[full] = (int)b.mods.size();
+    b.mods.push_back(m);
+    return (int)b.mods.size() - 1;
+}
+
+bool saveTarget(const Body& b, const std::string& path, std::string& err) {
+    std::ofstream o(fs::u8path(path));
+    if (!o) { err = "Couldn't write " + path; return false; }
+    o << "# Written by Pygmalion: the shape against MakeHuman's base mesh\n";
+    char buf[96]; int n = 0;
+    for (size_t v = 0; v < b.base.size() / 3; ++v) {
+        const float dx = b.pos[v * 3] - b.base[v * 3], dy = b.pos[v * 3 + 1] - b.base[v * 3 + 1], dz = b.pos[v * 3 + 2] - b.base[v * 3 + 2];
+        if (std::fabs(dx) + std::fabs(dy) + std::fabs(dz) < 1e-5f) continue;
+        snprintf(buf, sizeof buf, "%zu %.6f %.6f %.6f\n", v, dx, dy, dz); o << buf; ++n;
+    }
+    if (!n) { err = "The shape is the base mesh: nothing to save"; return false; }
+    return true;
+}
+
 // ---------- the modifiers (modifiers/*_modifiers.json) and their sliders (*_sliders.json) ----------
 // MakeHuman's own rule (modifierslider.py): the name's words, without the last if it holds the "|" choices and
 // without the group's name when it starts with it, each capitalised
@@ -557,9 +599,9 @@ void apply(Body& b) {
     }
 }
 
-void fitProxy(const Body& b, const Proxy& p, std::vector<float>& out) {
+void fitProxy(const Body& b, const Proxy& p, std::vector<float>& out, bool rest) {
     out.resize(p.pos.size());
-    const std::vector<float>& pos = b.shown.empty() ? b.pos : b.shown;
+    const std::vector<float>& pos = rest || b.shown.empty() ? b.pos : b.shown;
     float scale[3];
     for (int a = 0; a < 3; ++a) {
         const float d = std::fabs(b.pos[(size_t)p.scaleRef[a][0] * 3 + a] - b.pos[(size_t)p.scaleRef[a][1] * 3 + a]);   // (the scale from the unposed body)

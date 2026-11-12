@@ -10,6 +10,10 @@
 #include "model.h"
 #include "splash.h"
 #include "viewer.h"
+#include "export.h"
+#ifdef _WIN32
+#include "http.h"
+#endif
 
 #include <SDL.h>
 #include <SDL_opengl.h>
@@ -147,24 +151,51 @@ static std::string forcedTask;
 static char prompt[512] = "", search[64] = "";
 static std::string understood;
 static float randomAmount = 0.6f; static bool randMacros = true, randFace = true, randBody = true;
-static std::vector<std::pair<std::vector<float>, std::string>> undo;   // values of every modifier, and what changed
+struct State {
+    std::vector<float> mods, macros;
+    std::vector<std::pair<std::string, std::string>> gear;   // each proxy's file and material
+    std::string skin, pose, expression; bool hide = true;
+    std::vector<float> units;
+};
+static std::vector<std::pair<State, std::string>> undo;   // the state before each change, and what changed
+static void restorePose(const std::string& pose, const std::string& expression, const std::vector<float>& units);
+static void getPose(std::string& pose, std::string& expression, std::vector<float>& units);
 static float exportScale = 1.0f;   // MakeHuman's units are decimetres: 0.1 makes metres
 static double now() { return SDL_GetTicks() / 1000.0; }
-static void say(const std::string& s) { toast = s; toastUntil = now() + 6; }
-
-static std::vector<float> snapshot() {
-    std::vector<float> v;
-    for (const auto& m : body.mods) v.push_back(m.value);
-    v.insert(v.end(), {body.gender, body.age, body.muscle, body.weight, body.height, body.proportions, body.african, body.asian, body.caucasian, body.breastSize, body.breastFirmness});
-    return v;
+static std::vector<std::string> logs;   // Utilities > Logs: everything said in the status line
+static void say(const std::string& s) {
+    toast = s; toastUntil = now() + 6;
+    char t[16]; const Uint32 ms = SDL_GetTicks(); snprintf(t, sizeof t, "%02u:%02u ", ms / 60000 % 60, ms / 1000 % 60);
+    logs.push_back(t + s); if (logs.size() > 500) logs.erase(logs.begin());
 }
-static void restore(const std::vector<float>& v) {
-    for (size_t i = 0; i < body.mods.size() && i < v.size(); ++i) body.mods[i].value = v[i];
-    const size_t k = body.mods.size();
-    if (v.size() >= k + 11) {
-        float* f[] = {&body.gender, &body.age, &body.muscle, &body.weight, &body.height, &body.proportions, &body.african, &body.asian, &body.caucasian, &body.breastSize, &body.breastFirmness};
-        for (int i = 0; i < 11; ++i) *f[i] = v[k + i];
+
+static State snapshot() {
+    State st;
+    for (const auto& m : body.mods) st.mods.push_back(m.value);
+    st.macros = {body.gender, body.age, body.muscle, body.weight, body.height, body.proportions, body.african, body.asian, body.caucasian, body.breastSize, body.breastFirmness};
+    for (const auto& p : body.proxies) st.gear.push_back({p.file, p.material});
+    st.skin = body.skinMaterial; st.hide = body.hideUnderClothes;
+    getPose(st.pose, st.expression, st.units);
+    return st;
+}
+static void restore(const State& st) {
+    for (size_t i = 0; i < body.mods.size() && i < st.mods.size(); ++i) body.mods[i].value = st.mods[i];
+    float* f[] = {&body.gender, &body.age, &body.muscle, &body.weight, &body.height, &body.proportions, &body.african, &body.asian, &body.caucasian, &body.breastSize, &body.breastFirmness};
+    for (size_t i = 0; i < 11 && i < st.macros.size(); ++i) *f[i] = st.macros[i];
+    // the gear only when it changed (loading proxies takes a moment)
+    bool same = st.gear.size() == body.proxies.size();
+    for (size_t i = 0; same && i < st.gear.size(); ++i) same = st.gear[i].first == body.proxies[i].file && st.gear[i].second == body.proxies[i].material;
+    if (!same) {
+        body.proxies.clear();
+        std::string err;
+        for (const auto& [file, mat] : st.gear) {
+            if (!Human::wear(body, file, err)) continue;
+            for (auto& p : body.proxies) if (p.file == file && !mat.empty() && p.material != mat) { p.material = mat; Human::loadMaterial(mat, p.texture, p.transparent); }
+        }
     }
+    if (st.skin != body.skinMaterial) Human::setSkin(body, st.skin);
+    body.hideUnderClothes = st.hide;
+    restorePose(st.pose, st.expression, st.units);
     dirty = true;
 }
 static void remember(const std::string& what) { undo.push_back({snapshot(), what}); if (undo.size() > 60) undo.erase(undo.begin()); }
@@ -210,7 +241,7 @@ struct Prefs {
     bool invertMouse = false;
 };
 static Prefs prefs;
-static std::vector<std::pair<std::vector<float>, std::string>> redo;
+static std::vector<std::pair<State, std::string>> redo;
 
 static std::string units(float cm) {
     char b[48];
@@ -312,10 +343,16 @@ static std::vector<Skel::Pose> faceUnits; static std::vector<std::string> unitNa
 static std::string expressionFile;
 static bool showBones = false;
 
+static std::string userDataDir() {   // MakeHuman's "data" in the user's own folder: downloaded packs go here
+    const std::string h = homeDir();
+    if (h.empty()) return "";
+    std::error_code ec; fs::create_directories(fs::u8path(h) / "data", ec);
+    return (fs::u8path(h) / "data").u8string();
+}
 static std::vector<std::string> filesIn(const std::string& sub, const char* ext) {
     std::vector<std::string> v;
     std::error_code ec;
-    for (const std::string& root : {dataDir, assetsDir()})
+    for (const std::string& root : {dataDir, assetsDir(), userDataDir()})
         if (!root.empty())
             for (const auto& e : fs::recursive_directory_iterator(fs::u8path(root) / sub, ec))
                 if (e.is_regular_file() && e.path().extension() == ext) v.push_back(e.path().u8string());
@@ -334,11 +371,12 @@ static void loadFaceUnits() {
 }
 
 // the pose: the body's pose, the face's expression over it (mixPoses: the expression's bones win)
+static Skel::Skeleton chosen;                   // the chosen skeleton: exported, and shown with Show the bones
+static Skel::Pose currentPose;                  // what the body is posed with now (empty: the rest)
 static void repose() {
     if (rig.empty()) { body.shown.clear(); return; }
     bool anyUnit = false;
     for (size_t k = 1; k < unitW.size(); ++k) if (unitW[k] > 0) anyUnit = true;
-    if (bodyPose.empty() && !anyUnit) { body.shown.clear(); return; }
     Skel::Pose p = bodyPose;
     if (anyUnit) {
         std::vector<std::pair<const Skel::Pose*, float>> parts;
@@ -350,8 +388,24 @@ static void repose() {
             if (moved) p.bones[kv.first] = m;
         }
     }
-    Skel::setPose(rig, &p);
-    Skel::skin(rig, body.pos, body.shown);
+    currentPose = p;
+    const bool posed = !p.empty();
+    Skel::setPose(rig, posed ? &p : nullptr);
+    if (!chosen.empty()) { if (Skel::usesReferences(chosen)) Skel::retarget(chosen, rig); else Skel::setPose(chosen, posed ? &p : nullptr); }
+    if (posed) Skel::skin(rig, body.pos, body.shown); else body.shown.clear();
+    std::vector<float> lines;
+    Skel::boneLines(chosen.empty() ? rig : chosen, lines);
+    Viewer::setBones(lines);
+}
+static void setSkeletonFile(const std::string& f) {
+    skeletonFile = f;
+    chosen = Skel::Skeleton();
+    if (!f.empty()) {
+        std::string err;
+        if (Skel::load(chosen, f, err)) Skel::inheritWeights(chosen, rig);
+        else { say(err); skeletonFile.clear(); chosen = Skel::Skeleton(); }
+    }
+    dirty = true;
 }
 
 static void setPoseFile(const std::string& f) {
@@ -374,6 +428,31 @@ static void setExpressionFile(const std::string& f) {
         if (Json::parse(t, i, v)) if (const Json::Value* u = v.get("unit_poses"))
             for (const auto& kv : u->o) for (size_t k = 0; k < unitNames.size(); ++k) if (unitNames[k] == kv.first) unitW[k] = (float)kv.second.n;
     }
+    dirty = true;
+}
+
+static void getPose(std::string& pose, std::string& expression, std::vector<float>& units) { pose = poseFile; expression = expressionFile; units = unitW; }
+static void restorePose(const std::string& pose, const std::string& expression, const std::vector<float>& units) {
+    if (pose != poseFile) setPoseFile(pose);
+    expressionFile = expression;
+    if (units.size() == unitW.size()) unitW = units;
+}
+
+// ---------- Pose/Animate > Animations: MakeHuman's BVH animations played on the body ----------
+static std::vector<Skel::Pose> animFrames; static std::string animFile;
+static float animFrameTime = 1 / 24.0f, animFrame = 0, animSpeed = 1; static bool animPlaying = false;
+static void setAnimation(const std::string& f) {
+    animFile = f; animFrames.clear(); animPlaying = false; animFrame = 0;
+    if (f.empty()) { bodyPose = Skel::Pose(); poseFile.clear(); dirty = true; return; }
+    std::string err;
+    if (!Skel::loadBvh(f, animFrames, err, &animFrameTime)) { say(err); animFile.clear(); return; }
+    bodyPose = animFrames[0]; poseFile.clear(); animPlaying = true; dirty = true;
+}
+static void animate(float dt) {
+    if (!animPlaying || animFrames.empty()) return;
+    animFrame += dt * animSpeed / std::max(animFrameTime, 1e-3f);
+    while (animFrame >= animFrames.size()) animFrame -= (float)animFrames.size();
+    bodyPose = animFrames[(size_t)animFrame];
     dirty = true;
 }
 
@@ -515,10 +594,10 @@ static std::vector<std::string> tasksOf(int c) {
     }
     case CAT_GEOMETRIES: return {"Clothes", "Eyes", "Hair", "Teeth", "Topologies", "Eyebrows", "Eyelashes", "Tongue"};
     case CAT_MATERIALS: return {"Skin/Material"};
-    case CAT_POSE: return {"Skeleton", "Pose", "Expression"};
+    case CAT_POSE: return {"Skeleton", "Pose", "Expression", "Animations"};
     case CAT_RENDERING: return {"Render", "Scene", "Viewer"};
-    case CAT_SETTINGS: return {"Sliders", "General", "Mouse", "Shortcuts"};
-    case CAT_UTILITIES: return {"Describe", "Symmetry", "Statistics"};
+    case CAT_SETTINGS: return {"Sliders", "General", "Background", "Mouse", "Shortcuts"};
+    case CAT_UTILITIES: return {"Describe", "Symmetry", "Statistics", "Material Editor", "Expression mixer", "Targets", "Save targets", "Mass produce", "Scripting", "Download", "Data", "Logs"};
     default: return {"About", "Licence"};
     }
 }
@@ -622,11 +701,68 @@ static std::vector<std::string> modelFiles() {
     std::sort(v.begin(), v.end());
     return v;
 }
+static std::string relData(const std::string& f) { return f.empty() ? std::string() : Human::relPath(body, f); }
+static std::string findData(const std::string& rel, const char* sub) {
+    if (rel.empty()) return "";
+    { const size_t k = rel.find('/'); const std::string tail = k == std::string::npos ? rel : rel.substr(k + 1); if (fs::u8path(tail).is_absolute()) return tail; }
+    std::string f = Human::absPath(body, rel);
+    if (f.empty()) for (const auto& c : filesIn(sub, fs::u8path(rel).extension().u8string().c_str())) if (fs::u8path(c).filename() == fs::u8path(rel).filename()) return c;
+    return f;
+}
+static bool saveModel(const std::string& path, const std::string& name, std::string& err) {
+    if (!Human::saveMhm(body, path, name, err)) return false;
+    std::ofstream o(fs::u8path(path), std::ios::app);
+    if (!skeletonFile.empty()) o << "skeleton " << fs::u8path(skeletonFile).filename().u8string() << "\n";
+    if (!poseFile.empty()) o << "pose " << relData(poseFile) << "\n";
+    if (!expressionFile.empty()) o << "expression " << relData(expressionFile) << "\n";
+    return true;
+}
+static bool loadModel(const std::string& path, std::string& err) {
+    if (!Human::loadMhm(body, path, err)) return false;
+    std::ifstream in(fs::u8path(path)); std::string line;
+    std::string sk, po, ex;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        std::istringstream ls(line); std::string k, v; ls >> k; std::getline(ls >> std::ws, v);
+        if (k == "skeleton") sk = v; else if (k == "pose") po = v; else if (k == "expression") ex = v;
+    }
+    setSkeletonFile(sk.empty() ? std::string() : findData("rigs/" + sk, "rigs"));
+    setPoseFile(findData(po, "poses"));
+    if (!ex.empty()) setExpressionFile(findData(ex, "expressions")); else { expressionFile.clear(); std::fill(unitW.begin(), unitW.end(), 0.0f); }
+    animFrames.clear(); animFile.clear(); animPlaying = false;
+    return true;
+}
 static char saveName[128] = "person";
-static int exportFormat = 0; static int exportUnits = 1;
-static const char* EXPORT_NAMES[] = {"glTF binary (glb)", "Wavefront obj", "Stereolithography (stl)"};
+static int exportFormat = 0; static int exportUnits = 1; static bool exportFeet = true, exportPosed = true, exportAnim = false;
+enum { EX_DAE, EX_FBX, EX_GLB, EX_OBJ, EX_OGRE, EX_STL, EX_BVH, EX_UV, EX_COUNT };
+static const char* EXPORT_NAMES[] = {"Collada (dae)", "Filmbox (fbx)", "glTF binary (glb)", "Wavefront obj", "Ogre3D", "Stereolithography (stl)", "Biovision Hierarchy (bvh)", "UV map (png)"};
+static const char* EXPORT_EXT[] = {".dae", ".fbx", ".glb", ".obj", ".mesh.xml", ".stl", ".bvh", ".png"};
 static const char* UNIT_NAMES[] = {"decimeter", "meter", "centimeter", "millimeter", "inch"};
 static const float UNIT_SCALE[] = {1, 0.1f, 10, 100, 3.93700787f};
+static const float UNIT_CM[] = {10, 100, 1, 0.1f, 2.54f};
+static Mesh toMesh();
+static bool exportTo(const std::string& p, int fmt, std::string& err) {
+    const float sc = UNIT_SCALE[exportUnits];
+    if (fmt == EX_GLB || fmt == EX_OBJ || fmt == EX_STL) {
+        const Mesh m = toMesh();
+        return fmt == EX_GLB ? saveGlb(m, p, sc, false, err) : fmt == EX_OBJ ? saveObj(m, p, sc, false, err) : saveStl(m, p, sc, false, err);
+    }
+    if (fmt == EX_UV) return Export::saveUvMap(body, p, 2048, err);
+    if (fmt == EX_BVH) {
+        const Skel::Skeleton& sk = chosen.empty() ? rig : chosen;
+        if (sk.empty()) { err = "No skeleton to export"; return false; }
+        std::vector<Skel::Pose> frames;
+        if (exportAnim && !animFrames.empty()) frames = animFrames;
+        else if (!currentPose.empty()) frames.push_back(currentPose);
+        const bool ok = Skel::saveBvh(sk, frames, p, sc, animFrameTime, err, &sk != &rig && Skel::usesReferences(sk) ? &rig : nullptr);
+        repose();   // (saving walked the skeleton through the frames)
+        return ok;
+    }
+    Export::Options o; o.scale = sc; o.cmPerUnit = UNIT_CM[exportUnits]; o.feetOnGround = exportFeet; o.posed = exportPosed;
+    const Skel::Skeleton* sk = chosen.empty() ? nullptr : &chosen;
+    const auto parts = Export::withTexturesBeside(Export::parts(body, sk, exportPosed && fmt != EX_FBX), p);
+    return fmt == EX_DAE ? Export::saveCollada(parts, sk, p, o, err) : fmt == EX_FBX ? Export::saveFbx(parts, sk, p, o, err) : Export::saveOgre(parts, sk, p, o, err);
+}
 static bool wantThumb = false; static std::string thumbPath;
 
 static void filesLeft(float w) {
@@ -636,14 +772,14 @@ static void filesLeft(float w) {
         if (ImGui::Button("Load from another folder...", ImVec2(w, 0))) {
             const std::string p = fileDialog(false, L"MakeHuman model\0*.mhm\0\0", L"mhm", homeDir() + "\\");
             std::string err;
-            if (!p.empty()) { remember("Load"); if (Human::loadMhm(body, p, err)) { dirty = true; say("Loaded " + fs::u8path(p).filename().u8string()); } else say(err); }
+            if (!p.empty()) { remember("Load"); if (loadModel(p, err)) { dirty = true; say("Loaded " + fs::u8path(p).filename().u8string()); } else say(err); }
         }
         for (const auto& f : modelFiles()) {
             const std::string name = fs::u8path(f).stem().u8string();
             const GLuint th = picture(fs::u8path(f).replace_extension(".thumb").u8string());
             ImGui::PushID(f.c_str());
-            if (th) { if (ImGui::ImageButton("t", (ImTextureID)(intptr_t)th, ImVec2(64, 64))) { std::string err; remember("Load"); if (Human::loadMhm(body, f, err)) dirty = true; else say(err); } ImGui::SameLine(); }
-            if (ImGui::Button(name.c_str(), ImVec2(th ? w - 80 : w, th ? 72 : 0))) { std::string err; remember("Load"); if (Human::loadMhm(body, f, err)) dirty = true; else say(err); }
+            if (th) { if (ImGui::ImageButton("t", (ImTextureID)(intptr_t)th, ImVec2(64, 64))) { std::string err; remember("Load"); if (loadModel(f, err)) dirty = true; else say(err); } ImGui::SameLine(); }
+            if (ImGui::Button(name.c_str(), ImVec2(th ? w - 80 : w, th ? 72 : 0))) { std::string err; remember("Load"); if (loadModel(f, err)) dirty = true; else say(err); }
             ImGui::PopID();
         }
     } else if (task[CAT_FILES] == "Save") {
@@ -652,40 +788,47 @@ static void filesLeft(float w) {
         if (ImGui::Button("Save", ImVec2(w, 0))) {
             const std::string p = (fs::u8path(homeDir()) / (std::string(saveName) + ".mhm")).u8string();
             std::string err;
-            if (Human::saveMhm(body, p, saveName, err)) { say("Saved " + p + " (MakeHuman opens it too)"); wantThumb = true; thumbPath = fs::u8path(p).replace_extension(".thumb").u8string(); }
+            if (saveModel(p, saveName, err)) { say("Saved " + p + " (MakeHuman opens it too)"); wantThumb = true; thumbPath = fs::u8path(p).replace_extension(".thumb").u8string(); }
             else say(err);
         }
         if (ImGui::Button("Save as...", ImVec2(w, 0))) {
             const std::string p = fileDialog(true, L"MakeHuman model\0*.mhm\0\0", L"mhm", homeDir() + "\\" + saveName + ".mhm");
             std::string err;
-            if (!p.empty()) { if (Human::saveMhm(body, p, fs::u8path(p).stem().u8string(), err)) { say("Saved"); wantThumb = true; thumbPath = fs::u8path(p).replace_extension(".thumb").u8string(); } else say(err); }
+            if (!p.empty()) { if (saveModel(p, fs::u8path(p).stem().u8string(), err)) { say("Saved"); wantThumb = true; thumbPath = fs::u8path(p).replace_extension(".thumb").u8string(); } else say(err); }
         }
         ImGui::TextDisabled("A picture of the view is saved beside it (.thumb), as MakeHuman does.");
     } else {
         groupBox("Export");
         ImGui::SetNextItemWidth(w); ImGui::InputText("##ename", saveName, sizeof saveName);
         if (ImGui::Button("Export...", ImVec2(w, 0))) {
-            static const wchar_t* filters[] = {L"GLB\0*.glb\0\0", L"OBJ\0*.obj\0\0", L"STL\0*.stl\0\0"};
-            static const wchar_t* exts[] = {L"glb", L"obj", L"stl"};
-            static const char* dots[] = {".glb", ".obj", ".stl"};
-            const std::string p = fileDialog(true, filters[exportFormat], exts[exportFormat], homeDir() + "\\" + saveName + dots[exportFormat]);
-            if (!p.empty()) {
-                std::string err;
-                const Mesh m = toMesh();
-                const float sc = UNIT_SCALE[exportUnits];
-                const bool ok = exportFormat == 0 ? saveGlb(m, p, sc, false, err) : exportFormat == 1 ? saveObj(m, p, sc, false, err) : saveStl(m, p, sc, false, err);
-                say(ok ? "Exported " + fs::u8path(p).filename().u8string() : err);
-            }
+            std::wstring filter = L"File\0*", ext;
+            const std::string dot = EXPORT_EXT[exportFormat];
+            for (char c : dot) filter += (wchar_t)c;
+            filter += L"\0\0";
+            for (char c : dot.substr(dot.rfind('.') + 1)) ext += (wchar_t)c;
+            const std::string p = fileDialog(true, filter.c_str(), ext.c_str(), homeDir() + "\\" + saveName + dot);
+            if (!p.empty()) { std::string err; say(exportTo(p, exportFormat, err) ? "Exported " + fs::u8path(p).filename().u8string() : err); }
         }
+        ImGui::PushTextWrapPos(w);
+        if (exportFormat == EX_DAE || exportFormat == EX_FBX || exportFormat == EX_OGRE)
+            ImGui::TextDisabled(chosen.empty() ? "No skeleton is chosen (Pose/Animate > Skeleton): the mesh goes without one." : "With the %s skeleton and its weights; textures are copied beside it.", chosen.name.c_str());
+        else if (exportFormat == EX_BVH) ImGui::TextDisabled("The %s skeleton and the current pose (or the animation).", chosen.empty() ? "default" : chosen.name.c_str());
+        else if (exportFormat == EX_UV) ImGui::TextDisabled("The body's UV layout as a 2048 x 2048 picture, for painting skins.");
+        ImGui::PopTextWrapPos();
     }
 }
 static void filesRight() {
     if (task[CAT_FILES] != "Export") return;
     groupBox("Mesh format");
-    for (int k = 0; k < 3; ++k) ImGui::RadioButton(EXPORT_NAMES[k], &exportFormat, k);
+    for (int k = 0; k < EX_COUNT; ++k) ImGui::RadioButton(EXPORT_NAMES[k], &exportFormat, k);
     groupBox("Options");
     ImGui::TextUnformatted("Scale units");
     ImGui::SetNextItemWidth(-1); ImGui::Combo("##units", &exportUnits, UNIT_NAMES, 5);
+    if (exportFormat == EX_DAE || exportFormat == EX_FBX || exportFormat == EX_OGRE) {
+        ImGui::Checkbox("Feet on ground", &exportFeet);
+        ImGui::Checkbox("In the current pose", &exportPosed);
+    }
+    if (exportFormat == EX_BVH) ImGui::Checkbox("The whole animation", &exportAnim);
 }
 
 // ---------- the toolbar: MakeHuman's edit, view, symmetry and camera buttons ----------
@@ -718,6 +861,8 @@ static void toolbar(float x, float y, float w) {
     if (btn("Wire", "Show the mesh's lines", lk.wire)) lk.wire = !lk.wire;
     if (btn("Clay", "Plain grey instead of skin", lk.shading == 1)) lk.shading = lk.shading == 1 ? 0 : 1;
     if (btn("Floor", "The grid under the feet", lk.grid)) lk.grid = !lk.grid;
+    if (btn("Bones", "Show the skeleton", lk.bones)) { lk.bones = !lk.bones; showBones = lk.bones; }
+    if (btn("Ortho", "Orthographic view (no perspective)", lk.ortho)) lk.ortho = !lk.ortho;
     gap();
     if (btn("R>L", "Copy the right side's shapes to the left")) symmetry(true);
     if (btn("L>R", "Copy the left side's shapes to the right")) symmetry(false);
@@ -741,6 +886,393 @@ static void toolbar(float x, float y, float w) {
     ImGui::PopStyleColor(); ImGui::PopStyleVar();
 }
 
+// ---------- Rendering: Render, Scene, Viewer ----------
+static int renderW = 1920, renderH = 1080, renderSS = 2; static bool renderTransparent = false;
+static std::vector<unsigned char> rendered; static int renderedW = 0, renderedH = 0; static GLuint renderedTex = 0;
+static bool renderNow(int w, int h) {
+    Viewer::Look& lk = Viewer::look();
+    const bool was = lk.transparent;
+    lk.transparent = renderTransparent;
+    const bool ok = Viewer::renderImage(w, h, renderSS, rendered);
+    lk.transparent = was;
+    if (!ok) return false;
+    renderedW = w; renderedH = h;
+    if (!renderedTex) glGenTextures(1, &renderedTex);
+    glBindTexture(GL_TEXTURE_2D, renderedTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rendered.data());
+    return true;
+}
+static bool saveRendered(const std::string& p) {
+    return !rendered.empty() && stbi_write_png(fs::u8path(p).string().c_str(), renderedW, renderedH, 4, rendered.data(), renderedW * 4) != 0;
+}
+static void renderingLeft(const std::string& t, float lw) {
+    Viewer::Look& lk = Viewer::look();
+    if (t == "Render") {
+        groupBox("Resolution");
+        ImGui::SetNextItemWidth(lw); ImGui::SliderInt("##rw", &renderW, 64, 8192, "Width %d px");
+        ImGui::SetNextItemWidth(lw); ImGui::SliderInt("##rh", &renderH, 64, 8192, "Height %d px");
+        const struct { const char* n; int w, h; } presets[] = {{"HD", 1280, 720}, {"Full HD", 1920, 1080}, {"4K", 3840, 2160}, {"Square", 2048, 2048}, {"Portrait", 1080, 1920}};
+        for (int k = 0; k < 5; ++k) { if (k) ImGui::SameLine(); if (ImGui::SmallButton(presets[k].n)) { renderW = presets[k].w; renderH = presets[k].h; } }
+        groupBox("Quality");
+        ImGui::SetNextItemWidth(lw); ImGui::SliderInt("##ss", &renderSS, 1, 4, "Anti-aliasing %dx");
+        ImGui::Checkbox("Transparent background", &renderTransparent);
+        if (ImGui::Button("Render", ImVec2(lw, 34))) {
+            if (renderNow(renderW, renderH)) { say("Rendered " + std::to_string(renderW) + " x " + std::to_string(renderH) + " (Rendering > Viewer)"); forcedTask = "Viewer"; }
+            else say("That size is too big for this graphics card");
+        }
+        ImGui::TextDisabled("The view as it is now, at this size.");
+    } else if (t == "Scene") {
+        groupBox("Light");
+        ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##li", &lk.light, 0.1f, 2.5f, "Brightness %.2f");
+        for (int c = 0; c < 3; ++c) { static const char* n[] = {"Red %.2f", "Green %.2f", "Blue %.2f"}; ImGui::PushID(c); ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##lc", &lk.lightCol[c], 0, 1.5f, n[c]); ImGui::PopID(); }
+        if (ImGui::SmallButton("White")) lk.lightCol[0] = lk.lightCol[1] = lk.lightCol[2] = 1;
+        ImGui::SameLine(); if (ImGui::SmallButton("Warm")) { lk.lightCol[0] = 1.1f; lk.lightCol[1] = 0.98f; lk.lightCol[2] = 0.85f; }
+        ImGui::SameLine(); if (ImGui::SmallButton("Cold")) { lk.lightCol[0] = 0.88f; lk.lightCol[1] = 0.96f; lk.lightCol[2] = 1.12f; }
+        groupBox("Background");
+        for (int c = 0; c < 3; ++c) { static const char* n[] = {"Red %.2f", "Green %.2f", "Blue %.2f"}; ImGui::PushID(10 + c); ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##bg", &lk.bg[c], 0, 1, n[c]); ImGui::PopID(); }
+        groupBox("Camera");
+        ImGui::Checkbox("Orthographic", &lk.ortho);
+    } else {
+        groupBox("Viewer");
+        if (rendered.empty()) { notYet("Nothing rendered yet: Rendering > Render makes a picture, shown here."); return; }
+        ImGui::Text("%d x %d", renderedW, renderedH);
+        if (ImGui::Button("Save as...", ImVec2(lw, 0))) {
+            const std::string p = fileDialog(true, L"PNG\0*.png\0\0", L"png", homeDir() + "\\render.png");
+            if (!p.empty()) say(saveRendered(p) ? "Saved " + p : "Couldn't save " + p);
+        }
+    }
+}
+
+// ---------- Settings > Background: a picture behind the person ----------
+static void backgroundLeft(float lw) {
+    Viewer::Look& lk = Viewer::look();
+    groupBox("Background picture");
+    if (ImGui::Button("Choose a picture...", ImVec2(lw, 0))) {
+        const std::string p = fileDialog(false, L"Pictures\0*.png;*.jpg;*.jpeg;*.bmp\0\0", L"png", homeDir() + "\\");
+        if (!p.empty()) lk.bgImage = p;
+    }
+    if (!lk.bgImage.empty()) {
+        ImGui::PushTextWrapPos(lw); ImGui::TextDisabled("%s", lk.bgImage.c_str()); ImGui::PopTextWrapPos();
+        ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##bo", &lk.bgOpacity, 0, 1, "Opacity %.2f");
+        if (ImGui::Button("Remove", ImVec2(lw, 0))) lk.bgImage.clear();
+    }
+    notYet("A photo or drawing behind the person to model against, like MakeHuman's background images.");
+}
+
+// ---------- Utilities ----------
+static int matPick = 0;   // 0: the skin; k: proxy k-1
+static void materialEditor(float lw) {
+    groupBox("Object");
+    std::vector<std::string> names = {"Skin"};
+    for (const auto& p : body.proxies) names.push_back(niceName(p.file) + " (" + p.kind + ")");
+    matPick = std::clamp(matPick, 0, (int)names.size() - 1);
+    std::vector<const char*> cn; for (const auto& n : names) cn.push_back(n.c_str());
+    ImGui::SetNextItemWidth(lw); ImGui::Combo("##obj", &matPick, cn.data(), (int)cn.size());
+    float* tint = matPick == 0 ? body.skinTint : body.proxies[matPick - 1].tint;
+    std::string& tex = matPick == 0 ? body.skinTexture : body.proxies[matPick - 1].texture;
+    groupBox("Colour");
+    for (int c = 0; c < 3; ++c) { static const char* n[] = {"Red %.2f", "Green %.2f", "Blue %.2f"}; ImGui::PushID(c); ImGui::SetNextItemWidth(lw); if (ImGui::SliderFloat("##t", &tint[c], 0, 2, n[c])) dirty = true; ImGui::PopID(); }
+    if (ImGui::Button("Plain", ImVec2(lw, 0))) { tint[0] = tint[1] = tint[2] = 1; dirty = true; }
+    groupBox("Texture");
+    ImGui::PushTextWrapPos(lw); ImGui::TextDisabled("%s", tex.empty() ? "(none)" : tex.c_str()); ImGui::PopTextWrapPos();
+    if (ImGui::Button("Change texture...", ImVec2(lw, 0))) {
+        const std::string p = fileDialog(false, L"Pictures\0*.png;*.jpg;*.jpeg\0\0", L"png", homeDir() + "\\");
+        if (!p.empty()) { tex = p; dirty = true; }
+    }
+    if (matPick > 0) { if (ImGui::Checkbox("See-through (alpha)", &body.proxies[matPick - 1].transparent)) dirty = true; }
+    groupBox("Material file");
+    if (ImGui::Button("Load a material (.mhmat)...", ImVec2(lw, 0))) {
+        const std::string p = fileDialog(false, L"MakeHuman material\0*.mhmat\0\0", L"mhmat", homeDir() + "\\");
+        if (!p.empty()) { remember("Material"); if (matPick == 0) Human::setSkin(body, p); else Human::setProxyMaterial(body, body.proxies[matPick - 1].kind, p); dirty = true; }
+    }
+    if (ImGui::Button("Save as a material...", ImVec2(lw, 0))) {
+        const std::string p = fileDialog(true, L"MakeHuman material\0*.mhmat\0\0", L"mhmat", homeDir() + "\\material.mhmat");
+        if (!p.empty()) {
+            std::ofstream o(fs::u8path(p));
+            char b[128];
+            o << "# Written by Pygmalion\nname " << fs::u8path(p).stem().u8string() << "\n";
+            snprintf(b, sizeof b, "diffuseColor %.4f %.4f %.4f\n", std::min(tint[0], 1.0f), std::min(tint[1], 1.0f), std::min(tint[2], 1.0f)); o << b;
+            if (!tex.empty()) {
+                const fs::path src = fs::u8path(tex), dst = fs::u8path(p).parent_path() / src.filename();
+                std::error_code ec; if (!fs::exists(dst, ec)) fs::copy_file(src, dst, ec);
+                o << "diffuseTexture " << src.filename().u8string() << "\n";
+            }
+            if (matPick > 0 && body.proxies[matPick - 1].transparent) o << "transparent True\n";
+            say("Saved " + p);
+        }
+    }
+}
+
+static char targetFilter[64] = "";
+static void targetsView(float lw) {
+    groupBox("Targets in use");
+    ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##tf", "filter", targetFilter, sizeof targetFilter);
+    int n = 0;
+    ImGui::BeginChild("tl", ImVec2(lw, 0));
+    for (const auto& t : body.targets) {
+        if (std::fabs(t.weight) < 1e-4f) continue;
+        if (targetFilter[0] && t.path.find(targetFilter) == std::string::npos) continue;
+        ImGui::TextDisabled("%.3f", t.weight); ImGui::SameLine(); ImGui::TextUnformatted(t.path.c_str());
+        ++n;
+    }
+    if (!n) ImGui::TextDisabled("(none)");
+    ImGui::EndChild();
+}
+
+static char targetName[64] = "my-shape";
+static void customFolder(std::string& dir) { dir = homeDir().empty() ? std::string() : (fs::u8path(homeDir()) / "custom").u8string(); std::error_code ec; if (!dir.empty()) fs::create_directories(fs::u8path(dir), ec); }
+static void loadCustomTargets() {
+    std::string dir; customFolder(dir);
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(fs::u8path(dir), ec)) if (e.path().extension() == ".target") Human::addCustomTarget(body, e.path().u8string());
+}
+static void saveTargetsLeft(float lw) {
+    groupBox("Save the shape as a target");
+    ImGui::SetNextItemWidth(lw); ImGui::InputText("##tn", targetName, sizeof targetName);
+    if (ImGui::Button("Save", ImVec2(lw, 0))) {
+        std::string dir; customFolder(dir);
+        const std::string p = (fs::u8path(dir) / (std::string(targetName) + ".target")).u8string();
+        std::string err;
+        if (Human::saveTarget(body, p, err)) { say("Saved " + p + " (Modelling > Custom)"); Human::addCustomTarget(body, p); } else say(err);
+    }
+    notYet("The whole shape as it is now, against MakeHuman's base mesh. It's saved in your custom folder and appears as a slider in Modelling > Custom.");
+}
+
+static void customLeft(float lw) {
+    groupBox("Custom targets");
+    std::string dir; customFolder(dir);
+    if (ImGui::Button("Look again", ImVec2(lw / 2 - 4, 0))) loadCustomTargets();
+    ImGui::SameLine();
+#ifdef _WIN32
+    if (ImGui::Button("Open the folder", ImVec2(lw / 2 - 4, 0))) ShellExecuteW(nullptr, L"open", fs::u8path(dir).wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#endif
+    int n = 0;
+    for (size_t i = 0; i < body.mods.size(); ++i) if (body.mods[i].group == "custom") { modSlider((int)i, lw, "frontView"); ++n; }
+    if (!n) notYet(("Put your own .target files (from Blender's MakeTarget, or Utilities > Save targets) in " + dir + " and they appear here as sliders.").c_str());
+}
+
+// Mass produce: many random people, saved (and exported) one after another
+static int massCount = 10, massLeft = 0, massDone = 0, massFormat = -1; static float massAmount = 0.5f; static bool massRandGear = true;
+static void massStep() {
+    if (massLeft <= 0) return;
+    std::random_device rd;
+    Human::randomize(body, massAmount, true, true, true, rd());
+    if (massRandGear) {   // clothes, hair, skin at random too
+        auto pick = [&](const std::vector<std::string>& v) { return v.empty() ? std::string() : v[rd() % v.size()]; };
+        std::string err;
+        Human::takeOff(body, "hair"); Human::takeOff(body, "clothes");
+        const std::string h = pick(filesIn("hair", ".mhclo")); if (!h.empty()) Human::wear(body, h, err);
+        const std::string c = pick(filesIn("clothes", ".mhclo")); if (!c.empty()) Human::wear(body, c, err);
+        Human::setSkin(body, pick(filesIn("skins", ".mhmat")));
+    }
+    Human::apply(body);
+    if (!rig.empty()) Skel::build(rig, body.pos);
+    if (!chosen.empty()) Skel::build(chosen, body.pos);
+    repose();
+    std::string dir = (fs::u8path(homeDir()) / "massproduce").u8string();
+    std::error_code ec; fs::create_directories(fs::u8path(dir), ec);
+    char name[32]; snprintf(name, sizeof name, "person%03d", massDone + 1);
+    std::string err;
+    saveModel((fs::u8path(dir) / (std::string(name) + ".mhm")).u8string(), name, err);
+    if (massFormat >= 0) exportTo((fs::u8path(dir) / (std::string(name) + EXPORT_EXT[massFormat])).u8string(), massFormat, err);
+    ++massDone; --massLeft;
+    dirty = true;
+    if (!massLeft) say("Made " + std::to_string(massDone) + " people in " + dir);
+}
+static void massLeftPanel(float lw) {
+    groupBox("Mass produce");
+    ImGui::SetNextItemWidth(lw); ImGui::SliderInt("##mc", &massCount, 1, 500, "%d people");
+    ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##ma", &massAmount, 0.05f, 1, "Variation %.2f");
+    ImGui::Checkbox("Random hair, clothes and skin", &massRandGear);
+    std::vector<const char*> f = {"Models only (.mhm)"}; for (int k = 0; k < EX_COUNT; ++k) f.push_back(EXPORT_NAMES[k]);
+    int sel = massFormat + 1;
+    ImGui::SetNextItemWidth(lw); if (ImGui::Combo("##mf", &sel, f.data(), (int)f.size())) massFormat = sel - 1;
+    if (massLeft > 0) {
+        ImGui::ProgressBar((float)massDone / std::max(1, massDone + massLeft), ImVec2(lw, 0));
+        if (ImGui::Button("Stop", ImVec2(lw, 0))) massLeft = 0;
+    } else if (ImGui::Button("Make them", ImVec2(lw, 34))) { remember("Mass produce"); massLeft = massCount; massDone = 0; }
+    notYet(("They're saved in " + (fs::u8path(homeDir()) / "massproduce").u8string() + ".").c_str());
+}
+
+// Scripting: Pygmalion's own commands, a line each (MakeHuman's is Python; this does the same jobs)
+static char script[8192] = "# a line each; # starts a note\nreset\nmacro Gender 0\nmacro Age 0.4\nmodifier nose/nose-scale-horiz-decr|incr 0.3\nwear hair/bob01/bob01.mhclo\nskin skins/young_caucasian_female/young_caucasian_female.mhmat\nexpression smile01\n";
+static std::string scriptLog;
+static void runScript(const std::string& text) {
+    scriptLog.clear();
+    std::istringstream in(text); std::string line; int n = 0;
+    auto out = [&](const std::string& m) { scriptLog += m + "\n"; };
+    while (std::getline(in, line)) {
+        ++n;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        std::istringstream ls(line); std::string cmd; ls >> cmd;
+        if (cmd.empty() || cmd[0] == '#') continue;
+        std::string rest; std::getline(ls >> std::ws, rest);
+        std::string a, err; float v = 0;
+        std::istringstream rs(rest); rs >> a >> v;
+        bool ok = true;
+        if (cmd == "reset") { Human::resetAll(body); Human::defaultGear(body); setPoseFile(""); setExpressionFile(""); }
+        else if (cmd == "modifier") { auto it = body.modByName.find(a); if (it == body.modByName.end()) { ok = false; err = "no modifier " + a; } else Human::setModifier(body, it->second, v); }
+        else if (cmd == "macro") Human::setMacro(body, a, v);
+        else if (cmd == "wear") { const std::string f = Human::absPath(body, rest); ok = !f.empty() && Human::wear(body, f, err); if (f.empty()) err = "no " + rest; }
+        else if (cmd == "takeoff") Human::takeOff(body, rest);
+        else if (cmd == "skin") { const std::string f = rest == "default" ? std::string() : Human::absPath(body, rest); ok = Human::setSkin(body, f); }
+        else if (cmd == "skeleton") setSkeletonFile(rest == "none" ? std::string() : findData("rigs/" + rest + (rest.find('.') == std::string::npos ? ".mhskel" : ""), "rigs"));
+        else if (cmd == "pose") setPoseFile(rest == "none" ? std::string() : findData("poses/" + rest + (rest.find('.') == std::string::npos ? ".bvh" : ""), "poses"));
+        else if (cmd == "expression") setExpressionFile(rest == "none" ? std::string() : findData("expressions/" + rest + (rest.find('.') == std::string::npos ? ".mhpose" : ""), "expressions"));
+        else if (cmd == "random") { std::random_device rd; Human::randomize(body, rest.empty() ? 0.5f : (float)atof(rest.c_str()), true, true, true, rd()); }
+        else if (cmd == "describe") Human::describe(body, rest);
+        else if (cmd == "info") {   // the size of everything (for checking scripts)
+            Human::apply(body); if (!rig.empty()) Skel::build(rig, body.pos); if (!chosen.empty()) Skel::build(chosen, body.pos); repose();
+            auto box = [&](const char* what, const std::vector<float>& v, const std::vector<int>* idx) {
+                float lo[3] = {1e9f, 1e9f, 1e9f}, hi[3] = {-1e9f, -1e9f, -1e9f};
+                auto take = [&](size_t i) { for (int c = 0; c < 3; ++c) { lo[c] = std::min(lo[c], v[i * 3 + c]); hi[c] = std::max(hi[c], v[i * 3 + c]); } };
+                if (idx) for (int i : *idx) take((size_t)i); else for (size_t i = 0; i < v.size() / 3; ++i) take(i);
+                char b2[200]; snprintf(b2, sizeof b2, "%s: x %.2f..%.2f y %.2f..%.2f z %.2f..%.2f", what, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]); out(b2);
+            };
+            box("body", body.shown.empty() ? body.pos : body.shown, &body.tri);
+            box("body rest", body.pos, &body.tri);
+            { std::vector<int> h; for (int v = 13380; v < (int)(body.pos.size() / 3); ++v) h.push_back(v); box("helpers", body.shown.empty() ? body.pos : body.shown, &h); box("helpers rest", body.pos, &h); }
+            for (const auto& px : body.proxies) { std::vector<float> f; Human::fitProxy(body, px, f); box(px.name.c_str(), f, nullptr); std::vector<float> r; Human::fitProxy(body, px, r, true); box((px.name + " rest").c_str(), r, nullptr); }
+        }
+        else if (cmd == "symmetry") body.symmetry = rest != "off";
+        else if (cmd == "units") { ok = false; for (int k = 0; k < 5; ++k) if (rest == UNIT_NAMES[k]) { exportUnits = k; ok = true; } if (!ok) err = "units: decimeter, meter, centimeter, millimeter or inch"; }
+        else if (cmd == "load") ok = loadModel(rest, err);
+        else if (cmd == "save") ok = saveModel(rest, fs::u8path(rest).stem().u8string(), err);
+        else if (cmd == "export" || cmd == "render") {
+            Human::apply(body); if (!rig.empty()) Skel::build(rig, body.pos); if (!chosen.empty()) Skel::build(chosen, body.pos); repose(); Viewer::update(body);
+            if (cmd == "export") {
+                int fmt = -1;
+                for (int k = 0; k < EX_COUNT; ++k) { const std::string e = EXPORT_EXT[k]; if (rest.size() > e.size() && rest.compare(rest.size() - e.size(), e.size(), e) == 0) fmt = k; }
+                if (fmt == EX_UV) fmt = -1;
+                if (fmt < 0) { ok = false; err = "export: name the file with .dae .fbx .glb .obj .mesh.xml .stl or .bvh"; } else ok = exportTo(rest, fmt, err);
+            } else {
+                std::string path; int w = renderW, h = renderH; std::istringstream r2(rest); r2 >> path >> w >> h;
+                ok = renderNow(w, h) && saveRendered(path); if (!ok) err = "couldn't render " + path;
+            }
+        }
+        else { ok = false; err = "unknown command " + cmd; }
+        out((ok ? "ok    " : "line " + std::to_string(n) + ": ") + (ok ? line : err));
+    }
+    dirty = true;
+}
+static void scriptingLeft(float lw) {
+    groupBox("Script");
+    ImGui::InputTextMultiline("##sc", script, sizeof script, ImVec2(lw, 300));
+    if (ImGui::Button("Run", ImVec2(lw, 30))) { remember("Script"); runScript(script); say("The script ran"); }
+    if (ImGui::Button("Load...", ImVec2(lw / 2 - 4, 0))) {
+        const std::string p = fileDialog(false, L"Pygmalion script\0*.pyg;*.txt\0\0", L"pyg", homeDir() + "\\");
+        if (!p.empty()) { std::ifstream in(fs::u8path(p)); std::ostringstream ss; ss << in.rdbuf(); snprintf(script, sizeof script, "%s", ss.str().c_str()); }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Save...", ImVec2(lw / 2 - 4, 0))) {
+        const std::string p = fileDialog(true, L"Pygmalion script\0*.pyg\0\0", L"pyg", homeDir() + "\\script.pyg");
+        if (!p.empty()) { std::ofstream o(fs::u8path(p)); o << script; }
+    }
+}
+static void scriptingRight() {
+    groupBox("Commands");
+    ImGui::TextDisabled("reset | random 0.5 | describe words\nmacro Gender 0..1 (Age, Muscle, Weight,\n  Height, BodyProportions, African, Asian,\n  Caucasian, BreastSize, BreastFirmness)\nmodifier group/name value\nwear clothes/x/x.mhclo | takeoff hair\nskin skins/x/x.mhmat | skin default\nskeleton game_engine | none\npose standing01 | none\nexpression smile01 | none\nsymmetry on | off\nload file.mhm | save file.mhm\nexport file.fbx (.dae .glb .obj ...)\nrender file.png 1920 1080");
+    if (!scriptLog.empty()) { groupBox("Output"); ImGui::BeginChild("so"); ImGui::TextUnformatted(scriptLog.c_str()); ImGui::EndChild(); }
+}
+
+// Download: MakeHuman's asset packs (CC0) from its mirror, into your own data folder
+static const char* MIRROR = "https://mirror1.makehuman.net/asset_packs/";
+static std::vector<std::string> packs; static std::set<std::string> packsHave;
+static std::atomic<bool> dlBusy{false}, dlStop{false}; static std::atomic<int64_t> dlDone{0}, dlTotal{0};
+static std::string dlName, dlResult; static std::mutex dlMtx; static bool dlFinished = false;
+static void loadPacksHave() {
+    packsHave.clear();
+    std::ifstream in(fs::u8path(userDataDir()) / "packs-installed.txt"); std::string l;
+    while (std::getline(in, l)) if (!l.empty()) packsHave.insert(l);
+}
+static void startDownload(const std::string& pack, bool listOnly) {
+#ifdef _WIN32
+    if (dlBusy) return;
+    dlBusy = true; dlStop = false; dlDone = 0; dlTotal = 0; dlName = pack;
+    std::thread([pack, listOnly] {
+        std::string result;
+        if (listOnly) {
+            const Http::Response r = Http::get(MIRROR);
+            std::vector<std::string> found;
+            size_t i = 0;
+            while ((i = r.body.find("data-sort=\"*", i)) != std::string::npos) { i += 12; const size_t e = r.body.find('"', i); found.push_back(r.body.substr(i, e - i)); }
+            std::lock_guard<std::mutex> g(dlMtx);
+            if (found.empty()) result = "Couldn't reach MakeHuman's mirror"; else { packs = found; result = std::to_string(found.size()) + " packs"; }
+        } else {
+            const std::string url = std::string(MIRROR) + pack + "/" + pack + "_cc0.zip";
+            const fs::path zip = fs::temp_directory_path() / ("pygmalion-" + pack + ".zip");
+            std::string err;
+            if (!Http::download(url, zip.u8string(), [](int64_t d, int64_t t) { dlDone = d; dlTotal = t; }, &dlStop, err)) result = err.empty() ? "Download stopped" : err;
+            else {
+                // Windows' own tar opens zips
+                std::wstring cmd = L"tar.exe -xf \"" + zip.wstring() + L"\" -C \"" + fs::u8path(userDataDir()).wstring() + L"\"";
+                STARTUPINFOW si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
+                std::vector<wchar_t> buf(cmd.begin(), cmd.end()); buf.push_back(0);
+                DWORD code = 1;
+                if (CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+                    WaitForSingleObject(pi.hProcess, INFINITE); GetExitCodeProcess(pi.hProcess, &code); CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+                }
+                std::error_code ec; fs::remove(zip, ec);
+                if (code == 0) { std::ofstream o(fs::u8path(userDataDir()) / "packs-installed.txt", std::ios::app); o << pack << "\n"; result = "Installed " + pack; }
+                else result = "Couldn't unpack " + pack;
+            }
+        }
+        std::lock_guard<std::mutex> g(dlMtx);
+        dlResult = result; dlFinished = true; dlBusy = false;
+    }).detach();
+#else
+    (void)pack; (void)listOnly;
+#endif
+}
+static void downloadLeft(float lw) {
+    groupBox("MakeHuman's asset packs");
+    notYet("Clothes, hair, shoes, hats, poses, skins and more from MakeHuman's community (all CC0), into your own data folder.");
+    if (dlBusy) {
+        ImGui::Text("%s", dlName.empty() ? "Getting the list..." : ("Downloading " + dlName).c_str());
+        ImGui::ProgressBar(dlTotal > 0 ? (float)dlDone / dlTotal : 0.0f, ImVec2(lw, 0));
+        if (ImGui::Button("Stop", ImVec2(lw, 0))) dlStop = true;
+        return;
+    }
+    if (packs.empty()) { if (ImGui::Button("Get the list", ImVec2(lw, 30))) { loadPacksHave(); dlName.clear(); startDownload("", true); } return; }
+    ImGui::BeginChild("packs");
+    std::lock_guard<std::mutex> g(dlMtx);
+    for (const auto& p : packs) {
+        ImGui::PushID(p.c_str());
+        const bool have = packsHave.count(p) > 0;
+        if (have) ImGui::PushStyleColor(ImGuiCol_Button, col4(C_DEEP));
+        if (ImGui::Button(have ? "Again" : "Get", ImVec2(60, 0))) startDownload(p, false);
+        if (have) ImGui::PopStyleColor();
+        ImGui::SameLine(); ImGui::TextUnformatted(p.c_str());
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+}
+
+static void dataView() {
+    groupBox("Data");
+    int shown = 0; for (size_t t = 0; t + 2 < body.tri.size(); t += 3) ++shown;
+    ImGui::Text("Base mesh: %d vertices, %d triangles", (int)(body.base.size() / 3), shown);
+    ImGui::Text("Targets: %d, modifiers: %d", (int)body.targets.size(), (int)body.mods.size());
+    ImGui::Text("Proxies worn: %d", (int)body.proxies.size());
+    for (const auto& p : body.proxies) ImGui::BulletText("%s (%s): %d vertices", p.name.c_str(), p.kind.c_str(), (int)(p.pos.size() / 3));
+    ImGui::Text("Skeleton for posing: %d bones", (int)rig.bones.size());
+    if (!chosen.empty()) ImGui::Text("Chosen skeleton: %s, %d bones", chosen.name.c_str(), (int)chosen.bones.size());
+    groupBox("Folders");
+    ImGui::TextWrapped("Program data: %s", dataDir.c_str());
+    ImGui::TextWrapped("MakeHuman assets: %s", assetsDir().empty() ? "(none)" : assetsDir().c_str());
+    ImGui::TextWrapped("Your data: %s", userDataDir().c_str());
+}
+static void logsView() {
+    groupBox("Logs");
+    if (ImGui::Button("Clear")) logs.clear();
+    ImGui::BeginChild("lg");
+    for (const auto& l : logs) ImGui::TextUnformatted(l.c_str());
+    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) ImGui::SetScrollHereY(1);
+    ImGui::EndChild();
+}
+
 // ---------- the categories without their own code yet show what's coming, honestly ----------
 static void notYet(const char* what) {
     ImGui::PushTextWrapPos(0);
@@ -750,6 +1282,9 @@ static void notYet(const char* what) {
 
 static void frame() {
     ImGuiIO& io = ImGui::GetIO();
+    animate(io.DeltaTime);
+    massStep();
+    { std::lock_guard<std::mutex> g(dlMtx); if (dlFinished) { dlFinished = false; say(dlResult); loadPacksHave(); libCache.clear(); } }
     const float W = io.DisplaySize.x, H = io.DisplaySize.y;
     if (!io.WantTextInput) {
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z) && !undo.empty()) { redo.push_back({snapshot(), undo.back().second}); restore(undo.back().first); undo.pop_back(); }
@@ -788,7 +1323,7 @@ static void frame() {
     else if (cat == CAT_MODELLING) {
         if (t == "Main") { groupBox("Macros"); macroSliders(lw); }
         else if (t == "Random") randomLeft(lw);
-        else if (t == "Custom") { groupBox("Custom targets"); notYet(("Put your own .target files in " + homeDir() + "\\custom and they appear here as sliders.").c_str()); }
+        else if (t == "Custom") customLeft(lw);
         else if (const Human::Tab* tb = tabNamed(t)) modTabLeft(*tb, lw);
     } else if (cat == CAT_FILES) filesLeft(lw);
     else if (cat == CAT_SETTINGS) {
@@ -806,7 +1341,8 @@ static void frame() {
             if (ImGui::RadioButton("Imperial (in)", &u, 1)) prefs.metric = false;
             groupBox("Models folder");
             ImGui::TextWrapped("%s", homeDir().c_str());
-        } else if (t == "Mouse") {
+        } else if (t == "Background") backgroundLeft(lw);
+        else if (t == "Mouse") {
             groupBox("Camera");
             ImGui::TextWrapped("Left drag: turn. Right or middle drag: move. Wheel: zoom.");
         } else {
@@ -825,7 +1361,16 @@ static void frame() {
             if (ImGui::Button("Right to left", ImVec2(lw, 0))) symmetry(true);
             if (ImGui::Button("Left to right", ImVec2(lw, 0))) symmetry(false);
             ImGui::Checkbox("Symmetric modelling", &body.symmetry);
-        } else statistics();
+        } else if (t == "Statistics") statistics();
+        else if (t == "Material Editor") materialEditor(lw);
+        else if (t == "Expression mixer") notYet("Every face pose unit is a slider on the right; Pose/Animate > Expression has the ready-made ones.");
+        else if (t == "Targets") targetsView(lw);
+        else if (t == "Save targets") saveTargetsLeft(lw);
+        else if (t == "Mass produce") massLeftPanel(lw);
+        else if (t == "Scripting") scriptingLeft(lw);
+        else if (t == "Download") downloadLeft(lw);
+        else if (t == "Data") dataView();
+        else logsView();
     } else if (cat == CAT_HELP) {
         if (t == "About") { groupBox("Pygmalion " PYGMALION_VERSION); ImGui::TextWrapped("People in 3D with sliders: MakeHuman, remade in C++ by Cursed Entertainment. Farica\xe2\x98\x86Kimora \xc2\xa9 Cursed Entertainment."); }
         else { groupBox("Licence"); ImGui::TextWrapped("The code is AGPL-3.0 (it ports MakeHuman's code). The body, its shapes and the assets are MakeHuman's, CC0."); }
@@ -835,18 +1380,34 @@ static void frame() {
         std::string picked;
         if (t == "Skeleton") {
             groupBox("Skeleton");
-            if (chooser("sk", filesIn("rigs", ".mhskel"), skeletonFile, picked, lw)) { skeletonFile = picked; say(picked.empty() ? "No skeleton" : niceName(picked) + " skeleton (exported with the model)"); }
-            ImGui::Checkbox("Show the bones", &showBones);
+            if (chooser("sk", filesIn("rigs", ".mhskel"), skeletonFile, picked, lw)) { remember("Skeleton"); setSkeletonFile(picked); say(picked.empty() ? "No skeleton" : niceName(picked) + " skeleton (exported with the model)"); }
+            if (ImGui::Checkbox("Show the bones", &showBones)) Viewer::look().bones = showBones;
+            if (!chosen.empty()) { ImGui::TextDisabled("%s: %d bones", chosen.name.c_str(), (int)chosen.bones.size()); if (!chosen.description.empty()) { ImGui::PushTextWrapPos(lw); ImGui::TextDisabled("%s", chosen.description.c_str()); ImGui::PopTextWrapPos(); } }
         } else if (t == "Pose") {
             groupBox("Pose");
             if (chooser("po", filesIn("poses", ".bvh"), poseFile, picked, lw)) setPoseFile(picked);
+        } else if (t == "Animations") {
+            groupBox("Animations");
+            if (chooser("an", filesIn("animations", ".bvh"), animFile, picked, lw)) setAnimation(picked);
+            if (!animFrames.empty()) {
+                groupBox("Playback");
+                if (ImGui::Button(animPlaying ? "Pause" : "Play", ImVec2(lw / 2 - 4, 0))) animPlaying = !animPlaying;
+                ImGui::SameLine();
+                if (ImGui::Button("Stop", ImVec2(lw / 2 - 4, 0))) { animPlaying = false; animFrame = 0; bodyPose = animFrames[0]; dirty = true; }
+                int fr = (int)animFrame;
+                ImGui::SetNextItemWidth(lw);
+                if (ImGui::SliderInt("##frame", &fr, 0, (int)animFrames.size() - 1, "Frame %d")) { animFrame = (float)fr; bodyPose = animFrames[fr]; dirty = true; }
+                ImGui::SetNextItemWidth(lw);
+                ImGui::SliderFloat("##speed", &animSpeed, 0.1f, 3, "Speed %.2fx");
+                ImGui::TextDisabled("%d frames at %.0f a second", (int)animFrames.size(), 1 / std::max(animFrameTime, 1e-3f));
+            }
         } else {
             groupBox("Expression");
             if (chooser("ex", filesIn("expressions", ".mhpose"), expressionFile, picked, lw)) setExpressionFile(picked);
             if (filesIn("expressions", ".mhpose").empty()) notYet("MakeHuman's ready-made expressions come with its asset pack; the mixer on the right makes any expression now.");
         }
     }
-    else notYet("Rendering: this tab is being built.");
+    else if (cat == CAT_RENDERING) renderingLeft(t, lw);
     ImGui::End();
 
     ImGui::SetNextWindowPos(ImVec2(W - sideW, top)); ImGui::SetNextWindowSize(ImVec2(sideW, H - top - statusH));
@@ -857,7 +1418,8 @@ static void frame() {
             else if (t != "Main" && t != "Random" && t != "Custom") { if (const Human::Tab* tb = tabNamed(t)) modTabRight(*tb); }
             else if (t == "Main") statistics();
         } else if (cat == CAT_FILES) filesRight();
-        else if (cat == CAT_POSE && t == "Expression") {
+        else if (cat == CAT_UTILITIES && t == "Scripting") scriptingRight();
+        else if ((cat == CAT_POSE && t == "Expression") || (cat == CAT_UTILITIES && t == "Expression mixer")) {
             // the Expression mixer: every face pose unit is a slider
             groupBox("Expression mixer");
             if (ImGui::Button("Neutral", ImVec2(-1, 0))) { std::fill(unitW.begin(), unitW.end(), 0.0f); expressionFile.clear(); dirty = true; }
@@ -883,6 +1445,7 @@ static void frame() {
     if (dirty && loadErr.empty()) {
         Human::apply(body);
         if (!rig.empty()) Skel::build(rig, body.pos);
+        if (!chosen.empty()) Skel::build(chosen, body.pos);
         repose();
         Viewer::update(body);
         dirty = false;
@@ -891,6 +1454,12 @@ static void frame() {
     ImGui::InvisibleButton("v", size, ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight | ImGuiButtonFlags_MouseButtonMiddle);
     const unsigned tex = Viewer::render((int)size.x, (int)size.y, ImGui::IsItemHovered() || ImGui::IsItemActive());
     ImGui::GetWindowDrawList()->AddImage((ImTextureID)(intptr_t)tex, a, ImVec2(a.x + size.x, a.y + size.y), ImVec2(0, 1), ImVec2(1, 0));
+    if (cat == CAT_RENDERING && task[CAT_RENDERING] == "Viewer" && renderedTex) {   // the last render, fitted
+        const float k = std::min(size.x / renderedW, size.y / renderedH);
+        const ImVec2 sz(renderedW * k, renderedH * k), at(a.x + (size.x - sz.x) / 2, a.y + (size.y - sz.y) / 2);
+        ImGui::GetWindowDrawList()->AddRectFilled(a, ImVec2(a.x + size.x, a.y + size.y), C_BG);
+        ImGui::GetWindowDrawList()->AddImage((ImTextureID)(intptr_t)renderedTex, at, ImVec2(at.x + sz.x, at.y + sz.y));
+    }
     if (wantThumb) {   // a picture of the view: the .thumb beside a saved model, or a screenshot
         std::vector<unsigned char> px; int w, h; Viewer::readPixels(px, w, h);
         if (!px.empty()) stbi_write_png(fs::u8path(thumbPath).string().c_str(), w, h, 4, px.data(), w * 4);
@@ -917,7 +1486,7 @@ static std::mutex loadMtx;
 static void progressCb(float f, const char* what) { loadFrac = f; std::lock_guard<std::mutex> g(loadMtx); loadWhat = what; }
 
 int main(int argc, char** argv) {
-    std::string capture, file, describeWords, startPose;
+    std::string capture, file, describeWords, startPose, startScript;
     std::vector<std::string> startUnits;   // "Name=weight"
     float startYaw = -1000;   // degrees, for a screenshot from a side
     std::vector<std::string> args;
@@ -935,6 +1504,7 @@ int main(int argc, char** argv) {
         else if (args[i] == "--pose" && i + 1 < args.size()) startPose = args[++i];
         else if (args[i] == "--yaw" && i + 1 < args.size()) startYaw = (float)atof(args[++i].c_str());
         else if (args[i] == "--unit" && i + 1 < args.size()) startUnits.push_back(args[++i]);
+        else if (args[i] == "--script" && i + 1 < args.size()) startScript = args[++i];
         else file = args[i];
     }
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) return 1;
@@ -998,18 +1568,25 @@ int main(int argc, char** argv) {
     Viewer::init(dataDir);
     body.roots.clear();
     if (!assetsDir().empty()) body.roots.push_back(assetsDir());
+    if (!userDataDir().empty()) body.roots.push_back(userDataDir());
     body.roots.push_back(dataDir);
+    loadCustomTargets();
     Human::defaultGear(body);
     { std::string err; if (!Skel::load(rig, (fs::u8path(dataDir) / "rigs" / "default.mhskel").u8string(), err)) say("No skeleton: " + err); }
     loadFaceUnits();
     category.clear();
-    if (!file.empty()) { std::string err; if (!Human::loadMhm(body, file, err)) say(err); }
+    if (!file.empty()) { std::string err; if (!loadModel(file, err)) say(err); }
     if (!describeWords.empty()) { snprintf(prompt, sizeof prompt, "%s", describeWords.c_str()); understood = Human::describe(body, describeWords); }
     if (startYaw > -999) { Human::apply(body); Viewer::update(body); Viewer::focusBody(startYaw * 3.14159265f / 180, 0.05f); }
     if (!startPose.empty()) setPoseFile((fs::u8path(dataDir) / "poses" / (startPose + ".bvh")).u8string());
     for (const auto& u : startUnits) {
         const size_t eq = u.find('=');
         for (size_t k = 0; k < unitNames.size(); ++k) if (unitNames[k] == u.substr(0, eq)) unitW[k] = eq == std::string::npos ? 1.0f : (float)atof(u.c_str() + eq + 1);
+    }
+    if (!startScript.empty()) {   // a script file run at the start (and its output in script-log.txt beside it)
+        std::ifstream in(fs::u8path(startScript)); std::ostringstream ss; ss << in.rdbuf();
+        runScript(ss.str());
+        std::ofstream lo(fs::u8path(startScript).replace_extension(".log")); lo << scriptLog;
     }
     dirty = true;
     if (capture.empty()) { SDL_ShowWindow(window); SDL_MaximizeWindow(window); SDL_RaiseWindow(window); }
@@ -1019,7 +1596,7 @@ int main(int argc, char** argv) {
         while (SDL_PollEvent(&e)) {
             ImGui_ImplSDL2_ProcessEvent(&e);
             if (e.type == SDL_QUIT) quit = true;
-            if (e.type == SDL_DROPFILE) { std::string err; remember("Open"); if (Human::loadMhm(body, e.drop.file, err)) dirty = true; else say(err); SDL_free(e.drop.file); }
+            if (e.type == SDL_DROPFILE) { std::string err; remember("Open"); if (loadModel(e.drop.file, err)) dirty = true; else say(err); SDL_free(e.drop.file); }
         }
         ImGui_ImplOpenGL3_NewFrame(); ImGui_ImplSDL2_NewFrame(); ImGui::NewFrame();
         frame();

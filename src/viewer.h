@@ -18,6 +18,13 @@ struct Look {
     bool smooth = false;                            // MakeHuman's Smooth: one Catmull-Clark subdivision
     std::string bgImage;                            // a picture behind the person (Settings > Background)
     float bgOpacity = 1;
+    // MakeHuman's scene (Rendering > Scene): ambient light, shine and up to 4 lights. They light clothes, hair,
+    // skin textures and clay; the default skin is MakeHuman's litsphere, which (as in MakeHuman) has its light painted in.
+    struct Light { bool on = true; float yaw = 0, pitch = 0, col[3] = {1, 1, 1}, strength = 1; bool withView = true; };
+    float ambient[3] = {0.38f, 0.38f, 0.38f};
+    float shine = 0.04f, shininess = 24;
+    std::vector<Light> lights = {Light{true, 0, 0, {1, 1, 1}, 0.72f, true}};
+    bool sceneSkin = false;                         // light MakeHuman's litsphere skin by the scene too
     float turnSpeed = 1, moveSpeed = 1, zoomSpeed = 1;   // Settings > Mouse
     bool invertTurn = false, invertZoom = false;
 };

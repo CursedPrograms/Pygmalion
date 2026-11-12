@@ -50,8 +50,9 @@ MakeHuman's own layout, tab for tab:
 - **Pose/Animate:** four skeletons (default, without toes, game engine, CMU motion capture), 18 poses, 33 facial
   expressions plus a mixer with every face pose unit as a slider, animations that play (and BVH motion capture in CMU
   or Mixamo naming), Show the bones.
-- **Rendering:** pictures at any size up to 8K with anti-aliasing and a transparent background; the scene's light
-  and background; an orthographic view.
+- **Rendering:** pictures at any size up to 8K with anti-aliasing and a transparent background; MakeHuman's Scene:
+  ambient light, shine and up to four lights (direction, colour, strength, fixed or turning with the view), five
+  ready-made scenes and your own saved as `.pygscene`; the background; an orthographic view.
 - **Exports:** Collada (`.dae`), FBX, glTF (`.glb`), OBJ, Ogre3D, STL, BVH and the UV map, with the skeleton, its
   weights and the textures, posed or not, feet on the ground, in any units. Tested by importing into Blender.
 - **Utilities:** Describe ("a tall, muscular old woman with a big nose" sets the sliders), Symmetry, Statistics,

@@ -37,6 +37,7 @@ GLF(void, glUniformMatrix4fv, (GLint, GLsizei, GLboolean, const GLfloat*))
 GLF(void, glUniform1i, (GLint, GLint))
 GLF(void, glUniform1f, (GLint, GLfloat))
 GLF(void, glUniform3f, (GLint, GLfloat, GLfloat, GLfloat))
+GLF(void, glUniform3fv, (GLint, GLsizei, const GLfloat*))
 GLF(void, glUniform2f, (GLint, GLfloat, GLfloat))
 GLF(void, glGenVertexArrays, (GLsizei, GLuint*))
 GLF(void, glBindVertexArray, (GLuint))
@@ -120,7 +121,7 @@ static GLuint textureLoad(const std::string& path) {
 bool init(const std::string& data) {
 #define L(name) name##_ = (PFN_##name)SDL_GL_GetProcAddress(#name); if (!name##_) return false;
     L(glCreateShader) L(glShaderSource) L(glCompileShader) L(glCreateProgram) L(glAttachShader) L(glLinkProgram) L(glUseProgram)
-    L(glGetUniformLocation) L(glUniformMatrix4fv) L(glUniform1i) L(glUniform1f) L(glUniform3f) L(glUniform2f) L(glGenVertexArrays) L(glBindVertexArray)
+    L(glGetUniformLocation) L(glUniformMatrix4fv) L(glUniform1i) L(glUniform1f) L(glUniform3f) L(glUniform3fv) L(glUniform2f) L(glGenVertexArrays) L(glBindVertexArray)
     L(glGenBuffers) L(glBindBuffer) L(glBufferData) L(glEnableVertexAttribArray) L(glVertexAttribPointer) L(glGenFramebuffers)
     L(glBindFramebuffer) L(glFramebufferTexture2D) L(glGenRenderbuffers) L(glBindRenderbuffer) L(glRenderbufferStorage)
     L(glFramebufferRenderbuffer) L(glGenerateMipmap) L(glActiveTexture)
@@ -134,6 +135,16 @@ void main() { N = mat3(view) * n; T = t; gl_Position = mvp * vec4(p, 1); })",
                 R"(#version 330
 in vec3 N; in vec2 T; out vec4 o;
 uniform sampler2D litA, litB, litC, tex; uniform vec3 eth; uniform int mode, hasTex, cutout; uniform float light; uniform vec3 lcol, tint;
+uniform int nl, sceneSkin; uniform vec3 ldir[4], lrgb[4], amb; uniform float shine, shininess;
+vec3 lit(vec3 n, vec3 c) {                               // the scene's lights on a colour (view space: the eye looks down -z)
+  vec3 d = amb, sp = vec3(0);
+  for (int i = 0; i < nl; ++i) {
+    float k = max(dot(n, ldir[i]), 0.0);
+    d += lrgb[i] * k;
+    sp += lrgb[i] * pow(max(dot(n, normalize(ldir[i] + vec3(0, 0, 1))), 0.0), shininess) * step(0.0001, k);
+  }
+  return c * d + sp * shine;
+}
 void shade();
 void main() { shade(); o.rgb *= light * lcol * tint; }
 void shade() {
@@ -142,8 +153,8 @@ void shade() {
   vec4 tc = hasTex == 1 ? texture(tex, T) : vec4(0.62, 0.62, 0.64, 1);
   if (cutout == 1 && tc.a < 0.4) discard;                // hair, eyebrows, lashes: their see-through parts
   float d = max(n.z, 0.0);
-  if (mode == 3) { o = vec4(tc.rgb * (0.38 + 0.72 * d) + vec3(0.04) * pow(d, 24.0), 1); return; }
-  if (mode == 4) { o = vec4(tc.rgb * (0.42 + 0.68 * d) * vec3(1.0, 0.97, 0.95), 1); return; }   // a skin texture
+  if (mode == 3) { o = vec4(lit(n, tc.rgb), 1); return; }
+  if (mode == 4) { o = vec4(lit(n, tc.rgb * 1.05) * vec3(1.0, 0.97, 0.95), 1); return; }   // a skin texture
   if (mode == 1) {                                       // the eyes: their picture; the cornea's clear parts let the iris show
     vec4 c = tc;
     if (c.a < 0.35) discard;
@@ -151,9 +162,17 @@ void shade() {
     o = vec4(c.rgb * 0.8 + shine * 0.5 * 0.35, 1);
     return;
   }
-  if (mode == 2) { float d = max(n.z, 0.0); o = vec4(vec3(0.78, 0.76, 0.74) * (0.25 + 0.8 * d), 1); return; }   // clay
+  if (mode == 2) { o = vec4(lit(n, vec3(0.78, 0.76, 0.74)), 1); return; }   // clay
   vec3 skin = texture(litA, uv).rgb * eth.x + texture(litB, uv).rgb * eth.y + texture(litC, uv).rgb * eth.z;
-  o = vec4(mix(vec3(dot(skin, vec3(0.33))), skin, 1.0) * mix(1.0, 1.0, light), 1);
+  if (sceneSkin == 1) {   // the litsphere's colour, lit by the scene instead of its painted light
+    vec3 base = vec3(0);
+    for (int k = 0; k < 9; ++k) {                          // the sphere's average colour: the skin without its painted light
+      vec2 q = vec2(0.5) + 0.3 * vec2(k % 3 - 1, k / 3 - 1);
+      base += texture(litA, q).rgb * eth.x + texture(litB, q).rgb * eth.y + texture(litC, q).rgb * eth.z;
+    }
+    o = vec4(lit(n, base / 9.0 * 1.25), 1); return;
+  }
+  o = vec4(skin, 1);
 })");
     progBg = make(R"(#version 330
 out vec2 T; void main() { vec2 p = vec2((gl_VertexID & 1) * 2 - 1, (gl_VertexID >> 1) * 2 - 1); T = p * 0.5 + 0.5; gl_Position = vec4(p, 0.999, 1); })",
@@ -430,6 +449,25 @@ unsigned render(int w, int h, bool hovered) {
     glUniform3f_(glGetUniformLocation_(prog, "eth"), eth[0], eth[1], eth[2]);
     glUniform1f_(glGetUniformLocation_(prog, "light"), lk.light);
     glUniform3f_(glGetUniformLocation_(prog, "lcol"), lk.lightCol[0], lk.lightCol[1], lk.lightCol[2]);
+    {   // the scene's lights, turned into view space (those that turn with the view are there already)
+        float dirs[12] = {0}, cols[12] = {0}; int nl = 0;
+        for (const auto& L : lk.lights) {
+            if (!L.on || nl == 4) continue;
+            const float cp2 = std::cos(L.pitch), d[3] = {cp2 * std::sin(L.yaw), std::sin(L.pitch), cp2 * std::cos(L.yaw)};
+            float v[3];
+            if (L.withView) { v[0] = d[0]; v[1] = d[1]; v[2] = d[2]; }
+            else { v[0] = s[0] * d[0] + s[1] * d[1] + s[2] * d[2]; v[1] = u[0] * d[0] + u[1] * d[1] + u[2] * d[2]; v[2] = -(f[0] * d[0] + f[1] * d[1] + f[2] * d[2]); }
+            for (int c = 0; c < 3; ++c) { dirs[nl * 3 + c] = v[c]; cols[nl * 3 + c] = L.col[c] * L.strength; }
+            ++nl;
+        }
+        glUniform1i_(glGetUniformLocation_(prog, "nl"), nl);
+        glUniform3fv_(glGetUniformLocation_(prog, "ldir"), 4, dirs);
+        glUniform3fv_(glGetUniformLocation_(prog, "lrgb"), 4, cols);
+        glUniform3f_(glGetUniformLocation_(prog, "amb"), lk.ambient[0], lk.ambient[1], lk.ambient[2]);
+        glUniform1f_(glGetUniformLocation_(prog, "shine"), lk.shine);
+        glUniform1f_(glGetUniformLocation_(prog, "shininess"), lk.shininess);
+        glUniform1i_(glGetUniformLocation_(prog, "sceneSkin"), lk.sceneSkin ? 1 : 0);
+    }
     glUniform1i_(glGetUniformLocation_(prog, "litA"), 0); glUniform1i_(glGetUniformLocation_(prog, "litB"), 1);
     glUniform1i_(glGetUniformLocation_(prog, "litC"), 2); glUniform1i_(glGetUniformLocation_(prog, "tex"), 3);
     const GLint uMode = glGetUniformLocation_(prog, "mode"), uHas = glGetUniformLocation_(prog, "hasTex"), uCut = glGetUniformLocation_(prog, "cutout");

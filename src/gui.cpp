@@ -944,6 +944,83 @@ static bool renderNow(int w, int h) {
 static bool saveRendered(const std::string& p) {
     return !rendered.empty() && stbi_write_png(fs::u8path(p).string().c_str(), renderedW, renderedH, 4, rendered.data(), renderedW * 4) != 0;
 }
+// ---------- MakeHuman's scenes: ambient light, shine and lights, kept as .pygscene (JSON) ----------
+static const float DEG = 3.14159265f / 180;
+static void scenePreset(int k) {
+    Viewer::Look& lk = Viewer::look();
+    using L = Viewer::Look::Light;
+    lk.lights.clear();
+    lk.sceneSkin = k != 0;   // MakeHuman's own scene keeps its painted skin; the others light it
+    switch (k) {
+    case 0:   // MakeHuman's default: a light from the eye
+        lk.ambient[0] = lk.ambient[1] = lk.ambient[2] = 0.38f; lk.shine = 0.04f; lk.shininess = 24;
+        lk.lights.push_back(L{true, 0, 0, {1, 1, 1}, 0.72f, true}); break;
+    case 1:   // studio: key, fill and rim, fixed round the person
+        lk.ambient[0] = lk.ambient[1] = lk.ambient[2] = 0.18f; lk.shine = 0.12f; lk.shininess = 30;
+        lk.lights.push_back(L{true, -40 * DEG, 30 * DEG, {1, 0.97f, 0.92f}, 0.85f, false});
+        lk.lights.push_back(L{true, 50 * DEG, 5 * DEG, {0.85f, 0.9f, 1}, 0.35f, false});
+        lk.lights.push_back(L{true, 160 * DEG, 25 * DEG, {1, 1, 1}, 0.6f, false}); break;
+    case 2:   // soft: lots of ambient, two gentle lights
+        lk.ambient[0] = lk.ambient[1] = lk.ambient[2] = 0.5f; lk.shine = 0.02f; lk.shininess = 12;
+        lk.lights.push_back(L{true, -30 * DEG, 20 * DEG, {1, 1, 1}, 0.4f, true});
+        lk.lights.push_back(L{true, 30 * DEG, 20 * DEG, {1, 1, 1}, 0.3f, true}); break;
+    case 3:   // dramatic: one hard light from the side, rim from behind
+        lk.ambient[0] = lk.ambient[1] = lk.ambient[2] = 0.06f; lk.shine = 0.2f; lk.shininess = 40;
+        lk.lights.push_back(L{true, -80 * DEG, 15 * DEG, {1, 0.93f, 0.85f}, 1.1f, false});
+        lk.lights.push_back(L{true, 150 * DEG, 30 * DEG, {0.7f, 0.8f, 1}, 0.7f, false}); break;
+    default:  // sunset: warm low sun, cool sky
+        lk.ambient[0] = 0.2f; lk.ambient[1] = 0.22f; lk.ambient[2] = 0.32f; lk.shine = 0.08f; lk.shininess = 20;
+        lk.lights.push_back(L{true, -60 * DEG, 8 * DEG, {1.2f, 0.75f, 0.45f}, 0.9f, false});
+        lk.lights.push_back(L{true, 90 * DEG, 60 * DEG, {0.5f, 0.6f, 0.9f}, 0.35f, false}); break;
+    }
+}
+static void rgbSliders(const char* id, float* c, float maxV, float lw) {   // a colour as three sliders
+    static const char* n[] = {"Red %.2f", "Green %.2f", "Blue %.2f"};
+    ImGui::PushID(id);
+    for (int k = 0; k < 3; ++k) { ImGui::PushID(k); ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##c", &c[k], 0, maxV, n[k]); ImGui::PopID(); }
+    ImGui::PopID();
+}
+static const char* SCENE_PRESETS[] = {"MakeHuman", "Studio", "Soft", "Dramatic", "Sunset"};
+static bool saveScene(const std::string& path) {
+    const Viewer::Look& lk = Viewer::look();
+    std::ofstream o(fs::u8path(path));
+    if (!o) return false;
+    o << "{\n  \"ambient\": [" << lk.ambient[0] << ", " << lk.ambient[1] << ", " << lk.ambient[2] << "],\n  \"shine\": " << lk.shine
+      << ",\n  \"shininess\": " << lk.shininess << ",\n  \"brightness\": " << lk.light << ",\n  \"skinLit\": " << (lk.sceneSkin ? "true" : "false")
+      << ",\n  \"background\": [" << lk.bg[0] << ", " << lk.bg[1] << ", " << lk.bg[2] << "],\n  \"lights\": [";
+    for (size_t i = 0; i < lk.lights.size(); ++i) {
+        const auto& L = lk.lights[i];
+        o << (i ? ",\n" : "\n") << "    {\"on\": " << (L.on ? "true" : "false") << ", \"turn\": " << L.yaw / DEG << ", \"height\": " << L.pitch / DEG
+          << ", \"colour\": [" << L.col[0] << ", " << L.col[1] << ", " << L.col[2] << "], \"strength\": " << L.strength
+          << ", \"withView\": " << (L.withView ? "true" : "false") << "}";
+    }
+    o << "\n  ]\n}\n";
+    return (bool)o;
+}
+static bool loadScene(const std::string& path, std::string& err) {
+    std::ifstream in(fs::u8path(path)); if (!in) { err = "Couldn't open " + path; return false; }
+    std::ostringstream ss; ss << in.rdbuf(); const std::string t = ss.str();
+    Json::Value v; size_t i = 0;
+    if (!Json::parse(t, i, v) || v.type != Json::Value::OBJ) { err = "Not a scene: " + path; return false; }
+    Viewer::Look& lk = Viewer::look();
+    auto three = [](const Json::Value* a, float* out) { if (a && a->type == Json::Value::ARR && a->a.size() == 3) for (int c = 0; c < 3; ++c) out[c] = (float)a->a[(size_t)c].n; };
+    auto flag = [](const Json::Value* b, bool def) { return b && b->type == Json::Value::BOOL ? b->b : def; };
+    three(v.get("ambient"), lk.ambient); three(v.get("background"), lk.bg);
+    lk.shine = (float)v.num("shine", lk.shine); lk.shininess = (float)v.num("shininess", lk.shininess); lk.light = (float)v.num("brightness", lk.light);
+    lk.sceneSkin = flag(v.get("skinLit"), false);
+    if (const Json::Value* ls = v.get("lights")) {
+        lk.lights.clear();
+        for (const auto& l : ls->a) {
+            if (lk.lights.size() == 4) break;
+            Viewer::Look::Light L;
+            L.on = flag(l.get("on"), true); L.yaw = (float)l.num("turn") * DEG; L.pitch = (float)l.num("height") * DEG;
+            three(l.get("colour"), L.col); L.strength = (float)l.num("strength", 1); L.withView = flag(l.get("withView"), false);
+            lk.lights.push_back(L);
+        }
+    }
+    return true;
+}
+
 static void renderingLeft(const std::string& t, float lw) {
     Viewer::Look& lk = Viewer::look();
     if (t == "Render") {
@@ -961,9 +1038,49 @@ static void renderingLeft(const std::string& t, float lw) {
         }
         ImGui::TextDisabled("The view as it is now, at this size.");
     } else if (t == "Scene") {
-        groupBox("Light");
+        groupBox("Scene");
+        int pre = -1;
+        ImGui::SetNextItemWidth(lw);
+        if (ImGui::BeginCombo("##pre", "A ready-made scene...")) {
+            for (int k = 0; k < 5; ++k) if (ImGui::Selectable(SCENE_PRESETS[k])) pre = k;
+            ImGui::EndCombo();
+        }
+        if (pre >= 0) { scenePreset(pre); say(std::string(SCENE_PRESETS[pre]) + " scene"); }
+        if (ImGui::Button("Load...", ImVec2(lw / 2 - 4, 0))) {
+            const std::string p = fileDialog(false, L"Pygmalion scene\0*.pygscene\0\0", L"pygscene", homeDir() + "\\");
+            if (!p.empty()) { std::string err; say(loadScene(p, err) ? "Scene " + fs::u8path(p).stem().u8string() : err); }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Save...", ImVec2(lw / 2 - 4, 0))) {
+            const std::string p = fileDialog(true, L"Pygmalion scene\0*.pygscene\0\0", L"pygscene", homeDir() + "\\scene.pygscene");
+            if (!p.empty()) say(saveScene(p) ? "Saved " + p : "Couldn't save " + p);
+        }
+        groupBox("Ambient light");
+        rgbSliders("amb", lk.ambient, 1.5f, lw);
+        ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##sh", &lk.shine, 0, 1, "Shine %.2f");
+        ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##shn", &lk.shininess, 2, 128, "Sharpness %.0f", ImGuiSliderFlags_Logarithmic);
+        ImGui::Checkbox("Light the skin by the scene", &lk.sceneSkin);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("MakeHuman's skin has its light painted in (a litsphere). On, the scene's lights shade it instead.");
+        int drop = -1;
+        for (size_t i = 0; i < lk.lights.size(); ++i) {
+            auto& L = lk.lights[i];
+            ImGui::PushID(100 + (int)i);
+            groupBox(("Light " + std::to_string(i + 1)).c_str());
+            ImGui::Checkbox("On", &L.on); ImGui::SameLine(); ImGui::Checkbox("Turns with the view", &L.withView);
+            float deg[2] = {L.yaw / DEG, L.pitch / DEG};
+            ImGui::SetNextItemWidth(lw); if (ImGui::SliderFloat("##y", &deg[0], -180, 180, L.withView ? "From the left/right %.0f deg" : "Round the person %.0f deg")) L.yaw = deg[0] * DEG;
+            ImGui::SetNextItemWidth(lw); if (ImGui::SliderFloat("##p", &deg[1], -89, 89, "Height %.0f deg")) L.pitch = deg[1] * DEG;
+            ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##s", &L.strength, 0, 3, "Strength %.2f");
+            rgbSliders("lc", L.col, 1.5f, lw);
+            if (lk.lights.size() > 1 && ImGui::SmallButton("Remove this light")) drop = (int)i;
+            ImGui::PopID();
+        }
+        if (drop >= 0) lk.lights.erase(lk.lights.begin() + drop);
+        if (lk.lights.size() < 4 && ImGui::Button("Add a light", ImVec2(lw, 0))) lk.lights.push_back(Viewer::Look::Light{true, 45 * DEG, 30 * DEG, {1, 1, 1}, 0.5f, false});
+        groupBox("Overall");
         ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##li", &lk.light, 0.1f, 2.5f, "Brightness %.2f");
         for (int c = 0; c < 3; ++c) { static const char* n[] = {"Red %.2f", "Green %.2f", "Blue %.2f"}; ImGui::PushID(c); ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##lc", &lk.lightCol[c], 0, 1.5f, n[c]); ImGui::PopID(); }
+        ImGui::TextDisabled("Tint");
         if (ImGui::SmallButton("White")) lk.lightCol[0] = lk.lightCol[1] = lk.lightCol[2] = 1;
         ImGui::SameLine(); if (ImGui::SmallButton("Warm")) { lk.lightCol[0] = 1.1f; lk.lightCol[1] = 0.98f; lk.lightCol[2] = 0.85f; }
         ImGui::SameLine(); if (ImGui::SmallButton("Cold")) { lk.lightCol[0] = 0.88f; lk.lightCol[1] = 0.96f; lk.lightCol[2] = 1.12f; }
@@ -1138,7 +1255,7 @@ static bool installPack(const std::string& pack, std::string& err);
 static char script[8192] = "# a line each; # starts a note\nreset\nmacro Gender 0\nmacro Age 0.4\nmodifier nose/nose-scale-horiz-decr|incr 0.3\nwear hair/bob01/bob01.mhclo\nskin skins/young_caucasian_female/young_caucasian_female.mhmat\nexpression smile01\n";
 static std::string scriptLog;
 static const char* MACRO_NAMES[] = {"Gender", "Age", "Muscle", "Weight", "Height", "BodyProportions", "African", "Asian", "Caucasian", "BreastSize", "BreastFirmness"};
-static const char* COMMANDS = "reset | random 0.5 | describe words\nmacro Gender 0..1 (Age, Muscle, Weight,\n  Height, BodyProportions, African, Asian,\n  Caucasian, BreastSize, BreastFirmness)\nmodifier group/name value\nwear clothes/x/x.mhclo | takeoff hair\nskin skins/x/x.mhmat | skin default\nskeleton game_engine | none\npose standing01 | none\nanimation walk1 | none\nexpression smile01 | none\nbones on | off\nsymmetry on | off\nunits meter (decimeter, centimeter...)\nload file.mhm | save file.mhm\nexport file.fbx (.dae .glb .obj ...)\nrender file.png 1920 1080\nsmooth on | off\ndownload hair01 (an asset pack)\nget Gender | get group/name (a value)\nlist macros | modifiers | worn | poses\ninfo (the size of everything)";
+static const char* COMMANDS = "reset | random 0.5 | describe words\nmacro Gender 0..1 (Age, Muscle, Weight,\n  Height, BodyProportions, African, Asian,\n  Caucasian, BreastSize, BreastFirmness)\nmodifier group/name value\nwear clothes/x/x.mhclo | takeoff hair\nskin skins/x/x.mhmat | skin default\nskeleton game_engine | none\npose standing01 | none\nanimation walk1 | none\nexpression smile01 | none\nbones on | off\nsymmetry on | off\nunits meter (decimeter, centimeter...)\nload file.mhm | save file.mhm\nexport file.fbx (.dae .glb .obj ...)\nrender file.png 1920 1080\nsmooth on | off\nscene studio (makehuman, soft,\n  dramatic, sunset) | scene file.pygscene\n  | scene save file.pygscene\ndownload hair01 (an asset pack)\nget Gender | get group/name (a value)\nlist macros | modifiers | worn | poses\ninfo (the size of everything)";
 // one command; anything it prints goes to out
 static bool runCommand(const std::string& line, std::string& err, const std::function<void(const std::string&)>& out) {
     std::istringstream ls(line); std::string cmd; ls >> cmd;
@@ -1207,6 +1324,12 @@ static bool runCommand(const std::string& line, std::string& err, const std::fun
         else if (a == "worn") for (const auto& px : body.proxies) out(px.kind + ": " + px.name);
         else if (a == "poses") for (const auto& f : filesIn("poses", ".bvh")) out(fs::u8path(f).stem().u8string());
         else { ok = false; err = "list macros, modifiers, worn or poses"; }
+    }
+    else if (cmd == "scene") {
+        int k = -1; for (int j = 0; j < 5; ++j) { std::string n = SCENE_PRESETS[j]; for (char& c : n) c = (char)tolower((unsigned char)c); if (rest == n) k = j; }
+        if (k >= 0) scenePreset(k);
+        else if (a == "save") { const std::string f = rest.size() > 5 ? rest.substr(5) : ""; ok = !f.empty() && saveScene(f); if (!ok) err = "scene save file.pygscene"; }
+        else ok = loadScene(rest, err);
     }
     else if (cmd == "help") out(COMMANDS);
     else { ok = false; err = "unknown command " + cmd + " (help lists them)"; }

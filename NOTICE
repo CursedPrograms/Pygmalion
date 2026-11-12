@@ -1,0 +1,13 @@
+Pygmalion
+Copyright (c) 2026 Cursed Entertainment.
+
+Pygmalion's code is under the GNU Affero General Public License v3 (LICENSE.md): it ports MakeHuman's own code
+(apps/human.py, apps/humanmodifier.py, lib/targets.py and the proxy fitting), which is AGPL-3.0.
+  MakeHuman - the MakeHuman team - https://github.com/makehumancommunity/makehuman (fork: CursedPrograms/makehuman)
+
+The body, its 1,280 shapes (targets), the modifiers and sliders, the eyes and the litspheres in data\ are MakeHuman's
+assets, released as CC0 (data\LICENSE.ASSETS.md).
+
+SDL2 - https://www.libsdl.org - zlib License
+Dear ImGui - Omar Cornut - https://github.com/ocornut/imgui - MIT License
+stb_image, stb_image_write - Sean Barrett - https://github.com/nothings/stb - MIT License / public domain

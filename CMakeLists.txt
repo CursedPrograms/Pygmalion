@@ -1,0 +1,57 @@
+cmake_minimum_required(VERSION 3.20)
+project(Pygmalion VERSION 1.0.0 LANGUAGES C CXX)
+# Pygmalion: people in 3D with sliders, on your own PC. Part of Atelier. AGPL-3.0 (its maths are MakeHuman's).
+# The body and its 1,280 shapes are MakeHuman's data (CC0), in data beside the program.
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+include(FetchContent)
+if(EXISTS ${CMAKE_SOURCE_DIR}/external/imgui-1.90.4/imgui.h)
+    set(FETCHCONTENT_SOURCE_DIR_IMGUI ${CMAKE_SOURCE_DIR}/external/imgui-1.90.4)
+endif()
+FetchContent_Declare(imgui URL https://github.com/ocornut/imgui/archive/refs/tags/v1.90.4.tar.gz)
+FetchContent_MakeAvailable(imgui)
+if(WIN32 AND NOT SDL2_DIR AND EXISTS ${CMAKE_SOURCE_DIR}/external/SDL2-2.30.9/cmake)
+    set(SDL2_DIR ${CMAKE_SOURCE_DIR}/external/SDL2-2.30.9/cmake)
+endif()
+find_package(SDL2 REQUIRED)
+find_package(OpenGL REQUIRED)
+set(STB_DIR ${CMAKE_SOURCE_DIR}/external/stb)
+foreach(f stb_image.h stb_image_write.h)
+    if(NOT EXISTS ${STB_DIR}/${f})
+        file(DOWNLOAD https://raw.githubusercontent.com/nothings/stb/master/${f} ${STB_DIR}/${f})
+    endif()
+endforeach()
+add_library(imgui STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp ${imgui_SOURCE_DIR}/imgui_draw.cpp ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl2.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp)
+target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+target_link_libraries(imgui PUBLIC SDL2::SDL2 OpenGL::GL)
+
+set(SOURCES src/gui.cpp src/splash.cpp src/human.cpp src/model.cpp src/viewer.cpp src/stb.cpp)
+if(WIN32)
+    list(APPEND SOURCES src/app.rc)
+endif()
+add_executable(Pygmalion WIN32 ${SOURCES})
+target_include_directories(Pygmalion PRIVATE src ${STB_DIR})
+target_link_libraries(Pygmalion PRIVATE imgui)
+target_compile_definitions(Pygmalion PRIVATE PYGMALION_VERSION="${PROJECT_VERSION}")
+if(TARGET SDL2::SDL2main)
+    target_link_libraries(Pygmalion PRIVATE SDL2::SDL2main)
+endif()
+if(MSVC)
+    target_compile_options(Pygmalion PRIVATE /W3 /utf-8 /O2 /D_CRT_SECURE_NO_WARNINGS)
+endif()
+add_custom_command(TARGET Pygmalion POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/assets $<TARGET_FILE_DIR:Pygmalion>/assets)
+if(WIN32)
+    add_custom_command(TARGET Pygmalion POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:SDL2::SDL2> $<TARGET_FILE_DIR:Pygmalion>)
+endif()
+add_custom_command(TARGET Pygmalion POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/data $<TARGET_FILE_DIR:Pygmalion>/data)

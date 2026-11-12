@@ -6,6 +6,7 @@
 //   Pygmalion [model.mhm]
 //   Pygmalion --capture out.bmp [--describe "words"] [--tab N]      a screenshot, then quit
 #include "human.h"
+#include "skeleton.h"
 #include "model.h"
 #include "splash.h"
 #include "viewer.h"
@@ -27,7 +28,9 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <fstream>
 #include <sstream>
+#include "json.h"
 #include <random>
 #include <string>
 #include <thread>
@@ -124,6 +127,12 @@ static SDL_Window* window = nullptr;
 static bool quit = false;
 static Human::Body body;
 static std::string dataDir, loadErr, toast; static double toastUntil = 0;
+// MakeHuman's asset pack (clothes, hair, skins, poses, expressions...): assets\ beside data\ when it's there
+static std::string assetsDir() {
+    std::error_code ec;
+    const fs::path a = fs::u8path(dataDir).parent_path() / "assets-mh";
+    return fs::exists(a, ec) ? a.u8string() : std::string();
+}
 static bool dirty = true;
 static int tab = 0, forcedTab = 1;   // MakeHuman opens on Modelling
 static std::string forcedTask;
@@ -279,6 +288,115 @@ static void groupBox(const char* title) {
     ImGui::Spacing();
     ImGui::PushStyleColor(ImGuiCol_Text, col4(C_PINK)); ImGui::TextUnformatted(title); ImGui::PopStyleColor();
     ImGui::Separator();
+}
+
+// ---------- posing: MakeHuman's default skeleton moves the body; the chosen skeleton is the one exported ----------
+static Skel::Skeleton rig;                      // the default skeleton, for posing
+static std::string skeletonFile;                // the chosen skeleton ("" none), as MakeHuman's Skeleton tab
+static Skel::Pose bodyPose; static std::string poseFile;
+static std::vector<Skel::Pose> faceUnits; static std::vector<std::string> unitNames; static std::vector<float> unitW;
+static std::string expressionFile;
+static bool showBones = false;
+
+static std::vector<std::string> filesIn(const std::string& sub, const char* ext) {
+    std::vector<std::string> v;
+    std::error_code ec;
+    for (const std::string& root : {dataDir, assetsDir()})
+        if (!root.empty())
+            for (const auto& e : fs::recursive_directory_iterator(fs::u8path(root) / sub, ec))
+                if (e.is_regular_file() && e.path().extension() == ext) v.push_back(e.path().u8string());
+    std::sort(v.begin(), v.end(), [](const std::string& a, const std::string& b) { return fs::u8path(a).stem() < fs::u8path(b).stem(); });
+    return v;
+}
+
+static void loadFaceUnits() {
+    std::string err, t;
+    Skel::loadBvh((fs::u8path(dataDir) / "poseunits" / "face-poseunits.bvh").u8string(), faceUnits, err);
+    std::ifstream in(fs::u8path(dataDir) / "poseunits" / "face-poseunits.json");
+    std::ostringstream ss; ss << in.rdbuf(); t = ss.str();
+    Json::Value v; size_t i = 0;
+    if (Json::parse(t, i, v)) if (const Json::Value* fm = v.get("framemapping")) for (const auto& n : fm->a) unitNames.push_back(n.s);
+    unitW.assign(unitNames.size(), 0.0f);
+}
+
+// the pose: the body's pose, the face's expression over it (mixPoses: the expression's bones win)
+static void repose() {
+    if (rig.empty()) { body.shown.clear(); return; }
+    bool anyUnit = false;
+    for (size_t k = 1; k < unitW.size(); ++k) if (unitW[k] > 0) anyUnit = true;
+    if (bodyPose.empty() && !anyUnit) { body.shown.clear(); return; }
+    Skel::Pose p = bodyPose;
+    if (anyUnit) {
+        std::vector<std::pair<const Skel::Pose*, float>> parts;
+        for (size_t k = 1; k < unitW.size() && k < faceUnits.size(); ++k) if (unitW[k] > 0) parts.push_back({&faceUnits[k], unitW[k]});
+        const Skel::Pose face = Skel::blend(parts);
+        for (const auto& kv : face.bones) {
+            const auto& m = kv.second;
+            const bool moved = std::fabs(m[0] - 1) + std::fabs(m[5] - 1) + std::fabs(m[10] - 1) > 1e-6f;
+            if (moved) p.bones[kv.first] = m;
+        }
+    }
+    Skel::setPose(rig, &p);
+    Skel::skin(rig, body.pos, body.shown);
+}
+
+static void setPoseFile(const std::string& f) {
+    poseFile = f;
+    bodyPose = Skel::Pose();
+    if (!f.empty()) {
+        std::vector<Skel::Pose> fr; std::string err;
+        if (Skel::loadBvh(f, fr, err)) bodyPose = fr[0]; else say(err);
+    }
+    dirty = true;
+}
+
+// an .mhpose expression: its pose units and their weights (MakeHuman's expressions/*.mhpose)
+static void setExpressionFile(const std::string& f) {
+    expressionFile = f;
+    std::fill(unitW.begin(), unitW.end(), 0.0f);
+    if (!f.empty()) {
+        std::ifstream in(fs::u8path(f)); std::ostringstream ss; ss << in.rdbuf();
+        Json::Value v; size_t i = 0; const std::string t = ss.str();
+        if (Json::parse(t, i, v)) if (const Json::Value* u = v.get("unit_poses"))
+            for (const auto& kv : u->o) for (size_t k = 0; k < unitNames.size(); ++k) if (unitNames[k] == kv.first) unitW[k] = (float)kv.second.n;
+    }
+    dirty = true;
+}
+
+static std::string niceName(const std::string& path) {
+    std::string n = fs::u8path(path).stem().u8string();
+    for (auto& c : n) if (c == '_' || c == '-') c = ' ';
+    if (!n.empty()) n[0] = (char)toupper((unsigned char)n[0]);
+    return n;
+}
+
+// a MakeHuman file chooser: a "None" choice, then each file with its .thumb
+static bool chooser(const char* id, const std::vector<std::string>& files, const std::string& current, std::string& picked, float w, bool none = true) {
+    bool ch = false;
+    ImGui::PushID(id);
+    const int cols = std::max(1, (int)(w / 104));
+    int n = 0;
+    auto cell = [&](const std::string& f, const std::string& label) {
+        if (n % cols) ImGui::SameLine();
+        ImGui::BeginGroup();
+        const GLuint th = f.empty() ? 0 : picture(fs::u8path(f).replace_extension(".thumb").u8string());
+        const bool on = f == current;
+        if (on) ImGui::PushStyleColor(ImGuiCol_Button, col4(C_DEEP));
+        ImGui::PushID(n);
+        bool click = th ? ImGui::ImageButton("b", (ImTextureID)(intptr_t)th, ImVec2(88, 88)) : ImGui::Button(f.empty() ? "None" : "?", ImVec2(96, 96));
+        ImGui::PopID();
+        if (on) ImGui::PopStyleColor();
+        std::string l = label; if (l.size() > 14) l = l.substr(0, 13) + ".";
+        ImGui::TextDisabled("%s", l.c_str());
+        ImGui::EndGroup();
+        tip(label);
+        if (click) { picked = f; ch = true; }
+        ++n;
+    };
+    if (none) cell("", "None");
+    for (const auto& f : files) cell(f, niceName(f));
+    ImGui::PopID();
+    return ch;
 }
 
 // ---------- the tasks: MakeHuman's categories and their tabs ----------
@@ -616,7 +734,21 @@ static void frame() {
         if (t == "About") { groupBox("Pygmalion " PYGMALION_VERSION); ImGui::TextWrapped("People in 3D with sliders: MakeHuman, remade in C++ by Cursed Entertainment. Farica\xe2\x98\x86Kimora \xc2\xa9 Cursed Entertainment."); }
         else { groupBox("Licence"); ImGui::TextWrapped("The code is AGPL-3.0 (it ports MakeHuman's code). The body, its shapes and the assets are MakeHuman's, CC0."); }
     } else if (cat == CAT_GEOMETRIES || cat == CAT_MATERIALS) notYet("Clothes, hair, eyebrows, eyelashes, teeth, tongue, topologies, skins and eye colours come with MakeHuman's asset pack: this tab is being built.");
-    else if (cat == CAT_POSE) notYet("The skeleton, poses and face expressions: this tab is being built.");
+    else if (cat == CAT_POSE) {
+        std::string picked;
+        if (t == "Skeleton") {
+            groupBox("Skeleton");
+            if (chooser("sk", filesIn("rigs", ".mhskel"), skeletonFile, picked, lw)) { skeletonFile = picked; say(picked.empty() ? "No skeleton" : niceName(picked) + " skeleton (exported with the model)"); }
+            ImGui::Checkbox("Show the bones", &showBones);
+        } else if (t == "Pose") {
+            groupBox("Pose");
+            if (chooser("po", filesIn("poses", ".bvh"), poseFile, picked, lw)) setPoseFile(picked);
+        } else {
+            groupBox("Expression");
+            if (chooser("ex", filesIn("expressions", ".mhpose"), expressionFile, picked, lw)) setExpressionFile(picked);
+            if (filesIn("expressions", ".mhpose").empty()) notYet("MakeHuman's ready-made expressions come with its asset pack; the mixer on the right makes any expression now.");
+        }
+    }
     else notYet("Rendering: this tab is being built.");
     ImGui::End();
 
@@ -628,6 +760,22 @@ static void frame() {
             else if (t != "Main" && t != "Random" && t != "Custom") { if (const Human::Tab* tb = tabNamed(t)) modTabRight(*tb); }
             else if (t == "Main") statistics();
         } else if (cat == CAT_FILES) filesRight();
+        else if (cat == CAT_POSE && t == "Expression") {
+            // the Expression mixer: every face pose unit is a slider
+            groupBox("Expression mixer");
+            if (ImGui::Button("Neutral", ImVec2(-1, 0))) { std::fill(unitW.begin(), unitW.end(), 0.0f); expressionFile.clear(); dirty = true; }
+            ImGui::BeginChild("units");
+            for (size_t k = 1; k < unitNames.size(); ++k) {
+                ImGui::PushID((int)k);
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::SliderFloat("##u", &unitW[k], 0, 1, (unitNames[k] + ": %.2f").c_str())) { if (prefs.realtime) dirty = true; }
+                if (ImGui::IsItemActivated()) lookFor("faceCamera");
+                if (ImGui::IsItemDeactivatedAfterEdit()) dirty = true;
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) { unitW[k] = 0; dirty = true; }
+                ImGui::PopID();
+            }
+            ImGui::EndChild();
+        }
     }
     ImGui::End();
 
@@ -635,7 +783,13 @@ static void frame() {
     ImGui::SetNextWindowPos(ImVec2(sideW, top + 34)); ImGui::SetNextWindowSize(ImVec2(W - 2 * sideW, H - top - 34 - statusH));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::Begin("view", nullptr, fixed);
-    if (dirty && loadErr.empty()) { Human::apply(body); Viewer::update(body); dirty = false; }
+    if (dirty && loadErr.empty()) {
+        Human::apply(body);
+        if (!rig.empty()) Skel::build(rig, body.pos);
+        repose();
+        Viewer::update(body);
+        dirty = false;
+    }
     const ImVec2 a = ImGui::GetCursorScreenPos(), size = ImGui::GetContentRegionAvail();
     ImGui::InvisibleButton("v", size, ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight | ImGuiButtonFlags_MouseButtonMiddle);
     const unsigned tex = Viewer::render((int)size.x, (int)size.y, ImGui::IsItemHovered() || ImGui::IsItemActive());
@@ -666,7 +820,9 @@ static std::mutex loadMtx;
 static void progressCb(float f, const char* what) { loadFrac = f; std::lock_guard<std::mutex> g(loadMtx); loadWhat = what; }
 
 int main(int argc, char** argv) {
-    std::string capture, file, describeWords;
+    std::string capture, file, describeWords, startPose;
+    std::vector<std::string> startUnits;   // "Name=weight"
+    float startYaw = -1000;   // degrees, for a screenshot from a side
     std::vector<std::string> args;
 #ifdef _WIN32
     { int n; LPWSTR* wa = CommandLineToArgvW(GetCommandLineW(), &n); if (wa) { for (int i = 1; i < n; ++i) args.push_back(fs::path(wa[i]).u8string()); LocalFree(wa); } }
@@ -679,6 +835,9 @@ int main(int argc, char** argv) {
         else if (args[i] == "--describe" && i + 1 < args.size()) describeWords = args[++i];
         else if (args[i] == "--tab" && i + 1 < args.size()) forcedTab = atoi(args[++i].c_str());
         else if (args[i] == "--task" && i + 1 < args.size()) forcedTask = args[++i];
+        else if (args[i] == "--pose" && i + 1 < args.size()) startPose = args[++i];
+        else if (args[i] == "--yaw" && i + 1 < args.size()) startYaw = (float)atof(args[++i].c_str());
+        else if (args[i] == "--unit" && i + 1 < args.size()) startUnits.push_back(args[++i]);
         else file = args[i];
     }
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) return 1;
@@ -740,9 +899,17 @@ int main(int argc, char** argv) {
         ImGui_ImplSDL2_InitForOpenGL(window, gl);
     } else while (!ready) SDL_Delay(10);
     Viewer::init(dataDir);
+    { std::string err; if (!Skel::load(rig, (fs::u8path(dataDir) / "rigs" / "default.mhskel").u8string(), err)) say("No skeleton: " + err); }
+    loadFaceUnits();
     category.clear();
     if (!file.empty()) { std::string err; if (!Human::loadMhm(body, file, err)) say(err); }
     if (!describeWords.empty()) { snprintf(prompt, sizeof prompt, "%s", describeWords.c_str()); understood = Human::describe(body, describeWords); }
+    if (startYaw > -999) { Human::apply(body); Viewer::update(body); Viewer::focusBody(startYaw * 3.14159265f / 180, 0.05f); }
+    if (!startPose.empty()) setPoseFile((fs::u8path(dataDir) / "poses" / (startPose + ".bvh")).u8string());
+    for (const auto& u : startUnits) {
+        const size_t eq = u.find('=');
+        for (size_t k = 0; k < unitNames.size(); ++k) if (unitNames[k] == u.substr(0, eq)) unitW[k] = eq == std::string::npos ? 1.0f : (float)atof(u.c_str() + eq + 1);
+    }
     dirty = true;
     if (capture.empty()) { SDL_ShowWindow(window); SDL_MaximizeWindow(window); SDL_RaiseWindow(window); }
     int frames = 0;

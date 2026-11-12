@@ -51,6 +51,7 @@ struct Proxy {                           // something fitted to the body: the ey
 struct Body {
     // the base mesh
     std::vector<float> base, pos;        // 3 floats a vertex: as made, as shaped now
+    std::vector<float> shown;            // as posed (empty: the same as pos)
     std::vector<float> uv;               // 2 floats a uv
     std::vector<int> tri, triUv;         // the visible body's triangles (helpers left out), and their uvs
     std::map<std::string, std::vector<int>> joints;   // the joint markers ("joint-l-hand"...): their vertices
@@ -79,7 +80,7 @@ void setModifier(Body& b, int m, float value);    // and its mirror, with symmet
 void setMacro(Body& b, const std::string& variable, float value);
 void resetAll(Body& b);
 void apply(Body& b);                     // brings pos up to date (only the targets whose weight changed)
-void fitProxy(const Body& b, const Proxy& p, std::vector<float>& out);
+void fitProxy(const Body& b, const Proxy& p, std::vector<float>& out);   // to what's shown (posed if posed)
 
 float ageYears(const Body& b);
 float heightCm(const Body& b);

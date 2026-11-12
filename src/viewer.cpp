@@ -170,9 +170,10 @@ static void normals(const std::vector<float>& pos, const std::vector<int>& tri, 
 void update(const Human::Body& b) {
     eth[0] = b.african; eth[1] = b.asian; eth[2] = b.caucasian;
     // the body: indexed, the visible triangles only
+    const std::vector<float>& pos = b.shown.empty() ? b.pos : b.shown;
     std::vector<float> n;
-    normals(b.pos, b.tri, n);
-    upload(bodyVao, bodyPos, 0, 3, b.pos);
+    normals(pos, b.tri, n);
+    upload(bodyVao, bodyPos, 0, 3, pos);
     upload(bodyVao, bodyNrm, 1, 3, n);
     if (!bodyCount) {
         glBindBuffer_(GL_ELEMENT_ARRAY_BUFFER, bodyIdx);
@@ -193,7 +194,7 @@ void update(const Human::Body& b) {
     }
     // the height (for framing): MakeHuman's units are decimetres
     float lo = 1e30f, hi = -1e30f;
-    for (int v : b.tri) { lo = std::min(lo, b.pos[(size_t)v * 3 + 1]); hi = std::max(hi, b.pos[(size_t)v * 3 + 1]); }
+    for (int v : b.tri) { lo = std::min(lo, pos[(size_t)v * 3 + 1]); hi = std::max(hi, pos[(size_t)v * 3 + 1]); }
     height = hi - lo; bodyMid = (hi + lo) / 2;
     if (!framed) { target[1] = bodyMid; lk.dist = height * 1.7f; framed = true; }
     glBindVertexArray_(0);

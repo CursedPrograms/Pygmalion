@@ -415,15 +415,16 @@ void apply(Body& b) {
 
 void fitProxy(const Body& b, const Proxy& p, std::vector<float>& out) {
     out.resize(p.pos.size());
+    const std::vector<float>& pos = b.shown.empty() ? b.pos : b.shown;
     float scale[3];
     for (int a = 0; a < 3; ++a) {
-        const float d = std::fabs(b.pos[(size_t)p.scaleRef[a][0] * 3 + a] - b.pos[(size_t)p.scaleRef[a][1] * 3 + a]);
+        const float d = std::fabs(b.pos[(size_t)p.scaleRef[a][0] * 3 + a] - b.pos[(size_t)p.scaleRef[a][1] * 3 + a]);   // (the scale from the unposed body)
         scale[a] = p.scaleDiv[a] != 0 ? d / p.scaleDiv[a] : 1;
     }
     for (size_t i = 0; i < p.pos.size() / 3; ++i)
         for (int a = 0; a < 3; ++a) {
             float s = 0;
-            for (int k = 0; k < 3; ++k) s += p.w[i * 3 + k] * b.pos[(size_t)p.ref[i * 3 + k] * 3 + a];
+            for (int k = 0; k < 3; ++k) s += p.w[i * 3 + k] * pos[(size_t)p.ref[i * 3 + k] * 3 + a];
             out[i * 3 + a] = s + p.off[i * 3 + a] * scale[a];
         }
 }

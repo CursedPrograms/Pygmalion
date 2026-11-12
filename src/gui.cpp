@@ -29,6 +29,8 @@
 #include <map>
 #include <mutex>
 #include <fstream>
+#include <map>
+#include <set>
 #include <sstream>
 #include "json.h"
 #include <random>
@@ -130,8 +132,14 @@ static std::string dataDir, loadErr, toast; static double toastUntil = 0;
 // MakeHuman's asset pack (clothes, hair, skins, poses, expressions...): assets\ beside data\ when it's there
 static std::string assetsDir() {
     std::error_code ec;
-    const fs::path a = fs::u8path(dataDir).parent_path() / "assets-mh";
-    return fs::exists(a, ec) ? a.u8string() : std::string();
+    // beside data, or up from it (a build folder's data is a copy; the pack stays in the source folder)
+    static std::string found; static bool looked = false;
+    if (looked) return found;
+    looked = true;
+    fs::path d = fs::absolute(fs::u8path(dataDir), ec).lexically_normal().parent_path();
+    for (int up = 0; up < 4 && !d.empty(); ++up, d = d.parent_path())
+        if (fs::exists(d / "assets-mh", ec)) return found = (d / "assets-mh").u8string();
+    return found;
 }
 static bool dirty = true;
 static int tab = 0, forcedTab = 1;   // MakeHuman opens on Modelling
@@ -161,25 +169,31 @@ static void restore(const std::vector<float>& v) {
 }
 static void remember(const std::string& what) { undo.push_back({snapshot(), what}); if (undo.size() > 60) undo.erase(undo.begin()); }
 
-// the shaped body as a mesh for the exports: the body's visible triangles and the eyes
+// the shaped body as a mesh for the exports: the body's visible triangles (less those under clothes), then the gear
 static Mesh toMesh() {
     Mesh m;
-    m.mats.push_back(Material{"skin"});
-    for (size_t t = 0; t < body.tri.size(); ++t) {
-        const int v = body.tri[t], u = body.triUv[t];
-        m.pos.insert(m.pos.end(), &body.pos[(size_t)v * 3], &body.pos[(size_t)v * 3] + 3);
-        if (u >= 0 && (size_t)u * 2 + 1 < body.uv.size()) m.uv.insert(m.uv.end(), {body.uv[(size_t)u * 2], body.uv[(size_t)u * 2 + 1]}); else m.uv.insert(m.uv.end(), {0, 0});
-        if (t % 3 == 2) m.matOf.push_back(0);
+    const std::vector<float>& pos = body.shown.empty() ? body.pos : body.shown;
+    const std::vector<char> hid = Human::hiddenVerts(body);
+    Material skin{"skin"}; skin.texturePath = body.skinTexture;
+    m.mats.push_back(skin);
+    for (size_t t = 0; t + 2 < body.tri.size(); t += 3) {
+        if (hid[body.tri[t]] || hid[body.tri[t + 1]] || hid[body.tri[t + 2]]) continue;
+        for (size_t c = t; c < t + 3; ++c) {
+            const int v = body.tri[c], u = body.triUv[c];
+            m.pos.insert(m.pos.end(), &pos[(size_t)v * 3], &pos[(size_t)v * 3] + 3);
+            if (u >= 0 && (size_t)u * 2 + 1 < body.uv.size()) m.uv.insert(m.uv.end(), {body.uv[(size_t)u * 2], body.uv[(size_t)u * 2 + 1]}); else m.uv.insert(m.uv.end(), {0, 0});
+        }
+        m.matOf.push_back(0);
     }
-    if (!body.proxies.empty()) {
-        const Human::Proxy& p = body.proxies[0];
+    for (const auto& p : body.proxies) {
         std::vector<float> fit; Human::fitProxy(body, p, fit);
-        Material eye{"eyes"}; eye.texturePath = p.texture;
-        m.mats.push_back(eye);
+        Material mat{p.name.empty() ? p.kind : p.name}; mat.texturePath = p.kind == "proxymeshes" ? body.skinTexture : p.texture;
+        const int mi = (int)m.mats.size();
+        m.mats.push_back(mat);
         for (size_t c = 0; c < p.tri.size(); ++c) {
             m.pos.insert(m.pos.end(), &fit[(size_t)p.tri[c] * 3], &fit[(size_t)p.tri[c] * 3] + 3);
             m.uv.insert(m.uv.end(), {p.uv[c * 2], p.uv[c * 2 + 1]});
-            if (c % 3 == 2) m.matOf.push_back(1);
+            if (c % 3 == 2) m.matOf.push_back(mi);
         }
     }
     computeNormals(m);
@@ -371,7 +385,7 @@ static std::string niceName(const std::string& path) {
 }
 
 // a MakeHuman file chooser: a "None" choice, then each file with its .thumb
-static bool chooser(const char* id, const std::vector<std::string>& files, const std::string& current, std::string& picked, float w, bool none = true) {
+static bool chooser(const char* id, const std::vector<std::string>& files, const std::string& current, std::string& picked, float w, bool none = true, const char* noneLabel = "None") {
     bool ch = false;
     ImGui::PushID(id);
     const int cols = std::max(1, (int)(w / 104));
@@ -383,7 +397,7 @@ static bool chooser(const char* id, const std::vector<std::string>& files, const
         const bool on = f == current;
         if (on) ImGui::PushStyleColor(ImGuiCol_Button, col4(C_DEEP));
         ImGui::PushID(n);
-        bool click = th ? ImGui::ImageButton("b", (ImTextureID)(intptr_t)th, ImVec2(88, 88)) : ImGui::Button(f.empty() ? "None" : "?", ImVec2(96, 96));
+        bool click = th ? ImGui::ImageButton("b", (ImTextureID)(intptr_t)th, ImVec2(88, 88)) : ImGui::Button(f.empty() ? noneLabel : "?", ImVec2(96, 96));
         ImGui::PopID();
         if (on) ImGui::PopStyleColor();
         std::string l = label; if (l.size() > 14) l = l.substr(0, 13) + ".";
@@ -393,10 +407,92 @@ static bool chooser(const char* id, const std::vector<std::string>& files, const
         if (click) { picked = f; ch = true; }
         ++n;
     };
-    if (none) cell("", "None");
+    if (none) cell("", noneLabel);
     for (const auto& f : files) cell(f, niceName(f));
     ImGui::PopID();
     return ch;
+}
+
+static void notYet(const char* what);
+// ---------- Geometries and Materials: MakeHuman's proxy and material libraries ----------
+static const char* kindOf(const std::string& tab) {
+    if (tab == "Clothes") return "clothes";
+    if (tab == "Eyes") return "eyes";
+    if (tab == "Hair") return "hair";
+    if (tab == "Teeth") return "teeth";
+    if (tab == "Topologies") return "proxymeshes";
+    if (tab == "Eyebrows") return "eyebrows";
+    if (tab == "Eyelashes") return "eyelashes";
+    return "tongue";
+}
+static std::map<std::string, std::vector<std::string>> libCache;
+static const std::vector<std::string>& library(const std::string& sub, const char* ext) {
+    const std::string key = sub + ext;
+    auto it = libCache.find(key);
+    if (it != libCache.end()) return it->second;
+    auto v = filesIn(sub, ext);
+    // the asset pack's own copy wins over data's (the same file twice shows once)
+    std::vector<std::string> out; std::set<std::string> seen;
+    for (const auto& f : v) if (seen.insert(fs::u8path(f).filename().u8string()).second) out.push_back(f);
+    return libCache[key] = out;
+}
+static void putOn(const std::string& f, const std::string& kind) {
+    remember("Geometry");
+    std::string err;
+    if (f.empty()) { Human::takeOff(body, kind); dirty = true; return; }
+    if (Human::wear(body, f, err)) { dirty = true; say((Human::isWorn(body, f) ? "On: " : "Off: ") + niceName(f)); } else say(err);
+}
+static void geometriesLeft(const std::string& t, float lw) {
+    const std::string kind = kindOf(t);
+    groupBox(t.c_str());
+    if (assetsDir().empty() && kind != "eyes") { notYet("MakeHuman's clothes, hair, eyebrows, eyelashes, teeth, tongue, topologies and skins are its asset pack (CC0). Put its \"system\" folder's contents in assets-mh beside data."); return; }
+    const auto& files = kind == "proxymeshes" ? library("proxymeshes", ".proxy") : library(kind, ".mhclo");
+    std::string picked;
+    if (kind == "clothes") {
+        // several at once: a click puts one on, a second click takes it off; the worn ones are pink
+        ImGui::Checkbox("Hide faces under clothes", &body.hideUnderClothes);
+        if (ImGui::IsItemEdited()) dirty = true;
+        if (ImGui::Button("Take everything off", ImVec2(lw, 0))) { remember("Geometry"); Human::takeOff(body, "clothes"); dirty = true; }
+        const int cols = std::max(1, (int)(lw / 104));
+        int n = 0;
+        for (const auto& f : files) {
+            if (n % cols) ImGui::SameLine();
+            ImGui::BeginGroup(); ImGui::PushID(n);
+            const GLuint th = picture(fs::u8path(f).replace_extension(".thumb").u8string());
+            const bool on = Human::isWorn(body, f);
+            if (on) ImGui::PushStyleColor(ImGuiCol_Button, col4(C_DEEP));
+            const bool click = th ? ImGui::ImageButton("b", (ImTextureID)(intptr_t)th, ImVec2(88, 88)) : ImGui::Button("?", ImVec2(96, 96));
+            if (on) ImGui::PopStyleColor();
+            std::string l = niceName(f); if (l.size() > 14) l = l.substr(0, 13) + ".";
+            ImGui::TextDisabled("%s", l.c_str());
+            ImGui::PopID(); ImGui::EndGroup();
+            tip(niceName(f));
+            if (click) putOn(f, kind);
+            ++n;
+        }
+        return;
+    }
+    const Human::Proxy* cur = Human::worn(body, kind);
+    if (chooser(kind.c_str(), files, cur ? cur->file : std::string(), picked, lw, kind != "eyes")) putOn(picked, kind);
+}
+static void materialsLeft(float lw) {
+    // MakeHuman's Skin/Material: the skins, then each worn proxy's own materials (eye colours, hair colours...)
+    std::string picked;
+    groupBox("Skin");
+    std::vector<std::string> skins = library("skins", ".mhmat");
+    if (chooser("skin", skins, body.skinMaterial, picked, lw, true, "Default")) { remember("Skin"); Human::setSkin(body, picked); dirty = true; say(picked.empty() ? "The default skin" : niceName(picked)); }
+    for (const auto& p : body.proxies) {
+        if (p.kind == "proxymeshes") continue;
+        std::vector<std::string> mats;
+        std::error_code ec;
+        const fs::path dir = fs::u8path(p.file).parent_path();
+        for (const fs::path d : {dir, dir.parent_path() / "materials"})
+            for (const auto& e : fs::directory_iterator(d, ec)) if (e.path().extension() == ".mhmat") mats.push_back(e.path().u8string());
+        if (mats.size() < 2) continue;
+        std::sort(mats.begin(), mats.end());
+        groupBox((niceName(p.file) + " material").c_str());
+        if (chooser(("m" + p.file).c_str(), mats, p.material, picked, lw, false)) { remember("Material"); Human::setProxyMaterial(body, p.kind, picked); dirty = true; }
+    }
 }
 
 // ---------- the tasks: MakeHuman's categories and their tabs ----------
@@ -616,7 +712,7 @@ static void toolbar(float x, float y, float w) {
     auto gap = [] { ImGui::SameLine(0, 12); };
     if (btn("Undo", "Undo (Ctrl+Z)") && !undo.empty()) { redo.push_back({snapshot(), undo.back().second}); restore(undo.back().first); undo.pop_back(); }
     if (btn("Redo", "Redo (Ctrl+Y)") && !redo.empty()) { undo.push_back({snapshot(), redo.back().second}); restore(redo.back().first); redo.pop_back(); }
-    if (btn("Reset", "Reset the human to the start")) { remember("Reset"); Human::resetAll(body); dirty = true; }
+    if (btn("Reset", "Reset the human to the start")) { remember("Reset"); Human::resetAll(body); Human::defaultGear(body); dirty = true; }
     gap();
     Viewer::Look& lk = Viewer::look();
     if (btn("Wire", "Show the mesh's lines", lk.wire)) lk.wire = !lk.wire;
@@ -733,7 +829,8 @@ static void frame() {
     } else if (cat == CAT_HELP) {
         if (t == "About") { groupBox("Pygmalion " PYGMALION_VERSION); ImGui::TextWrapped("People in 3D with sliders: MakeHuman, remade in C++ by Cursed Entertainment. Farica\xe2\x98\x86Kimora \xc2\xa9 Cursed Entertainment."); }
         else { groupBox("Licence"); ImGui::TextWrapped("The code is AGPL-3.0 (it ports MakeHuman's code). The body, its shapes and the assets are MakeHuman's, CC0."); }
-    } else if (cat == CAT_GEOMETRIES || cat == CAT_MATERIALS) notYet("Clothes, hair, eyebrows, eyelashes, teeth, tongue, topologies, skins and eye colours come with MakeHuman's asset pack: this tab is being built.");
+    } else if (cat == CAT_GEOMETRIES) geometriesLeft(t, lw);
+    else if (cat == CAT_MATERIALS) materialsLeft(lw);
     else if (cat == CAT_POSE) {
         std::string picked;
         if (t == "Skeleton") {
@@ -899,6 +996,10 @@ int main(int argc, char** argv) {
         ImGui_ImplSDL2_InitForOpenGL(window, gl);
     } else while (!ready) SDL_Delay(10);
     Viewer::init(dataDir);
+    body.roots.clear();
+    if (!assetsDir().empty()) body.roots.push_back(assetsDir());
+    body.roots.push_back(dataDir);
+    Human::defaultGear(body);
     { std::string err; if (!Skel::load(rig, (fs::u8path(dataDir) / "rigs" / "default.mhskel").u8string(), err)) say("No skeleton: " + err); }
     loadFaceUnits();
     category.clear();

@@ -5,6 +5,7 @@
 #include "json.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -205,34 +206,69 @@ static void loadSliders(Body& b, const fs::path& file) {
     }
 }
 
-// ---------- the eyes (a .mhclo proxy) ----------
-static bool loadProxy(Body& b, const fs::path& mhclo) {
+// ---------- proxies (.mhclo): everything fitted to the body ----------
+bool loadMaterial(const std::string& mhmat, std::string& texture, bool& transparent) {
+    std::string mt;
+    const fs::path mp = fs::u8path(mhmat);
+    if (!readAll(mp, mt)) return false;
+    std::istringstream mi(mt);
+    std::string line;
+    texture.clear(); transparent = false;
+    while (std::getline(mi, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        std::istringstream ls(line); std::string k, v; ls >> k >> v;
+        if (k == "diffuseTexture") texture = (mp.parent_path() / fs::u8path(v)).lexically_normal().u8string();
+        else if ((k == "transparent" && (v == "True" || v == "true")) || (k == "shaderConfig" && v == "transparency" && line.find("True") != std::string::npos)) transparent = true;
+    }
+    return true;
+}
+
+bool loadProxyFile(const std::string& path, Proxy& p, std::string& err) {
+    p = Proxy();
+    const fs::path mhclo = fs::u8path(path);
+    p.file = path;
+    p.kind = mhclo.parent_path().parent_path().filename().u8string();
+    if (p.kind == "high-poly" || p.kind == "low-poly") p.kind = "eyes";
     std::string t;
-    if (!readAll(mhclo, t)) return false;
-    Proxy p;
+    if (!readAll(mhclo, t)) { err = "Couldn't read " + path; return false; }
     std::istringstream in(t);
     std::string line, objFile, material;
-    bool inVerts = false;
+    enum { NONE, VERTS, DELETE } mode = NONE;
+    bool sawVerts = false;   // (keywords like material may sit between "verts" and its numbers)
     while (std::getline(in, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty() || line[0] == '#') continue;
         std::istringstream ls(line);
-        if (inVerts) {
+        const bool numeric = line.find_first_not_of(" \t0123456789.-+eE") == std::string::npos;
+        if (mode != DELETE && sawVerts && numeric) {
             std::vector<double> v; double x;
             while (ls >> x) v.push_back(x);
             if (v.size() == 9) {
                 for (int k = 0; k < 3; ++k) { p.ref.push_back((int)v[k]); p.w.push_back((float)v[3 + k]); p.off.push_back((float)v[6 + k]); }
             } else if (v.size() == 1) {   // exactly on a body vertex
                 p.ref.insert(p.ref.end(), {(int)v[0], (int)v[0], (int)v[0]}); p.w.insert(p.w.end(), {1, 0, 0}); p.off.insert(p.off.end(), {0, 0, 0});
-            } else if (!v.empty()) continue;
-            else inVerts = false;
+            }
             continue;
         }
+        if (mode == DELETE && numeric) {
+            // "a - b" ranges and single vertices
+            std::vector<std::string> tok; std::string w;
+            while (ls >> w) tok.push_back(w);
+            for (size_t i = 0; i < tok.size(); ++i) {
+                if (i + 2 < tok.size() && tok[i + 1] == "-") { const int a = atoi(tok[i].c_str()), z = atoi(tok[i + 2].c_str()); for (int v = a; v <= z; ++v) p.deleteVerts.push_back(v); i += 2; }
+                else p.deleteVerts.push_back(atoi(tok[i].c_str()));
+            }
+            continue;
+        }
+        mode = NONE;
         std::string k; ls >> k;
-        if (k == "verts") inVerts = true;
+        if (k == "verts") { mode = VERTS; sawVerts = true; }
+        else if (k == "delete_verts") mode = DELETE;
         else if (k == "name") ls >> p.name;
+        else if (k == "uuid") ls >> p.uuid;
         else if (k == "obj_file") ls >> objFile;
-        else if (k == "material") ls >> material;
+        else if (k == "material") { std::getline(ls >> std::ws, material); }
+        else if (k == "z_depth") ls >> p.zDepth;
         else if (k == "x_scale" || k == "y_scale" || k == "z_scale") {
             const int a = k[0] - 'x';
             ls >> p.scaleRef[a][0] >> p.scaleRef[a][1] >> p.scaleDiv[a];
@@ -240,36 +276,144 @@ static bool loadProxy(Body& b, const fs::path& mhclo) {
     }
     // its own mesh: vertices, uvs, triangles
     std::string o;
-    if (!readAll(mhclo.parent_path() / objFile, o)) return false;
-    std::istringstream oi(o);
+    if (!readAll(mhclo.parent_path() / fs::u8path(objFile), o)) { err = "Couldn't read " + objFile; return false; }
     std::vector<float> vt;
-    while (std::getline(oi, line)) {
-        if (line.rfind("v ", 0) == 0) { float x, y, z; sscanf(line.c_str() + 2, "%f %f %f", &x, &y, &z); p.pos.insert(p.pos.end(), {x, y, z}); }
-        else if (line.rfind("vt ", 0) == 0) { float u, v; sscanf(line.c_str() + 3, "%f %f", &u, &v); vt.insert(vt.end(), {u, v}); }
-        else if (line.rfind("f ", 0) == 0) {
+    const char* s = o.c_str(); const char* end = s + o.size();
+    while (s < end) {
+        const char* eol = (const char*)memchr(s, '\n', end - s);
+        if (!eol) eol = end;
+        char* q = nullptr;
+        if (s[0] == 'v' && s[1] == ' ') { q = (char*)s + 2; for (int k = 0; k < 3; ++k) p.pos.push_back(strtof(q, &q)); }
+        else if (s[0] == 'v' && s[1] == 't') { q = (char*)s + 3; for (int k = 0; k < 2; ++k) vt.push_back(strtof(q, &q)); }
+        else if (s[0] == 'f' && s[1] == ' ') {
             std::vector<int> v, u;
-            std::istringstream ls(line.substr(2)); std::string c;
-            while (ls >> c) { int a = 0, w = 0; sscanf(c.c_str(), "%d/%d", &a, &w); v.push_back(a - 1); u.push_back(w - 1); }
+            const char* c = s + 2;
+            while (c < eol) {
+                while (c < eol && (*c == ' ' || *c == '\t' || *c == '\r')) ++c;
+                if (c >= eol) break;
+                char* e2;
+                const int a = (int)strtol(c, &e2, 10); int w = 0;
+                c = e2;
+                if (*c == '/') { ++c; if (*c != '/') { w = (int)strtol(c, &e2, 10); c = e2; } if (*c == '/') { ++c; strtol(c, &e2, 10); c = e2; } }
+                while (c < eol && *c != ' ' && *c != '\t') ++c;
+                v.push_back(a - 1); u.push_back(w - 1);
+            }
             for (size_t k = 1; k + 1 < v.size(); ++k)
-                for (size_t q : {(size_t)0, k, k + 1}) {
-                    p.tri.push_back(v[q]);
-                    const int ui = u[q];
+                for (size_t qq : {(size_t)0, k, k + 1}) {
+                    p.tri.push_back(v[qq]);
+                    const int ui = u[qq];
                     p.uv.push_back(ui >= 0 && (size_t)ui * 2 + 1 < vt.size() ? vt[ui * 2] : 0);
                     p.uv.push_back(ui >= 0 && (size_t)ui * 2 + 1 < vt.size() ? vt[ui * 2 + 1] : 0);
                 }
         }
+        s = eol + 1;
     }
-    if (p.ref.size() / 3 != p.pos.size() / 3) return false;
-    // its texture, from the material
-    std::string mt;
-    const fs::path mp = (mhclo.parent_path() / material).lexically_normal();
-    if (readAll(mp, mt)) {
-        std::istringstream mi(mt);
-        while (std::getline(mi, line)) {
-            std::istringstream ls(line); std::string k, v; ls >> k >> v;
-            if (k == "diffuseTexture") p.texture = (mp.parent_path() / v).lexically_normal().u8string();
+    if (p.ref.size() / 3 != p.pos.size() / 3) { err = p.name + ": its fitting doesn't match its mesh"; return false; }
+    if (!material.empty()) {
+        p.material = (mhclo.parent_path() / fs::u8path(material)).lexically_normal().u8string();
+        loadMaterial(p.material, p.texture, p.transparent);
+    }
+    return true;
+}
+
+// ---------- the gear ----------
+std::string relPath(const Body& b, const std::string& abs) {
+    const fs::path a = fs::u8path(abs).lexically_normal();
+    for (const auto& r : b.roots) {
+        const fs::path rel = a.lexically_relative(fs::u8path(r).lexically_normal());
+        if (!rel.empty() && rel.native()[0] != '.') return rel.generic_u8string();
+    }
+    return a.generic_u8string();
+}
+std::string absPath(const Body& b, const std::string& rel) {
+    std::error_code ec;
+    if (fs::u8path(rel).is_absolute()) return rel;
+    for (const auto& r : b.roots) { const fs::path f = fs::u8path(r) / fs::u8path(rel); if (fs::exists(f, ec)) return f.lexically_normal().u8string(); }
+    return std::string();
+}
+
+static void sortGear(Body& b) {
+    std::stable_sort(b.proxies.begin(), b.proxies.end(), [](const Proxy& x, const Proxy& y) { return x.zDepth < y.zDepth; });
+}
+
+bool isWorn(const Body& b, const std::string& file) {
+    for (const auto& p : b.proxies) if (fs::u8path(p.file).lexically_normal() == fs::u8path(file).lexically_normal()) return true;
+    return false;
+}
+const Proxy* worn(const Body& b, const std::string& kind) {
+    for (const auto& p : b.proxies) if (p.kind == kind) return &p;
+    return nullptr;
+}
+void takeOff(Body& b, const std::string& k) {
+    const fs::path f = fs::u8path(k).lexically_normal();
+    b.proxies.erase(std::remove_if(b.proxies.begin(), b.proxies.end(), [&](const Proxy& p) { return p.kind == k || fs::u8path(p.file).lexically_normal() == f; }), b.proxies.end());
+}
+bool wear(Body& b, const std::string& file, std::string& err) {
+    if (isWorn(b, file)) {   // clothes come off with a second click; the rest stay
+        for (const auto& p : b.proxies) if (p.kind == "clothes" && fs::u8path(p.file).lexically_normal() == fs::u8path(file).lexically_normal()) { takeOff(b, file); break; }
+        return true;
+    }
+    Proxy p;
+    if (!loadProxyFile(file, p, err)) return false;
+    if (p.kind != "clothes") takeOff(b, p.kind);
+    b.proxies.push_back(std::move(p));
+    sortGear(b);
+    return true;
+}
+bool setSkin(Body& b, const std::string& mhmat) {
+    b.skinMaterial = mhmat; b.skinTexture.clear();
+    if (mhmat.empty()) return true;
+    bool t;
+    if (!loadMaterial(mhmat, b.skinTexture, t)) { b.skinMaterial.clear(); return false; }
+    std::error_code ec;
+    if (!b.skinTexture.empty() && !fs::exists(fs::u8path(b.skinTexture), ec)) b.skinTexture.clear();
+    return true;
+}
+bool setProxyMaterial(Body& b, const std::string& kind, const std::string& mhmat) {
+    for (auto& p : b.proxies) if (p.kind == kind) { p.material = mhmat; return loadMaterial(mhmat, p.texture, p.transparent); }
+    return false;
+}
+std::vector<char> hiddenVerts(const Body& b) {
+    std::vector<char> h(b.base.size() / 3, 0);
+    for (const auto& p : b.proxies) {
+        if (p.kind == "proxymeshes") { std::fill(h.begin(), h.end(), 1); break; }
+        if (p.kind == "clothes" && b.hideUnderClothes) for (int v : p.deleteVerts) if (v >= 0 && (size_t)v < h.size()) h[v] = 1;
+    }
+    return h;
+}
+static std::string findGear(const Body& b, const std::string& kind, const std::string& name, const std::string& uuid) {
+    std::error_code ec;
+    std::string byName;
+    for (const auto& r : b.roots)
+        for (const auto& e : fs::recursive_directory_iterator(fs::u8path(r) / (kind == "proxy" ? "proxymeshes" : kind), ec)) {
+            const auto x = e.path().extension();
+            if (!e.is_regular_file() || (x != ".mhclo" && x != ".proxy")) continue;
+            std::ifstream in(e.path()); std::string line;
+            for (int n = 0; n < 60 && std::getline(in, line); ++n) {
+                std::istringstream ls(line); std::string k, v; ls >> k >> v;
+                if (k == "uuid" && !uuid.empty() && v == uuid) return e.path().u8string();
+                if (k == "name" && byName.empty() && v == name) byName = e.path().u8string();
+            }
+            if (byName.empty() && e.path().stem().u8string() == name) byName = e.path().u8string();
         }
+    return byName;
+}
+void defaultGear(Body& b) {
+    // MakeHuman's new human: brown high-poly eyes, eyebrow001, eyelashes01; no clothes, the default skin
+    b.proxies.clear();
+    std::string err;
+    const std::string e = findGear(b, "eyes", "HighPolyEyes", "2c12f43b-1303-432c-b7ce-d78346baf2e6");
+    if (!e.empty()) wear(b, e, err);
+    for (const char* k : {"eyebrows/eyebrow001/eyebrow001.mhclo", "eyelashes/eyelashes01/eyelashes01.mhclo"}) {
+        const std::string f = absPath(b, k);
+        if (!f.empty()) wear(b, f, err);
     }
+    setSkin(b, "");
+}
+
+static bool loadProxy(Body& b, const fs::path& mhclo) {
+    Proxy p; std::string err;
+    if (!loadProxyFile(mhclo.u8string(), p, err)) return false;
     b.proxies.push_back(std::move(p));
     return true;
 }
@@ -499,7 +643,12 @@ bool saveMhm(const Body& b, const std::string& path, const std::string& name, st
         snprintf(buf, sizeof buf, "modifier %s %f\n", m.fullName().c_str(), m.value);
         o << buf;
     }
-    o << "eyes HighPolyEyes 2c12f43b-1303-432c-b7ce-d78346baf2e6\nskinMaterial skins/default.mhmat\nsubdivide False\n";
+    // the gear, as MakeHuman's libraries write it: "<library> <name> <uuid>", then each one's material
+    for (const auto& p : b.proxies) o << (p.kind == "proxymeshes" ? "proxy" : p.kind) << " " << p.name << " " << p.uuid << "\n";
+    o << "clothesHideFaces " << (b.hideUnderClothes ? "True" : "False") << "\n";
+    o << "skinMaterial " << (b.skinMaterial.empty() ? std::string("skins/default.mhmat") : relPath(b, b.skinMaterial)) << "\n";
+    for (const auto& p : b.proxies) if (!p.material.empty()) o << "material " << p.name << " " << p.uuid << " " << relPath(b, p.material) << "\n";
+    o << "subdivide False\n";
     return true;
 }
 
@@ -509,10 +658,18 @@ bool loadMhm(Body& b, const std::string& path, std::string& err) {
     resetAll(b);
     std::string line;
     int n = 0;
+    std::vector<std::array<std::string, 3>> wearLater, matLater;
+    std::string skinLater;
     float eth[3] = {-1, -1, -1};
     while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         std::istringstream ls(line); std::string k, name; float v;
         ls >> k;
+        static const std::set<std::string> gear = {"clothes", "hair", "eyebrows", "eyelashes", "teeth", "tongue", "eyes", "proxy"};
+        if (gear.count(k)) { std::string nm, id; ls >> nm >> id; wearLater.push_back({k, nm, id}); continue; }
+        if (k == "skinMaterial") { std::string f; std::getline(ls >> std::ws, f); skinLater = f; continue; }
+        if (k == "clothesHideFaces") { std::string f; ls >> f; b.hideUnderClothes = f != "False"; continue; }
+        if (k == "material") { std::string nm, id, f; ls >> nm >> id; std::getline(ls >> std::ws, f); matLater.push_back({nm, id, f}); continue; }
         if (k != "modifier" || !(ls >> name >> v)) continue;
         auto it = b.modByName.find(name);
         if (it == b.modByName.end()) continue;
@@ -526,6 +683,19 @@ bool loadMhm(Body& b, const std::string& path, std::string& err) {
     }
     if (eth[0] >= 0 && eth[1] >= 0 && eth[2] >= 0) { b.african = eth[0]; b.asian = eth[1]; b.caucasian = eth[2]; }
     for (auto& m : b.mods) if (m.macro) if (float* q = macroField(b, m.variable)) m.value = *q;
+    if (!b.roots.empty()) {
+        b.proxies.erase(std::remove_if(b.proxies.begin(), b.proxies.end(), [&](const Proxy& p) { return !wearLater.empty() || p.kind != "eyes"; }), b.proxies.end());
+        std::string e2;
+        for (const auto& g : wearLater) { const std::string f = findGear(b, g[0], g[1], g[2]); if (!f.empty()) wear(b, f, e2); }
+        if (!worn(b, "eyes")) { const std::string f = findGear(b, "eyes", "HighPolyEyes", "2c12f43b-1303-432c-b7ce-d78346baf2e6"); if (!f.empty()) wear(b, f, e2); }
+        for (const auto& m : matLater) {
+            const std::string f = absPath(b, m[2]);
+            if (f.empty()) continue;
+            for (auto& p : b.proxies) if (p.uuid == m[1] || p.name == m[0]) { p.material = f; loadMaterial(f, p.texture, p.transparent); }
+        }
+        const bool plain = skinLater.empty() || fs::u8path(skinLater).filename() == "default.mhmat";
+        setSkin(b, plain ? std::string() : absPath(b, skinLater));
+    }
     if (!n) { err = "No MakeHuman settings in that file"; return false; }
     return true;
 }

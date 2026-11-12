@@ -11,6 +11,8 @@
 #include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <map>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -73,16 +75,26 @@ namespace Viewer {
 static Look lk;
 Look& look() { return lk; }
 static GLuint prog = 0, progLine = 0;
-static GLuint bodyVao = 0, bodyPos = 0, bodyNrm = 0, bodyIdx = 0; static int bodyCount = 0;
-static GLuint eyeVao = 0, eyePos = 0, eyeNrm = 0, eyeUv = 0; static int eyeCount = 0;
+// a mesh drawn corner by corner (uvs are per corner): the body, and each proxy (eyes, clothes, hair...)
+struct Part { GLuint vao = 0, pos = 0, nrm = 0, uv = 0, tex = 0; int count = 0, mode = 3; bool cutout = false; };
+static Part bodyPart;
+static std::vector<Part> parts;
+static std::map<std::string, GLuint> texCache;
 static GLuint gridVao = 0, gridVbo = 0; static int gridCount = 0;
-static GLuint lit[3] = {0, 0, 0}, litEye = 0, eyeTex = 0;
+static GLuint lit[3] = {0, 0, 0}, litEye = 0;
 static GLuint fbo = 0, fboTex = 0, fboDepth = 0; static int fbW = 0, fbH = 0;
 static float eth[3] = {1 / 3.0f, 1 / 3.0f, 1 / 3.0f};
 static float target[3] = {0, 8.5f, 0}, height = 17, bodyMid = 8.5f;
 static bool framed = false;
 
+static GLuint textureLoad(const std::string& path);
 static GLuint texture(const std::string& path) {
+    if (path.empty()) return 0;
+    auto it = texCache.find(path);
+    if (it != texCache.end()) return it->second;
+    return texCache[path] = textureLoad(path);
+}
+static GLuint textureLoad(const std::string& path) {
     int w, h, n;
     stbi_set_flip_vertically_on_load(1);
     unsigned char* px = stbi_load(path.c_str(), &w, &h, &n, 4);
@@ -93,8 +105,8 @@ static GLuint texture(const std::string& path) {
     glGenerateMipmap_(GL_TEXTURE_2D);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
     stbi_image_free(px);
     return t;
 }
@@ -115,12 +127,17 @@ uniform mat4 mvp, view; out vec3 N; out vec2 T;
 void main() { N = mat3(view) * n; T = t; gl_Position = mvp * vec4(p, 1); })",
                 R"(#version 330
 in vec3 N; in vec2 T; out vec4 o;
-uniform sampler2D litA, litB, litC, eyeTex; uniform vec3 eth; uniform int mode; uniform float light;
+uniform sampler2D litA, litB, litC, tex; uniform vec3 eth; uniform int mode, hasTex, cutout; uniform float light;
 void main() {
   vec3 n = normalize(N); if (!gl_FrontFacing) n = -n;
   vec2 uv = n.xy * 0.495 + 0.5;                          // MakeHuman's litsphere lookup
+  vec4 tc = hasTex == 1 ? texture(tex, T) : vec4(0.62, 0.62, 0.64, 1);
+  if (cutout == 1 && tc.a < 0.4) discard;                // hair, eyebrows, lashes: their see-through parts
+  float d = max(n.z, 0.0);
+  if (mode == 3) { o = vec4(tc.rgb * (0.38 + 0.72 * d) + vec3(0.04) * pow(d, 24.0), 1); return; }
+  if (mode == 4) { o = vec4(tc.rgb * (0.42 + 0.68 * d) * vec3(1.0, 0.97, 0.95), 1); return; }   // a skin texture
   if (mode == 1) {                                       // the eyes: their picture; the cornea's clear parts let the iris show
-    vec4 c = texture(eyeTex, T);
+    vec4 c = tc;
     if (c.a < 0.35) discard;
     vec3 shine = texture(litA, uv).rgb;                  // MakeHuman's eye litsphere, added at half strength
     o = vec4(c.rgb * 0.8 + shine * 0.5 * 0.35, 1);
@@ -139,8 +156,7 @@ out vec4 o; uniform vec3 col; void main() { o = vec4(col, 1); })");
     lit[1] = texture((ls / "skinmat_asian.png").u8string());
     lit[2] = texture((ls / "skinmat_caucasian.png").u8string());
     litEye = texture((ls / "skinmat_eye.png").u8string());
-    glGenVertexArrays_(1, &bodyVao); glGenBuffers_(1, &bodyPos); glGenBuffers_(1, &bodyNrm); glGenBuffers_(1, &bodyIdx);
-    glGenVertexArrays_(1, &eyeVao); glGenBuffers_(1, &eyePos); glGenBuffers_(1, &eyeNrm); glGenBuffers_(1, &eyeUv);
+
     glGenVertexArrays_(1, &gridVao); glGenBuffers_(1, &gridVbo);
     return prog != 0;
 }
@@ -167,30 +183,49 @@ static void normals(const std::vector<float>& pos, const std::vector<int>& tri, 
     }
 }
 
+static void fill(Part& pt, const std::vector<float>& P, const std::vector<float>& N, const std::vector<float>& U) {
+    if (!pt.vao) { glGenVertexArrays_(1, &pt.vao); glGenBuffers_(1, &pt.pos); glGenBuffers_(1, &pt.nrm); glGenBuffers_(1, &pt.uv); }
+    upload(pt.vao, pt.pos, 0, 3, P); upload(pt.vao, pt.nrm, 1, 3, N); upload(pt.vao, pt.uv, 2, 2, U);
+    pt.count = (int)P.size() / 3;
+}
+
 void update(const Human::Body& b) {
     eth[0] = b.african; eth[1] = b.asian; eth[2] = b.caucasian;
-    // the body: indexed, the visible triangles only
     const std::vector<float>& pos = b.shown.empty() ? b.pos : b.shown;
-    std::vector<float> n;
-    normals(pos, b.tri, n);
-    upload(bodyVao, bodyPos, 0, 3, pos);
-    upload(bodyVao, bodyNrm, 1, 3, n);
-    if (!bodyCount) {
-        glBindBuffer_(GL_ELEMENT_ARRAY_BUFFER, bodyIdx);
-        glBufferData_(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(b.tri.size() * 4), b.tri.data(), GL_STATIC_DRAW);
-        bodyCount = (int)b.tri.size();
+    // the body: its visible triangles, less those under clothes (all of them under a topology)
+    {
+        std::vector<float> n; normals(pos, b.tri, n);
+        const std::vector<char> hid = Human::hiddenVerts(b);
+        std::vector<float> P, N, U;
+        P.reserve(b.tri.size() * 3); N.reserve(b.tri.size() * 3); U.reserve(b.tri.size() * 2);
+        for (size_t t = 0; t + 2 < b.tri.size(); t += 3) {
+            if (hid[b.tri[t]] || hid[b.tri[t + 1]] || hid[b.tri[t + 2]]) continue;
+            for (size_t c = t; c < t + 3; ++c) {
+                const size_t v = (size_t)b.tri[c]; const int u = b.triUv[c];
+                P.insert(P.end(), &pos[v * 3], &pos[v * 3] + 3); N.insert(N.end(), &n[v * 3], &n[v * 3] + 3);
+                if (u >= 0 && (size_t)u * 2 + 1 < b.uv.size()) U.insert(U.end(), {b.uv[(size_t)u * 2], b.uv[(size_t)u * 2 + 1]}); else U.insert(U.end(), {0, 0});
+            }
+        }
+        fill(bodyPart, P, N, U);
+        bodyPart.tex = texture(b.skinTexture);
+        bodyPart.mode = bodyPart.tex ? 4 : 0;
     }
-    // the eyes, fitted to the body as it is now (corners unrolled: their uvs are per corner)
-    if (!b.proxies.empty()) {
-        const Human::Proxy& p = b.proxies[0];
+    // the proxies, fitted to the body as it is now, in MakeHuman's z_depth order
+    parts.resize(std::max(parts.size(), b.proxies.size()));
+    for (size_t i = 0; i < parts.size(); ++i) {
+        Part& pt = parts[i];
+        if (i >= b.proxies.size()) { pt.count = 0; continue; }
+        const Human::Proxy& p = b.proxies[i];
         std::vector<float> fit; Human::fitProxy(b, p, fit);
-        std::vector<int> idx(p.tri.begin(), p.tri.end());
-        std::vector<float> pn; normals(fit, idx, pn);
+        std::vector<float> pn; normals(fit, p.tri, pn);
         std::vector<float> P, N;
+        P.reserve(p.tri.size() * 3); N.reserve(p.tri.size() * 3);
         for (int v : p.tri) { P.insert(P.end(), &fit[(size_t)v * 3], &fit[(size_t)v * 3] + 3); N.insert(N.end(), &pn[(size_t)v * 3], &pn[(size_t)v * 3] + 3); }
-        upload(eyeVao, eyePos, 0, 3, P); upload(eyeVao, eyeNrm, 1, 3, N); upload(eyeVao, eyeUv, 2, 2, p.uv);
-        eyeCount = (int)p.tri.size();
-        if (!eyeTex && !p.texture.empty()) eyeTex = texture(p.texture);
+        fill(pt, P, N, p.uv);
+        const bool topology = p.kind == "proxymeshes";
+        pt.tex = texture(topology ? b.skinTexture : p.texture);
+        pt.mode = p.kind == "eyes" ? 1 : topology ? (pt.tex ? 4 : 0) : 3;
+        pt.cutout = p.transparent || p.kind == "hair" || p.kind == "eyebrows" || p.kind == "eyelashes";
     }
     // the height (for framing): MakeHuman's units are decimetres
     float lo = 1e30f, hi = -1e30f;
@@ -276,29 +311,31 @@ unsigned render(int w, int h, bool hovered) {
     glUniformMatrix4fv_(glGetUniformLocation_(prog, "view"), 1, GL_FALSE, V);
     glUniform3f_(glGetUniformLocation_(prog, "eth"), eth[0], eth[1], eth[2]);
     glUniform1f_(glGetUniformLocation_(prog, "light"), lk.light);
-    for (int k = 0; k < 3; ++k) { glActiveTexture_(GL_TEXTURE0 + k); glBindTexture(GL_TEXTURE_2D, lit[k]); }
-    glActiveTexture_(GL_TEXTURE0 + 3); glBindTexture(GL_TEXTURE_2D, eyeTex);
     glUniform1i_(glGetUniformLocation_(prog, "litA"), 0); glUniform1i_(glGetUniformLocation_(prog, "litB"), 1);
-    glUniform1i_(glGetUniformLocation_(prog, "litC"), 2); glUniform1i_(glGetUniformLocation_(prog, "eyeTex"), 3);
-    glUniform1i_(glGetUniformLocation_(prog, "mode"), lk.shading == 1 ? 2 : 0);
-    glBindVertexArray_(bodyVao);
-    glBindBuffer_(GL_ELEMENT_ARRAY_BUFFER, bodyIdx);
-    glDrawElements(GL_TRIANGLES, bodyCount, GL_UNSIGNED_INT, nullptr);
-    if (lk.wire) {
-        glUseProgram_(progLine);
-        glUniformMatrix4fv_(glGetUniformLocation_(progLine, "mvp"), 1, GL_FALSE, mvp);
-        glUniform3f_(glGetUniformLocation_(progLine, "col"), 0.88f, 0.25f, 0.54f);
-        glPolygonMode(GL_FRONT_AND_BACK, GL_LINE); glEnable(GL_POLYGON_OFFSET_LINE); glPolygonOffset(-1, -1);
-        glDrawElements(GL_TRIANGLES, bodyCount, GL_UNSIGNED_INT, nullptr);
-        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL); glDisable(GL_POLYGON_OFFSET_LINE);
-        glUseProgram_(prog);
-    }
-    if (eyeCount) {
-        glUniform1i_(glGetUniformLocation_(prog, "mode"), 1);
-        glActiveTexture_(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, litEye);
-        glBindVertexArray_(eyeVao);
-        glDrawArrays(GL_TRIANGLES, 0, eyeCount);
-    }
+    glUniform1i_(glGetUniformLocation_(prog, "litC"), 2); glUniform1i_(glGetUniformLocation_(prog, "tex"), 3);
+    const GLint uMode = glGetUniformLocation_(prog, "mode"), uHas = glGetUniformLocation_(prog, "hasTex"), uCut = glGetUniformLocation_(prog, "cutout");
+    auto draw = [&](const Part& pt, bool lines) {
+        if (!pt.count) return;
+        for (int k = 0; k < 3; ++k) { glActiveTexture_(GL_TEXTURE0 + k); glBindTexture(GL_TEXTURE_2D, pt.mode == 1 && k == 0 ? litEye : lit[k]); }
+        glActiveTexture_(GL_TEXTURE0 + 3); glBindTexture(GL_TEXTURE_2D, pt.tex);
+        const bool clay = lk.shading == 1 && pt.mode != 1;
+        glUniform1i_(uMode, clay ? 2 : pt.mode);
+        glUniform1i_(uHas, pt.tex ? 1 : 0);
+        glUniform1i_(uCut, pt.cutout && pt.tex ? 1 : 0);
+        glBindVertexArray_(pt.vao);
+        glDrawArrays(GL_TRIANGLES, 0, pt.count);
+        if (lines) {
+            glUseProgram_(progLine);
+            glUniformMatrix4fv_(glGetUniformLocation_(progLine, "mvp"), 1, GL_FALSE, mvp);
+            glUniform3f_(glGetUniformLocation_(progLine, "col"), 0.88f, 0.25f, 0.54f);
+            glPolygonMode(GL_FRONT_AND_BACK, GL_LINE); glEnable(GL_POLYGON_OFFSET_LINE); glPolygonOffset(-1, -1);
+            glDrawArrays(GL_TRIANGLES, 0, pt.count);
+            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL); glDisable(GL_POLYGON_OFFSET_LINE);
+            glUseProgram_(prog);
+        }
+    };
+    draw(bodyPart, lk.wire);
+    for (const Part& pt : parts) draw(pt, lk.wire && pt.mode != 1 && !pt.cutout);
     glBindVertexArray_(0); glUseProgram_(0);
     glDisable(GL_DEPTH_TEST);
     glBindFramebuffer_(GL_FRAMEBUFFER, 0);

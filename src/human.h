@@ -37,16 +37,22 @@ struct Modifier {
 struct SliderGroup { std::string name; std::vector<int> mods; };
 struct Tab { std::string name; float order = 0; std::vector<SliderGroup> groups; };
 
-struct Proxy {                           // something fitted to the body: the eyes
-    std::string name;
+struct Proxy {                           // something fitted to the body (MakeHuman's .mhclo): eyes, clothes, hair...
+    std::string name, uuid, file, kind;  // kind: eyes, clothes, hair, eyebrows, eyelashes, teeth, tongue, proxymeshes
     std::vector<float> pos, uv;          // own vertices; uv per corner
     std::vector<int> tri;                // corners
     std::vector<int> ref;                // per vertex: 3 body vertices
     std::vector<float> w, off;           // per vertex: 3 weights, 3 offsets
     int scaleRef[3][2] = {{0, 0}, {0, 0}, {0, 0}};
     float scaleDiv[3] = {1, 1, 1};
-    std::string texture;                 // its PNG
+    std::string material, texture;       // its .mhmat and that's diffuse PNG
+    bool transparent = false;            // its texture has see-through parts (hair, eyebrows, lashes)
+    int zDepth = 50;                     // drawing order (MakeHuman's z_depth: lower first)
+    std::vector<int> deleteVerts;        // the body's vertices it covers (hidden under it)
 };
+bool loadProxyFile(const std::string& mhclo, Proxy& p, std::string& err);
+// a material: its diffuse texture (absolute path) and whether it's see-through
+bool loadMaterial(const std::string& mhmat, std::string& texture, bool& transparent);
 
 struct Body {
     // the base mesh
@@ -68,6 +74,10 @@ struct Body {
     float gender = 0.5f, age = 0.5f, muscle = 0.5f, weight = 0.5f, height = 0.5f, proportions = 0.5f;
     float african = 1 / 3.0f, asian = 1 / 3.0f, caucasian = 1 / 3.0f, breastSize = 0.5f, breastFirmness = 0.5f;
     bool symmetry = true;                // a left slider moves the right one too
+    // what it wears (MakeHuman's Geometries and Materials): proxies above, its skin here
+    std::vector<std::string> roots;      // where assets are looked for (data, MakeHuman's asset pack)
+    std::string skinMaterial, skinTexture;   // "" : the litsphere skin by ethnicity
+    bool hideUnderClothes = true;        // clothes hide the body's faces under them
 };
 
 extern const char* VAR_NAMES[];          // the macro value names, in val's order
@@ -81,6 +91,18 @@ void setMacro(Body& b, const std::string& variable, float value);
 void resetAll(Body& b);
 void apply(Body& b);                     // brings pos up to date (only the targets whose weight changed)
 void fitProxy(const Body& b, const Proxy& p, std::vector<float>& out);   // to what's shown (posed if posed)
+
+// the gear: MakeHuman's proxy libraries. kind: clothes (several), the rest one at a time ("proxymeshes": a topology)
+bool wear(Body& b, const std::string& file, std::string& err);      // clothes: on, or off if already worn
+void takeOff(Body& b, const std::string& kindOrFile);                // every proxy of a kind, or that file
+const Proxy* worn(const Body& b, const std::string& kind);           // the first of a kind (null if none)
+bool isWorn(const Body& b, const std::string& file);
+bool setSkin(Body& b, const std::string& mhmat);                    // "" : the default (litspheres)
+bool setProxyMaterial(Body& b, const std::string& kind, const std::string& mhmat);
+void defaultGear(Body& b);                                          // MakeHuman's start: eyes, eyebrow001, eyelashes01
+std::vector<char> hiddenVerts(const Body& b);                        // body vertices under clothes (or all, with a topology)
+std::string relPath(const Body& b, const std::string& abs);         // as MakeHuman writes paths: from the asset root
+std::string absPath(const Body& b, const std::string& rel);
 
 float ageYears(const Body& b);
 float heightCm(const Body& b);

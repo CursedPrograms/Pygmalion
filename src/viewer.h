@@ -15,6 +15,7 @@ struct Look {
     bool transparent = false;                       // renders: no background, no floor
     bool ortho = false;                             // MakeHuman's orthographic view
     bool bones = false;                             // the skeleton over the body
+    bool smooth = false;                            // MakeHuman's Smooth: one Catmull-Clark subdivision
     std::string bgImage;                            // a picture behind the person (Settings > Background)
     float bgOpacity = 1;
 };

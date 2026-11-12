@@ -865,6 +865,7 @@ static void toolbar(float x, float y, float w) {
     if (btn("Floor", "The grid under the feet", lk.grid)) lk.grid = !lk.grid;
     if (btn("Bones", "Show the skeleton", lk.bones)) { lk.bones = !lk.bones; showBones = lk.bones; }
     if (btn("Ortho", "Orthographic view (no perspective)", lk.ortho)) lk.ortho = !lk.ortho;
+    if (btn("Smooth", "Smooth the mesh (subdivided once, as MakeHuman's Smooth)", lk.smooth)) { lk.smooth = !lk.smooth; dirty = true; }
     gap();
     if (btn("R>L", "Copy the right side's shapes to the left")) symmetry(true);
     if (btn("L>R", "Copy the left side's shapes to the right")) symmetry(false);
@@ -1098,6 +1099,7 @@ static void massLeftPanel(float lw) {
     notYet(("They're saved in " + (fs::u8path(homeDir()) / "massproduce").u8string() + ".").c_str());
 }
 
+static bool installPack(const std::string& pack, std::string& err);
 // Scripting: Pygmalion's own commands, a line each (MakeHuman's is Python; this does the same jobs)
 static char script[8192] = "# a line each; # starts a note\nreset\nmacro Gender 0\nmacro Age 0.4\nmodifier nose/nose-scale-horiz-decr|incr 0.3\nwear hair/bob01/bob01.mhclo\nskin skins/young_caucasian_female/young_caucasian_female.mhmat\nexpression smile01\n";
 static std::string scriptLog;
@@ -1140,6 +1142,8 @@ static void runScript(const std::string& text) {
         }
         else if (cmd == "symmetry") body.symmetry = rest != "off";
         else if (cmd == "bones") { showBones = rest != "off"; Viewer::look().bones = showBones; }
+        else if (cmd == "smooth") Viewer::look().smooth = rest != "off";
+        else if (cmd == "download") ok = installPack(rest, err);
         else if (cmd == "animation") {
             if (rest == "none") setAnimation("");
             else { std::string f; for (const auto& c : filesIn("animations", ".bvh")) if (fs::u8path(c).stem().u8string() == rest) f = c; if (f.empty()) { ok = false; err = "no animation " + rest; } else setAnimation(f); }
@@ -1180,7 +1184,7 @@ static void scriptingLeft(float lw) {
 }
 static void scriptingRight() {
     groupBox("Commands");
-    ImGui::TextDisabled("reset | random 0.5 | describe words\nmacro Gender 0..1 (Age, Muscle, Weight,\n  Height, BodyProportions, African, Asian,\n  Caucasian, BreastSize, BreastFirmness)\nmodifier group/name value\nwear clothes/x/x.mhclo | takeoff hair\nskin skins/x/x.mhmat | skin default\nskeleton game_engine | none\npose standing01 | none\nanimation walk1 | none\nexpression smile01 | none\nbones on | off\nsymmetry on | off\nunits meter (decimeter, centimeter...)\nload file.mhm | save file.mhm\nexport file.fbx (.dae .glb .obj ...)\nrender file.png 1920 1080");
+    ImGui::TextDisabled("reset | random 0.5 | describe words\nmacro Gender 0..1 (Age, Muscle, Weight,\n  Height, BodyProportions, African, Asian,\n  Caucasian, BreastSize, BreastFirmness)\nmodifier group/name value\nwear clothes/x/x.mhclo | takeoff hair\nskin skins/x/x.mhmat | skin default\nskeleton game_engine | none\npose standing01 | none\nanimation walk1 | none\nexpression smile01 | none\nbones on | off\nsymmetry on | off\nunits meter (decimeter, centimeter...)\nload file.mhm | save file.mhm\nexport file.fbx (.dae .glb .obj ...)\nrender file.png 1920 1080\nsmooth on | off\ndownload hair01 (an asset pack)");
     if (!scriptLog.empty()) { groupBox("Output"); ImGui::BeginChild("so"); ImGui::TextUnformatted(scriptLog.c_str()); ImGui::EndChild(); }
 }
 
@@ -1193,6 +1197,28 @@ static void loadPacksHave() {
     packsHave.clear();
     std::ifstream in(fs::u8path(userDataDir()) / "packs-installed.txt"); std::string l;
     while (std::getline(in, l)) if (!l.empty()) packsHave.insert(l);
+}
+static bool installPack(const std::string& pack, std::string& err) {
+#ifdef _WIN32
+    const std::string url = std::string(MIRROR) + pack + "/" + pack + "_cc0.zip";
+    const fs::path zip = fs::temp_directory_path() / ("pygmalion-" + pack + ".zip");
+    if (!Http::download(url, zip.u8string(), [](int64_t d, int64_t t) { dlDone = d; dlTotal = t; }, &dlStop, err)) { if (err.empty()) err = "Download stopped"; return false; }
+    // Windows' own tar opens zips
+    std::wstring cmd = L"tar.exe -xf \"" + zip.wstring() + L"\" -C \"" + fs::u8path(userDataDir()).wstring() + L"\"";
+    STARTUPINFOW si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> buf(cmd.begin(), cmd.end()); buf.push_back(0);
+    DWORD code = 1;
+    if (CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, INFINITE); GetExitCodeProcess(pi.hProcess, &code); CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    }
+    std::error_code ec; fs::remove(zip, ec);
+    if (code != 0) { err = "Couldn't unpack " + pack; return false; }
+    std::ofstream o(fs::u8path(userDataDir()) / "packs-installed.txt", std::ios::app); o << pack << "\n";
+    libCache.clear();
+    return true;
+#else
+    err = "Downloads need Windows for now"; (void)pack; return false;
+#endif
 }
 static void startDownload(const std::string& pack, bool listOnly) {
 #ifdef _WIN32
@@ -1208,23 +1234,8 @@ static void startDownload(const std::string& pack, bool listOnly) {
             std::lock_guard<std::mutex> g(dlMtx);
             if (found.empty()) result = "Couldn't reach MakeHuman's mirror"; else { packs = found; result = std::to_string(found.size()) + " packs"; }
         } else {
-            const std::string url = std::string(MIRROR) + pack + "/" + pack + "_cc0.zip";
-            const fs::path zip = fs::temp_directory_path() / ("pygmalion-" + pack + ".zip");
             std::string err;
-            if (!Http::download(url, zip.u8string(), [](int64_t d, int64_t t) { dlDone = d; dlTotal = t; }, &dlStop, err)) result = err.empty() ? "Download stopped" : err;
-            else {
-                // Windows' own tar opens zips
-                std::wstring cmd = L"tar.exe -xf \"" + zip.wstring() + L"\" -C \"" + fs::u8path(userDataDir()).wstring() + L"\"";
-                STARTUPINFOW si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
-                std::vector<wchar_t> buf(cmd.begin(), cmd.end()); buf.push_back(0);
-                DWORD code = 1;
-                if (CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-                    WaitForSingleObject(pi.hProcess, INFINITE); GetExitCodeProcess(pi.hProcess, &code); CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-                }
-                std::error_code ec; fs::remove(zip, ec);
-                if (code == 0) { std::ofstream o(fs::u8path(userDataDir()) / "packs-installed.txt", std::ios::app); o << pack << "\n"; result = "Installed " + pack; }
-                else result = "Couldn't unpack " + pack;
-            }
+            result = installPack(pack, err) ? "Installed " + pack : err;
         }
         std::lock_guard<std::mutex> g(dlMtx);
         dlResult = result; dlFinished = true; dlBusy = false;

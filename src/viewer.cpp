@@ -12,6 +12,9 @@
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <unordered_map>
+#include <array>
+#include <cstdint>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -194,6 +197,85 @@ static void normals(const std::vector<float>& pos, const std::vector<int>& tri, 
     }
 }
 
+// MakeHuman's Smooth (catmull_clark_subdivision.py), on triangles: each becomes three quads (six triangles). The
+// positions are smoothed; the uvs are split linearly per face, so texture seams stay where they are.
+static void subdivide(const std::vector<float>& pos, const std::vector<int>& tri, const std::vector<float>& cuv,
+                      std::vector<float>& opos, std::vector<int>& otri, std::vector<float>& ouv) {
+    const size_t nv = pos.size() / 3, nf = tri.size() / 3;
+    std::unordered_map<uint64_t, int> edgeOf;
+    std::vector<std::array<int, 2>> ev; std::vector<std::array<int, 2>> ef;   // edge's vertices, faces (-1: none)
+    std::vector<std::array<int, 3>> fe(nf);
+    for (size_t f = 0; f < nf; ++f)
+        for (int k = 0; k < 3; ++k) {
+            const int a = tri[f * 3 + k], b = tri[f * 3 + (k + 1) % 3];
+            const uint64_t key = ((uint64_t)std::min(a, b) << 32) | (uint32_t)std::max(a, b);
+            auto it = edgeOf.find(key);
+            if (it == edgeOf.end()) { it = edgeOf.emplace(key, (int)ev.size()).first; ev.push_back({a, b}); ef.push_back({(int)f, -1}); }
+            else ef[it->second][1] = (int)f;
+            fe[f][k] = it->second;
+        }
+    const size_t ne = ev.size();
+    std::vector<float> F(nf * 3), E(ne * 3);
+    for (size_t f = 0; f < nf; ++f) for (int c = 0; c < 3; ++c) F[f * 3 + c] = (pos[(size_t)tri[f * 3] * 3 + c] + pos[(size_t)tri[f * 3 + 1] * 3 + c] + pos[(size_t)tri[f * 3 + 2] * 3 + c]) / 3;
+    std::vector<char> boundary(nv, 0);
+    for (size_t e = 0; e < ne; ++e) {
+        const int a = ev[e][0], b = ev[e][1];
+        for (int c = 0; c < 3; ++c) {
+            const float m = (pos[(size_t)a * 3 + c] + pos[(size_t)b * 3 + c]) / 2;
+            E[e * 3 + c] = ef[e][1] < 0 ? m : (2 * m + F[(size_t)ef[e][0] * 3 + c] + F[(size_t)ef[e][1] * 3 + c]) / 4;
+        }
+        if (ef[e][1] < 0) boundary[a] = boundary[b] = 1;
+    }
+    // the old vertices move: (F + 2R + (n - 3)P) / n inside; on an edge of a hole, 3/4 P + 1/8 of its two edge neighbours
+    std::vector<float> Fs(nv * 3, 0), Rs(nv * 3, 0), Bs(nv * 3, 0);
+    std::vector<int> nF(nv, 0), nR(nv, 0), nB(nv, 0);
+    for (size_t f = 0; f < nf; ++f) for (int k = 0; k < 3; ++k) { const int v = tri[f * 3 + k]; for (int c = 0; c < 3; ++c) Fs[(size_t)v * 3 + c] += F[f * 3 + c]; ++nF[v]; }
+    for (size_t e = 0; e < ne; ++e) {
+        const int a = ev[e][0], b = ev[e][1];
+        for (int c = 0; c < 3; ++c) { const float m = (pos[(size_t)a * 3 + c] + pos[(size_t)b * 3 + c]) / 2; Rs[(size_t)a * 3 + c] += m; Rs[(size_t)b * 3 + c] += m; }
+        ++nR[a]; ++nR[b];
+        if (ef[e][1] < 0) { for (int c = 0; c < 3; ++c) { Bs[(size_t)a * 3 + c] += pos[(size_t)b * 3 + c]; Bs[(size_t)b * 3 + c] += pos[(size_t)a * 3 + c]; } ++nB[a]; ++nB[b]; }
+    }
+    opos.assign((nv + ne + nf) * 3, 0);
+    for (size_t v = 0; v < nv; ++v)
+        for (int c = 0; c < 3; ++c) {
+            const float P = pos[v * 3 + c];
+            if (!nF[v]) opos[v * 3 + c] = P;
+            else if (boundary[v] && nB[v] == 2) opos[v * 3 + c] = 0.75f * P + 0.125f * Bs[v * 3 + c];
+            else if (boundary[v]) opos[v * 3 + c] = P;
+            else { const float n = (float)nF[v]; opos[v * 3 + c] = (Fs[v * 3 + c] / n + 2 * Rs[v * 3 + c] / nR[v] + (n - 3) * P) / n; }
+        }
+    std::copy(E.begin(), E.end(), opos.begin() + nv * 3);
+    std::copy(F.begin(), F.end(), opos.begin() + (nv + ne) * 3);
+    otri.clear(); ouv.clear(); otri.reserve(nf * 18); ouv.reserve(nf * 36);
+    for (size_t f = 0; f < nf; ++f) {
+        const float* u = &cuv[f * 6];
+        const float fu[2] = {(u[0] + u[2] + u[4]) / 3, (u[1] + u[3] + u[5]) / 3};
+        for (int k = 0; k < 3; ++k) {
+            const int kp = (k + 2) % 3;   // the corner before
+            const int v = tri[f * 3 + k], eN = (int)nv + fe[f][k], eP = (int)nv + fe[f][kp], fc = (int)(nv + ne + f);
+            const float uv[2] = {u[k * 2], u[k * 2 + 1]};
+            const float un[2] = {(u[k * 2] + u[((k + 1) % 3) * 2]) / 2, (u[k * 2 + 1] + u[((k + 1) % 3) * 2 + 1]) / 2};
+            const float up[2] = {(u[k * 2] + u[kp * 2]) / 2, (u[k * 2 + 1] + u[kp * 2 + 1]) / 2};
+            // the quad v, eN, fc, eP as two triangles
+            otri.insert(otri.end(), {v, eN, fc, v, fc, eP});
+            ouv.insert(ouv.end(), {uv[0], uv[1], un[0], un[1], fu[0], fu[1], uv[0], uv[1], fu[0], fu[1], up[0], up[1]});
+        }
+    }
+}
+
+static void normals(const std::vector<float>& pos, const std::vector<int>& tri, std::vector<float>& n);
+// a mesh corner by corner (smoothed first with Smooth on)
+static void unroll(const std::vector<float>& pos, const std::vector<int>& tri, const std::vector<float>& cuv, std::vector<float>& P, std::vector<float>& N, std::vector<float>& U) {
+    std::vector<float> sp; std::vector<int> st; std::vector<float> su;
+    const std::vector<float>* p = &pos; const std::vector<int>* t = &tri; const std::vector<float>* u = &cuv;
+    if (lk.smooth) { subdivide(pos, tri, cuv, sp, st, su); p = &sp; t = &st; u = &su; }
+    std::vector<float> n; normals(*p, *t, n);
+    P.clear(); N.clear(); P.reserve(t->size() * 3); N.reserve(t->size() * 3);
+    for (int v : *t) { P.insert(P.end(), &(*p)[(size_t)v * 3], &(*p)[(size_t)v * 3] + 3); N.insert(N.end(), &n[(size_t)v * 3], &n[(size_t)v * 3] + 3); }
+    U = *u;
+}
+
 static void fill(Part& pt, const std::vector<float>& P, const std::vector<float>& N, const std::vector<float>& U) {
     if (!pt.vao) { glGenVertexArrays_(1, &pt.vao); glGenBuffers_(1, &pt.pos); glGenBuffers_(1, &pt.nrm); glGenBuffers_(1, &pt.uv); }
     upload(pt.vao, pt.pos, 0, 3, P); upload(pt.vao, pt.nrm, 1, 3, N); upload(pt.vao, pt.uv, 2, 2, U);
@@ -205,18 +287,18 @@ void update(const Human::Body& b) {
     const std::vector<float>& pos = b.shown.empty() ? b.pos : b.shown;
     // the body: its visible triangles, less those under clothes (all of them under a topology)
     {
-        std::vector<float> n; normals(pos, b.tri, n);
         const std::vector<char> hid = Human::hiddenVerts(b);
-        std::vector<float> P, N, U;
-        P.reserve(b.tri.size() * 3); N.reserve(b.tri.size() * 3); U.reserve(b.tri.size() * 2);
+        std::vector<int> vt; std::vector<float> cuv;
+        vt.reserve(b.tri.size()); cuv.reserve(b.tri.size() * 2);
         for (size_t t = 0; t + 2 < b.tri.size(); t += 3) {
             if (hid[b.tri[t]] || hid[b.tri[t + 1]] || hid[b.tri[t + 2]]) continue;
             for (size_t c = t; c < t + 3; ++c) {
-                const size_t v = (size_t)b.tri[c]; const int u = b.triUv[c];
-                P.insert(P.end(), &pos[v * 3], &pos[v * 3] + 3); N.insert(N.end(), &n[v * 3], &n[v * 3] + 3);
-                if (u >= 0 && (size_t)u * 2 + 1 < b.uv.size()) U.insert(U.end(), {b.uv[(size_t)u * 2], b.uv[(size_t)u * 2 + 1]}); else U.insert(U.end(), {0, 0});
+                vt.push_back(b.tri[c]); const int u = b.triUv[c];
+                if (u >= 0 && (size_t)u * 2 + 1 < b.uv.size()) cuv.insert(cuv.end(), {b.uv[(size_t)u * 2], b.uv[(size_t)u * 2 + 1]}); else cuv.insert(cuv.end(), {0, 0});
             }
         }
+        std::vector<float> P, N, U;
+        unroll(pos, vt, cuv, P, N, U);
         fill(bodyPart, P, N, U);
         bodyPart.tex = texture(b.skinTexture);
         bodyPart.mode = bodyPart.tex ? 4 : 0;
@@ -229,11 +311,9 @@ void update(const Human::Body& b) {
         if (i >= b.proxies.size()) { pt.count = 0; continue; }
         const Human::Proxy& p = b.proxies[i];
         std::vector<float> fit; Human::fitProxy(b, p, fit);
-        std::vector<float> pn; normals(fit, p.tri, pn);
-        std::vector<float> P, N;
-        P.reserve(p.tri.size() * 3); N.reserve(p.tri.size() * 3);
-        for (int v : p.tri) { P.insert(P.end(), &fit[(size_t)v * 3], &fit[(size_t)v * 3] + 3); N.insert(N.end(), &pn[(size_t)v * 3], &pn[(size_t)v * 3] + 3); }
-        fill(pt, P, N, p.uv);
+        std::vector<float> P, N, U;
+        unroll(fit, p.tri, p.uv, P, N, U);
+        fill(pt, P, N, U);
         const bool topology = p.kind == "proxymeshes";
         pt.tex = texture(topology ? b.skinTexture : p.texture);
         pt.mode = p.kind == "eyes" ? 1 : topology ? (pt.tex ? 4 : 0) : 3;

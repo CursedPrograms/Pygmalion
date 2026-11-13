@@ -1610,7 +1610,9 @@ static void renderingLeft(const std::string& t, float lw) {
         groupBox("Viewer");
         if (rendered.empty()) { notYet("Nothing rendered yet: Rendering > Render makes a picture, shown here."); return; }
         ImGui::Text("%d x %d", renderedW, renderedH);
-        if (ImGui::Button("Save as...", ImVec2(lw, 0))) {
+        groupBox("Tools");
+        if (ImGui::Button("Refresh", ImVec2(lw, 0))) { if (!renderNow(renderedW, renderedH)) say("That size is too big for this graphics card"); }   // the same picture made again, as the person is now
+        if (ImGui::Button("Save As...", ImVec2(lw, 0))) {
             const std::string p = fileDialog(true, L"PNG\0*.png\0\0", L"png", homeDir() + "\\render.png");
             if (!p.empty()) say(saveRendered(p) ? "Saved " + p : "Couldn't save " + p);
         }

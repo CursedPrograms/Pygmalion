@@ -357,6 +357,12 @@ static std::string lastExport;                                           // Quic
 static std::set<std::string> excludedTasks, excludedAtStart;
 static std::vector<std::string> activeUserPlugins;
 static std::set<std::string>& startExclusions() { return excludedAtStart; }
+// the Demiurge link (Files > Export): see linkPanel
+static std::string linkProject;                 // the project's folder (with project.godot); "" when not linked
+static char linkName[64] = "character";
+static bool linkLive = true;
+static int linkFormat = 0;                      // 0 FBX (with the skeleton), 1 glTF binary (no skeleton)
+static void linkPanel(float w);
 static std::string settingsFile() { return (fs::u8path(homeDir()) / "settings.ini").u8string(); }
 static void saveSettings() {
     std::ofstream o(fs::u8path(settingsFile()));
@@ -366,6 +372,7 @@ static void saveSettings() {
       << "\nrealtime=" << prefs.realtime << "\nmetric=" << prefs.metric
       << "\nturnSpeed=" << lk.turnSpeed << "\nmoveSpeed=" << lk.moveSpeed << "\nzoomSpeed=" << lk.zoomSpeed
       << "\ninvertTurn=" << lk.invertTurn << "\ninvertZoom=" << lk.invertZoom
+      << "\ndemiurgeProject=" << linkProject << "\ndemiurgeName=" << linkName << "\ndemiurgeFormat=" << linkFormat << "\ndemiurgeLive=" << linkLive
       << "\nmhShaders=" << lk.mhShaders << "\nbgImage=" << lk.bgImage << "\nbgOpacity=" << lk.bgOpacity << "\n";
     o << "realtimeNormals=" << lk.normalsWhileDragging << "\nrealtimeFitting=" << lk.fitWhileDragging << "\nrealWeight=" << prefs.realWeight
       << "\ntagMode=" << prefs.tagMode << "\ntagCount=" << prefs.tagCount << "\nnameTags=" << prefs.nameTags << "\npreload=" << prefs.preload
@@ -388,6 +395,8 @@ static void loadSettings() {
         else if (k == "turnSpeed") lk.turnSpeed = std::clamp(f, 0.1f, 5.0f); else if (k == "moveSpeed") lk.moveSpeed = std::clamp(f, 0.1f, 5.0f);
         else if (k == "zoomSpeed") lk.zoomSpeed = std::clamp(f, 0.1f, 5.0f);
         else if (k == "invertTurn") lk.invertTurn = b; else if (k == "invertZoom") lk.invertZoom = b;
+        else if (k == "demiurgeProject") linkProject = v; else if (k == "demiurgeName" && !v.empty()) snprintf(linkName, sizeof linkName, "%s", v.c_str());
+        else if (k == "demiurgeFormat") linkFormat = std::clamp(atoi(v.c_str()), 0, 1); else if (k == "demiurgeLive") linkLive = b;
         else if (k == "bgImage") { std::error_code ec; if (!v.empty() && fs::exists(fs::u8path(v), ec)) lk.bgImage = v; }
         else if (k == "bgOpacity") lk.bgOpacity = std::clamp(f, 0.0f, 1.0f);
         else if (k == "mhShaders") lk.mhShaders = b;
@@ -1233,7 +1242,108 @@ static void filesLeft(float w) {
         else if (exportFormat == EX_UV) ImGui::TextDisabled(T("The body's UV layout as a 2048 x 2048 picture, for painting skins."));
         else if (exportFormat == EX_LIGHT) ImGui::TextDisabled(T("MakeHuman's lightmap: one light, from the front left and above, baked into the body's UV layout (1024 x 1024)."));
         ImGui::PopTextWrapPos();
+        linkPanel(w);
     }
+}
+// ---------- the Demiurge link: this person kept up to date in a Demiurge (or Godot) project ----------
+// Every change (once a slider is let go) is sent to <project>/characters/<name>/: FBX with the chosen skeleton (or
+// GLB without one), then <name>.pygmalion is touched. The Pygmalion Link add-on, put in the project here, sees the
+// stamp change and imports the files again, so the scenes using the person update while both programs are open.
+static uint64_t linkSent = 0, linkSeen = 0;     // what was sent last, and what the person looked like last check
+static double linkChangedAt = -1, linkCheckedAt = 0;
+static std::string linkStatus;
+
+static uint64_t personPrint() {   // what the person looks like now, as one number (shape, pose, clothes, skin...)
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](const void* d, size_t n) { const unsigned char* c = (const unsigned char*)d; for (size_t i = 0; i < n; ++i) { h ^= c[i]; h *= 1099511628211ull; } };
+    const std::vector<float>& v = body.shown.empty() ? body.pos : body.shown;
+    for (size_t i = 0; i < v.size(); i += 7) mix(&v[i], sizeof(float));
+    for (const auto& px : body.proxies) mix(px.file.data(), px.file.size());
+    mix(body.skinMaterial.data(), body.skinMaterial.size()); mix(body.skinTexture.data(), body.skinTexture.size()); mix(body.skinTint, sizeof body.skinTint);
+    mix(chosen.name.data(), chosen.name.size()); mix(linkName, strlen(linkName)); mix(&linkFormat, sizeof linkFormat); mix(&exportUnits, sizeof exportUnits);
+    return h;
+}
+
+static bool installLinkAddon(const std::string& project, std::string& err) {
+    std::error_code ec;
+    const fs::path dst = fs::u8path(project) / "addons" / "pygmalion_link";
+    fs::create_directories(dst, ec);
+    for (const char* f : {"plugin.cfg", "plugin.gd"})
+        if (!fs::copy_file(fs::u8path(dataDir) / "demiurge" / f, dst / f, fs::copy_options::overwrite_existing, ec)) { err = "Couldn't put the Pygmalion Link add-on in the project"; return false; }
+    // switched on in project.godot (read when the project opens)
+    const fs::path pg = fs::u8path(project) / "project.godot";
+    std::ifstream in(pg, std::ios::binary); std::stringstream ss; ss << in.rdbuf(); in.close();
+    std::string t = ss.str();
+    const std::string me = "\"res://addons/pygmalion_link/plugin.cfg\"";
+    if (t.find(me) != std::string::npos) return true;
+    const size_t sec = t.find("[editor_plugins]");
+    if (sec == std::string::npos) t += "\n[editor_plugins]\n\nenabled=PackedStringArray(" + me + ")\n";
+    else {
+        const size_t en = t.find("enabled=PackedStringArray(", sec);
+        if (en == std::string::npos) t.insert(t.find('\n', sec) + 1, "\nenabled=PackedStringArray(" + me + ")\n");
+        else { const size_t close = t.find(')', en); const bool empty = t[close - 1] == '('; t.insert(close, (empty ? "" : ", ") + me); }
+    }
+    std::ofstream out(pg, std::ios::binary); out << t;
+    return (bool)out;
+}
+
+static void sendToDemiurge() {
+    if (linkProject.empty()) return;
+    std::string name = linkName;
+    for (auto& c : name) if (strchr("<>:\"/\\|?* ", c)) c = '_';
+    if (name.empty()) name = "character";
+    std::error_code ec;
+    const fs::path dir = fs::u8path(linkProject) / "characters" / fs::u8path(name);
+    fs::create_directories(dir, ec);
+    const int fmt = linkFormat == 0 ? EX_FBX : EX_GLB;
+    std::string err;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!exportTo((dir / fs::u8path(name + (fmt == EX_FBX ? ".fbx" : ".glb"))).u8string(), fmt, err)) { linkStatus = err; say(err); return; }
+    std::ofstream((dir / fs::u8path(name + ".pygmalion")).string()) << "sent " << time(nullptr) << "\n";   // the add-on's cue
+    linkSent = personPrint();
+    char b[160]; snprintf(b, sizeof b, "Sent to Demiurge (%.1f s)", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    linkStatus = b;
+}
+
+// every frame: when the person changed and nothing is being dragged, send it (after a moment's quiet)
+static void linkTick() {
+    if (linkProject.empty() || !linkLive) return;
+    const double now = ImGui::GetTime();
+    if (now - linkCheckedAt < 0.25) return;
+    linkCheckedAt = now;
+    const uint64_t p = personPrint();
+    if (p != linkSeen) { linkSeen = p; linkChangedAt = now; }
+    if (p != linkSent && linkChangedAt >= 0 && now - linkChangedAt > 0.6 && !ImGui::IsAnyItemActive() && !ImGui::IsMouseDown(0)) sendToDemiurge();
+}
+
+static void linkPanel(float w) {
+    groupBox(T("Demiurge link"));
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + w);
+    if (linkProject.empty()) {
+        ImGui::TextDisabled("%s", T("Keep this person up to date in a Demiurge (or Godot) project: every change is sent as you make it, and the project picks it up at once."));
+        if (ImGui::Button(T("Link a Demiurge project..."), ImVec2(w, 0))) {
+            const std::string d = folderDialog();
+            std::error_code ec;
+            if (d.empty()) {}
+            else if (!fs::exists(fs::u8path(d) / "project.godot", ec)) say(T("That folder isn't a Demiurge project (no project.godot in it)"));
+            else {
+                std::string err;
+                if (!installLinkAddon(d, err)) say(err);
+                else { linkProject = d; linkSent = 0; saveSettings(); sendToDemiurge(); say(T("Linked: the person is in res://characters. Restart Demiurge once if the project is open, to switch the link on.")); }
+            }
+        }
+    } else {
+        ImGui::TextDisabled("%s", fs::u8path(linkProject).filename().u8string().c_str());
+        ImGui::SetNextItemWidth(w); if (ImGui::InputTextWithHint("##lname", T("name"), linkName, sizeof linkName)) saveSettings();
+        ImGui::RadioButton(T("FBX, with the skeleton"), &linkFormat, 0);
+        ImGui::RadioButton(T("glTF (glb), no skeleton"), &linkFormat, 1);
+        if (linkFormat == 0 && chosen.empty()) ImGui::TextDisabled("%s", T("No skeleton chosen (Pose/Animate > Skeleton): it goes without one."));
+        ImGui::Checkbox(T("Send every change"), &linkLive);
+        if (ImGui::Button(T("Send now"), ImVec2(w, 0))) sendToDemiurge();
+        if (ImGui::Button(T("Unlink"), ImVec2(w, 0))) { linkProject.clear(); saveSettings(); linkStatus.clear(); }
+        if (!linkStatus.empty()) ImGui::TextDisabled("%s", linkStatus.c_str());
+    }
+    ImGui::PopTextWrapPos();
 }
 static void filesRight() {
     if (task[CAT_FILES] != "Export") return;
@@ -2310,6 +2420,13 @@ static bool runCommand(const std::string& line0, std::string& err, const std::fu
     }
     else if (cmd == "random") { std::random_device rd; Human::randomize(body, rest.empty() ? 0.5f : (float)atof(rest.c_str()), true, true, true, rd()); }
     else if (cmd == "describe") Human::describe(body, rest);
+    else if (cmd == "link") {   // link <Demiurge project folder> [name]: as the Demiurge link's button, then sends
+        std::istringstream ls(rest); std::string d, n; ls >> d >> n;
+        if (!n.empty()) snprintf(linkName, sizeof linkName, "%s", n.c_str());
+        if (!fs::exists(fs::u8path(d) / "project.godot")) { ok = false; err = "link: no project.godot in " + d; }
+        else if (!installLinkAddon(d, err)) ok = false;
+        else { linkProject = d; sendToDemiurge(); }
+    }
     else if (cmd == "info") {   // the size of everything (for checking scripts)
         Human::apply(body); if (!rig.empty()) Skel::build(rig, body.pos); if (!chosen.empty()) Skel::build(chosen, body.pos); repose();
         auto box = [&](const char* what, const std::vector<float>& v, const std::vector<int>* idx) {
@@ -3355,7 +3472,9 @@ static void helpLeft(float lw) {
     }
 }
 
+static void linkTick();
 static void frame() {
+    linkTick();
     ImGuiIO& io = ImGui::GetIO();
     animate(io.DeltaTime);
     massStep();

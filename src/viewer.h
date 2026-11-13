@@ -18,9 +18,17 @@ struct Look {
     bool smooth = false;                            // MakeHuman's Smooth: one Catmull-Clark subdivision
     std::string bgImage;                            // a picture behind the person (Settings > Background)
     float bgOpacity = 1;
-    // MakeHuman's scene (Rendering > Scene): ambient light, shine and up to 4 lights. They light clothes, hair,
-    // skin textures and clay; the default skin is MakeHuman's litsphere, which (as in MakeHuman) has its light painted in.
-    struct Light { bool on = true; float yaw = 0, pitch = 0, col[3] = {1, 1, 1}, strength = 1; bool withView = true; };
+    // MakeHuman's scene (Rendering > Scene): ambient light, shine and up to 8 lights (MakeHuman's limit). They light
+    // clothes, hair, skin textures and clay; the default skin is MakeHuman's litsphere, which (as in MakeHuman) has its
+    // light painted in. A light's direction is yaw/pitch; MakeHuman's own numbers (a point light at a position, looking
+    // at a focus, in the view's axes) are kept beside it so its scene files go back out as they came in.
+    struct Light {
+        bool on = true; float yaw = 0, pitch = 0, col[3] = {1, 1, 1}, strength = 1; bool withView = true;
+        float spec[3] = {1, 1, 1};                                   // its highlight's colour
+        float pos[3] = {-10.99f, 20, 20}, focus[3] = {0, 0, 0};      // MakeHuman's position and focus
+        float fov = 180, attenuation = 0, areaLightSize = 4; int areaLights = 1;   // its spot angle, falloff, softness
+    };
+    std::string skybox;                             // MakeHuman's environment skybox (kept, as MakeHuman doesn't draw it either)
     float ambient[3] = {0.38f, 0.38f, 0.38f};
     float shine = 0.04f, shininess = 24;
     std::vector<Light> lights = {Light{true, 0, 0, {1, 1, 1}, 0.72f, true}};

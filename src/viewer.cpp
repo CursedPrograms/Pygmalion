@@ -135,13 +135,13 @@ void main() { N = mat3(view) * n; T = t; gl_Position = mvp * vec4(p, 1); })",
                 R"(#version 330
 in vec3 N; in vec2 T; out vec4 o;
 uniform sampler2D litA, litB, litC, tex; uniform vec3 eth; uniform int mode, hasTex, cutout; uniform float light; uniform vec3 lcol, tint;
-uniform int nl, sceneSkin; uniform vec3 ldir[4], lrgb[4], amb; uniform float shine, shininess;
+uniform int nl, sceneSkin; uniform vec3 ldir[8], lrgb[8], lspec[8], amb; uniform float shine, shininess;
 vec3 lit(vec3 n, vec3 c) {                               // the scene's lights on a colour (view space: the eye looks down -z)
   vec3 d = amb, sp = vec3(0);
   for (int i = 0; i < nl; ++i) {
     float k = max(dot(n, ldir[i]), 0.0);
     d += lrgb[i] * k;
-    sp += lrgb[i] * pow(max(dot(n, normalize(ldir[i] + vec3(0, 0, 1))), 0.0), shininess) * step(0.0001, k);
+    sp += lspec[i] * pow(max(dot(n, normalize(ldir[i] + vec3(0, 0, 1))), 0.0), shininess) * step(0.0001, k);
   }
   return c * d + sp * shine;
 }
@@ -450,19 +450,20 @@ unsigned render(int w, int h, bool hovered) {
     glUniform1f_(glGetUniformLocation_(prog, "light"), lk.light);
     glUniform3f_(glGetUniformLocation_(prog, "lcol"), lk.lightCol[0], lk.lightCol[1], lk.lightCol[2]);
     {   // the scene's lights, turned into view space (those that turn with the view are there already)
-        float dirs[12] = {0}, cols[12] = {0}; int nl = 0;
+        float dirs[24] = {0}, cols[24] = {0}, specs[24] = {0}; int nl = 0;
         for (const auto& L : lk.lights) {
-            if (!L.on || nl == 4) continue;
+            if (!L.on || nl == 8) continue;
             const float cp2 = std::cos(L.pitch), d[3] = {cp2 * std::sin(L.yaw), std::sin(L.pitch), cp2 * std::cos(L.yaw)};
             float v[3];
             if (L.withView) { v[0] = d[0]; v[1] = d[1]; v[2] = d[2]; }
             else { v[0] = s[0] * d[0] + s[1] * d[1] + s[2] * d[2]; v[1] = u[0] * d[0] + u[1] * d[1] + u[2] * d[2]; v[2] = -(f[0] * d[0] + f[1] * d[1] + f[2] * d[2]); }
-            for (int c = 0; c < 3; ++c) { dirs[nl * 3 + c] = v[c]; cols[nl * 3 + c] = L.col[c] * L.strength; }
+            for (int c = 0; c < 3; ++c) { dirs[nl * 3 + c] = v[c]; cols[nl * 3 + c] = L.col[c] * L.strength; specs[nl * 3 + c] = L.spec[c] * L.strength; }
             ++nl;
         }
         glUniform1i_(glGetUniformLocation_(prog, "nl"), nl);
-        glUniform3fv_(glGetUniformLocation_(prog, "ldir"), 4, dirs);
-        glUniform3fv_(glGetUniformLocation_(prog, "lrgb"), 4, cols);
+        glUniform3fv_(glGetUniformLocation_(prog, "ldir"), 8, dirs);
+        glUniform3fv_(glGetUniformLocation_(prog, "lrgb"), 8, cols);
+        glUniform3fv_(glGetUniformLocation_(prog, "lspec"), 8, specs);
         glUniform3f_(glGetUniformLocation_(prog, "amb"), lk.ambient[0], lk.ambient[1], lk.ambient[2]);
         glUniform1f_(glGetUniformLocation_(prog, "shine"), lk.shine);
         glUniform1f_(glGetUniformLocation_(prog, "shininess"), lk.shininess);

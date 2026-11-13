@@ -11,6 +11,7 @@
 #include "splash.h"
 #include "viewer.h"
 #include "export.h"
+#include "mhscene.h"
 #ifdef _WIN32
 #include "http.h"
 #include "socket.h"
@@ -657,7 +658,7 @@ static std::vector<std::string> tasksOf(int c) {
     case CAT_POSE: return {"Skeleton", "Pose", "Expression", "Animations"};
     case CAT_RENDERING: return {"Render", "Scene", "Viewer"};
     case CAT_SETTINGS: return {"Sliders", "General", "Background", "Mouse", "Shortcuts"};
-    case CAT_UTILITIES: return {"Describe", "Symmetry", "Statistics", "Material Editor", "Expression mixer", "Targets", "Save targets", "Mass produce", "Shell", "Scripting", "Download", "Socket", "Data", "Logs"};
+    case CAT_UTILITIES: return {"Describe", "Symmetry", "Statistics", "Material Editor", "Scene Editor", "Expression mixer", "Targets", "Save targets", "Mass produce", "Shell", "Scripting", "Download", "Socket", "Data", "Logs"};
     default: return {"About", "Licence"};
     }
 }
@@ -1016,9 +1017,65 @@ static void rgbSliders(const char* id, float* c, float maxV, float lw) {   // a 
     ImGui::PopID();
 }
 static const char* SCENE_PRESETS[] = {"MakeHuman", "Studio", "Soft", "Dramatic", "Sunset"};
+// MakeHuman's lights are point lights at a position, looking at a focus, in the view's axes: the direction is the one
+// from the focus to the light. Turning a light (yaw/pitch) moves its position round the focus at the same distance.
+static void lightFromMh(Viewer::Look::Light& L) {
+    float d[3] = {L.pos[0] - L.focus[0], L.pos[1] - L.focus[1], L.pos[2] - L.focus[2]};
+    const float len = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    if (len < 1e-6f) return;
+    for (float& c : d) c /= len;
+    L.yaw = std::atan2(d[0], d[2]); L.pitch = std::asin(std::clamp(d[1], -1.0f, 1.0f));
+}
+static void lightToMh(Viewer::Look::Light& L) {
+    float len = std::sqrt((L.pos[0] - L.focus[0]) * (L.pos[0] - L.focus[0]) + (L.pos[1] - L.focus[1]) * (L.pos[1] - L.focus[1]) + (L.pos[2] - L.focus[2]) * (L.pos[2] - L.focus[2]));
+    if (len < 1e-3f) len = 31.0f;
+    const float cp = std::cos(L.pitch);
+    L.pos[0] = L.focus[0] + len * cp * std::sin(L.yaw); L.pos[1] = L.focus[1] + len * std::sin(L.pitch); L.pos[2] = L.focus[2] + len * cp * std::cos(L.yaw);
+}
+static std::string sceneFile;          // the scene file in use ("" : a new scene), as MakeHuman's scene.file
+static bool sceneModified = false;
+static MhScene::Scene sceneRead;       // the numbers as read (unchanged ones are written back exactly)
+static void fromMhScene(const MhScene::Scene& s) {
+    sceneRead = s;
+    Viewer::Look& lk = Viewer::look();
+    for (int c = 0; c < 3; ++c) lk.ambient[c] = (float)s.ambience[c];
+    lk.skybox = s.skybox;
+    lk.lights.clear();
+    for (const auto& m : s.lights) {
+        if (lk.lights.size() == 8) break;
+        Viewer::Look::Light L; L.on = true; L.withView = true; L.strength = 1;
+        for (int c = 0; c < 3; ++c) { L.col[c] = (float)m.color[c]; L.spec[c] = (float)m.specular[c]; L.pos[c] = (float)m.position[c]; L.focus[c] = (float)m.focus[c]; }
+        L.fov = (float)m.fov; L.attenuation = (float)m.attenuation; L.areaLights = m.areaLights; L.areaLightSize = (float)m.areaLightSize;
+        lightFromMh(L);
+        lk.lights.push_back(L);
+    }
+}
+static MhScene::Scene toMhScene() {
+    const Viewer::Look& lk = Viewer::look();
+    MhScene::Scene s;
+    using MhScene::keep;
+    for (int c = 0; c < 3; ++c) s.ambience[c] = keep(lk.ambient[c], sceneRead.ambience[c]);
+    s.skybox = lk.skybox;
+    s.lights.clear();
+    for (auto L : lk.lights) {
+        if (!L.on) continue;
+        const MhScene::Light was = s.lights.size() < sceneRead.lights.size() ? sceneRead.lights[s.lights.size()] : MhScene::Light();
+        MhScene::Light m;
+        for (int c = 0; c < 3; ++c) {
+            m.color[c] = keep(L.col[c] * L.strength, was.color[c]); m.specular[c] = keep(L.spec[c], was.specular[c]);
+            m.position[c] = keep(L.pos[c], was.position[c]); m.focus[c] = keep(L.focus[c], was.focus[c]);
+        }
+        m.fov = keep(L.fov, was.fov); m.attenuation = keep(L.attenuation, was.attenuation); m.areaLights = L.areaLights; m.areaLightSize = keep(L.areaLightSize, was.areaLightSize);
+        s.lights.push_back(m);
+    }
+    return s;
+}
+static bool isMhScene(const std::string& p) { std::string e = fs::u8path(p).extension().u8string(); for (char& c : e) c = (char)tolower((unsigned char)c); return e == ".mhscene"; }
 static bool saveScene(const std::string& path) {
+    if (isMhScene(path)) { std::string err; if (!MhScene::save(toMhScene(), path, err)) return false; sceneFile = path; sceneModified = false; return true; }
     const Viewer::Look& lk = Viewer::look();
     std::ofstream o(fs::u8path(path));
+    o.precision(9);   // enough to come back as the same float
     if (!o) return false;
     o << "{\n  \"ambient\": [" << lk.ambient[0] << ", " << lk.ambient[1] << ", " << lk.ambient[2] << "],\n  \"shine\": " << lk.shine
       << ",\n  \"shininess\": " << lk.shininess << ",\n  \"brightness\": " << lk.light << ",\n  \"skinLit\": " << (lk.sceneSkin ? "true" : "false")
@@ -1027,12 +1084,19 @@ static bool saveScene(const std::string& path) {
         const auto& L = lk.lights[i];
         o << (i ? ",\n" : "\n") << "    {\"on\": " << (L.on ? "true" : "false") << ", \"turn\": " << L.yaw / DEG << ", \"height\": " << L.pitch / DEG
           << ", \"colour\": [" << L.col[0] << ", " << L.col[1] << ", " << L.col[2] << "], \"strength\": " << L.strength
-          << ", \"withView\": " << (L.withView ? "true" : "false") << "}";
+          << ", \"withView\": " << (L.withView ? "true" : "false")
+          << ", \"specular\": [" << L.spec[0] << ", " << L.spec[1] << ", " << L.spec[2] << "], \"position\": [" << L.pos[0] << ", " << L.pos[1] << ", " << L.pos[2]
+          << "], \"focus\": [" << L.focus[0] << ", " << L.focus[1] << ", " << L.focus[2] << "], \"fov\": " << L.fov << ", \"attenuation\": " << L.attenuation
+          << ", \"areaLights\": " << L.areaLights << ", \"areaLightSize\": " << L.areaLightSize << "}";
     }
-    o << "\n  ]\n}\n";
+    o << "\n  ]";
+    if (!lk.skybox.empty()) o << ",\n  \"skybox\": \"" << lk.skybox << "\"";
+    o << "\n}\n";
+    if (o) { sceneFile = path; sceneModified = false; }
     return (bool)o;
 }
 static bool loadScene(const std::string& path, std::string& err) {
+    if (isMhScene(path)) { MhScene::Scene s; if (!MhScene::load(path, s, err)) return false; fromMhScene(s); sceneFile = path; sceneModified = false; return true; }
     std::ifstream in(fs::u8path(path)); if (!in) { err = "Couldn't open " + path; return false; }
     std::ostringstream ss; ss << in.rdbuf(); const std::string t = ss.str();
     Json::Value v; size_t i = 0;
@@ -1043,17 +1107,93 @@ static bool loadScene(const std::string& path, std::string& err) {
     three(v.get("ambient"), lk.ambient); three(v.get("background"), lk.bg);
     lk.shine = (float)v.num("shine", lk.shine); lk.shininess = (float)v.num("shininess", lk.shininess); lk.light = (float)v.num("brightness", lk.light);
     lk.sceneSkin = flag(v.get("skinLit"), false);
+    lk.skybox = v.str("skybox");
+    sceneFile = path; sceneModified = false;
     if (const Json::Value* ls = v.get("lights")) {
         lk.lights.clear();
         for (const auto& l : ls->a) {
-            if (lk.lights.size() == 4) break;
+            if (lk.lights.size() == 8) break;
             Viewer::Look::Light L;
             L.on = flag(l.get("on"), true); L.yaw = (float)l.num("turn") * DEG; L.pitch = (float)l.num("height") * DEG;
             three(l.get("colour"), L.col); L.strength = (float)l.num("strength", 1); L.withView = flag(l.get("withView"), false);
+            three(l.get("specular"), L.spec); three(l.get("position"), L.pos); three(l.get("focus"), L.focus);
+            L.fov = (float)l.num("fov", 180); L.attenuation = (float)l.num("attenuation", 0); L.areaLights = (int)l.num("areaLights", 1); L.areaLightSize = (float)l.num("areaLightSize", 4);
+            if (!l.get("position")) lightToMh(L);
             lk.lights.push_back(L);
         }
     }
     return true;
+}
+
+// Utilities > Scene Editor: MakeHuman's (plugins/7_scene_editor.py): the scene file, its items (the environment and
+// each light) and the chosen item's properties - every number a slider
+static int sceneItem = 0;              // 0 the environment, 1.. a light, -1 "Add scene item"
+static void sceneEditorLeft(float lw) {
+    Viewer::Look& lk = Viewer::look();
+    groupBox("Scene");
+    ImGui::TextUnformatted((sceneFile.empty() ? std::string("<New scene>") : fs::u8path(sceneFile).filename().u8string() + (sceneModified ? "*" : "")).c_str());
+    const float hw = lw / 2 - 4;
+    auto saveAs = [&] {
+        const std::string p = fileDialog(true, L"MakeHuman scene\0*.mhscene\0Pygmalion scene (keeps every setting)\0*.pygscene\0\0", L"mhscene",
+                                         (fs::u8path(userDataDir()) / "scenes" / "scene.mhscene").u8string());
+        if (!p.empty()) { std::error_code ec; fs::create_directories(fs::u8path(p).parent_path(), ec); say(saveScene(p) ? "Saved " + p : "Couldn't save " + p); }
+    };
+    if (ImGui::Button("Save", ImVec2(hw, 0))) { if (sceneFile.empty()) saveAs(); else say(saveScene(sceneFile) ? "Saved " + sceneFile : "Couldn't save " + sceneFile); }
+    ImGui::SameLine();
+    if (ImGui::Button("Load ...", ImVec2(hw, 0))) {
+        const std::string p = fileDialog(false, L"MakeHuman scene\0*.mhscene\0Pygmalion scene\0*.pygscene\0All files\0*.*\0\0", L"mhscene", (fs::u8path(userDataDir()) / "scenes").u8string() + "\\");
+        if (!p.empty()) { std::string err; say(loadScene(p, err) ? "Scene " + fs::u8path(p).stem().u8string() : err); sceneItem = 0; }
+    }
+    if (ImGui::Button("Save As...", ImVec2(hw, 0))) saveAs();
+    ImGui::SameLine();
+    if (ImGui::Button("Close", ImVec2(hw, 0))) {   // MakeHuman's reset: its default light and ambience
+        MhScene::Scene s; fromMhScene(s); sceneFile.clear(); sceneModified = false; sceneItem = 0; say("A new scene");
+    }
+    groupBox("Items");
+    ImGui::BeginChild("items", ImVec2(lw, std::min(200.0f, 30.0f + 22.0f * (float)(lk.lights.size() + 1))), true);
+    if (ImGui::Selectable("Environment", sceneItem == 0)) sceneItem = 0;
+    for (size_t i = 0; i < lk.lights.size(); ++i) if (ImGui::Selectable(("Light " + std::to_string(i)).c_str(), sceneItem == (int)i + 1)) sceneItem = (int)i + 1;
+    ImGui::EndChild();
+    if (ImGui::Button("Add...", ImVec2(lw, 0))) sceneItem = -1;
+    bool changed = false;
+    auto slider3 = [&](const char* id, float* v, float lo, float hi, const char* a, const char* b, const char* c) {
+        ImGui::PushID(id); const char* n[] = {a, b, c}; bool ch = false;
+        for (int k = 0; k < 3; ++k) { ImGui::PushID(k); ImGui::SetNextItemWidth(lw); ch |= ImGui::SliderFloat("##v", &v[k], lo, hi, n[k]); ImGui::PopID(); }
+        ImGui::PopID(); return ch;
+    };
+    if (sceneItem == -1) {
+        groupBox("Add scene item");
+        if (lk.lights.size() < 8 && ImGui::Button("Add light", ImVec2(lw, 0))) {
+            Viewer::Look::Light L; L.withView = true; L.strength = 1; lightFromMh(L);   // MakeHuman's new light: (-10.99, 20, 20) at the centre
+            lk.lights.push_back(L); sceneItem = (int)lk.lights.size(); changed = true;
+        }
+        if (lk.lights.size() >= 8) ImGui::TextDisabled("Eight lights is MakeHuman's limit.");
+    } else if (sceneItem == 0) {
+        groupBox("Environment properties");
+        ImGui::TextUnformatted("Ambience");
+        changed |= slider3("amb", lk.ambient, 0, 1, "Red %.3f", "Green %.3f", "Blue %.3f");
+        if (!lk.skybox.empty()) ImGui::TextDisabled("Skybox: %s", lk.skybox.c_str());
+    } else if (sceneItem <= (int)lk.lights.size()) {
+        auto& L = lk.lights[(size_t)sceneItem - 1];
+        groupBox(("Light " + std::to_string(sceneItem - 1) + " properties").c_str());
+        ImGui::TextUnformatted("Position");
+        if (slider3("pos", L.pos, -60, 60, "X %.2f", "Y %.2f", "Z %.2f")) { lightFromMh(L); L.withView = true; changed = true; }
+        ImGui::TextUnformatted("Focus");
+        if (slider3("foc", L.focus, -30, 30, "X %.2f", "Y %.2f", "Z %.2f")) { lightFromMh(L); L.withView = true; changed = true; }
+        ImGui::TextUnformatted("Color");
+        changed |= slider3("col", L.col, 0, 1.5f, "Red %.3f", "Green %.3f", "Blue %.3f");
+        ImGui::TextUnformatted("Specular");
+        changed |= slider3("spe", L.spec, 0, 1.5f, "Red %.3f", "Green %.3f", "Blue %.3f");
+        ImGui::SetNextItemWidth(lw); changed |= ImGui::SliderFloat("##fov", &L.fov, 1, 180, "Spot angle %.1f");
+        ImGui::SetNextItemWidth(lw); changed |= ImGui::SliderFloat("##att", &L.attenuation, 0, 1, "Attenuation %.3f");
+        bool soft = L.areaLights > 1;
+        if (ImGui::Checkbox("Soft light", &soft)) { L.areaLights = soft ? std::max(L.areaLights, 2) : 1; changed = true; }
+        ImGui::SetNextItemWidth(lw); changed |= ImGui::SliderFloat("##size", &L.areaLightSize, 0, 20, "Softness %.2f");
+        ImGui::SetNextItemWidth(lw); changed |= ImGui::SliderInt("##samp", &L.areaLights, 1, 16, "Samples %d");
+        ImGui::TextDisabled("Spot angle, attenuation and softness are kept in the scene file for renderers; the view lights by position and colour, as MakeHuman's does.");
+        if (ImGui::Button(("Remove light " + std::to_string(sceneItem - 1)).c_str(), ImVec2(lw, 0))) { lk.lights.erase(lk.lights.begin() + (sceneItem - 1)); sceneItem = 0; changed = true; }
+    } else sceneItem = 0;
+    if (changed) sceneModified = true;
 }
 
 static void renderingLeft(const std::string& t, float lw) {
@@ -1080,14 +1220,27 @@ static void renderingLeft(const std::string& t, float lw) {
             for (int k = 0; k < 5; ++k) if (ImGui::Selectable(SCENE_PRESETS[k])) pre = k;
             ImGui::EndCombo();
         }
-        if (pre >= 0) { scenePreset(pre); say(std::string(SCENE_PRESETS[pre]) + " scene"); }
+        if (pre >= 0) { scenePreset(pre); sceneFile.clear(); for (auto& L : lk.lights) lightToMh(L); say(std::string(SCENE_PRESETS[pre]) + " scene"); }
+        // MakeHuman's scenes: the .mhscene files in its scenes folders (and Pygmalion's own .pygscene)
+        groupBox("Scene files");
+        {
+            std::vector<std::string> files = filesIn("scenes", ".mhscene");
+            for (const auto& f : filesIn("scenes", ".pygscene")) files.push_back(f);
+            ImGui::BeginChild("scenes", ImVec2(lw, std::min(160.0f, 26.0f + 22.0f * (float)files.size())), true);
+            for (const auto& f : files) {
+                const bool on = fs::u8path(f) == fs::u8path(sceneFile);
+                if (ImGui::Selectable(fs::u8path(f).stem().u8string().c_str(), on)) { std::string err; say(loadScene(f, err) ? "Scene " + fs::u8path(f).stem().u8string() : err); }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", f.c_str());
+            }
+            ImGui::EndChild();
+        }
         if (ImGui::Button("Load...", ImVec2(lw / 2 - 4, 0))) {
-            const std::string p = fileDialog(false, L"Pygmalion scene\0*.pygscene\0\0", L"pygscene", homeDir() + "\\");
+            const std::string p = fileDialog(false, L"Scene (*.mhscene, *.pygscene)\0*.mhscene;*.pygscene\0\0", L"mhscene", homeDir() + "\\");
             if (!p.empty()) { std::string err; say(loadScene(p, err) ? "Scene " + fs::u8path(p).stem().u8string() : err); }
         }
         ImGui::SameLine();
         if (ImGui::Button("Save...", ImVec2(lw / 2 - 4, 0))) {
-            const std::string p = fileDialog(true, L"Pygmalion scene\0*.pygscene\0\0", L"pygscene", homeDir() + "\\scene.pygscene");
+            const std::string p = fileDialog(true, L"MakeHuman scene\0*.mhscene\0Pygmalion scene (keeps every setting)\0*.pygscene\0\0", L"mhscene", homeDir() + "\\scene.mhscene");
             if (!p.empty()) say(saveScene(p) ? "Saved " + p : "Couldn't save " + p);
         }
         groupBox("Ambient light");
@@ -1103,15 +1256,16 @@ static void renderingLeft(const std::string& t, float lw) {
             groupBox(("Light " + std::to_string(i + 1)).c_str());
             ImGui::Checkbox("On", &L.on); ImGui::SameLine(); ImGui::Checkbox("Turns with the view", &L.withView);
             float deg[2] = {L.yaw / DEG, L.pitch / DEG};
-            ImGui::SetNextItemWidth(lw); if (ImGui::SliderFloat("##y", &deg[0], -180, 180, L.withView ? "From the left/right %.0f deg" : "Round the person %.0f deg")) L.yaw = deg[0] * DEG;
-            ImGui::SetNextItemWidth(lw); if (ImGui::SliderFloat("##p", &deg[1], -89, 89, "Height %.0f deg")) L.pitch = deg[1] * DEG;
+            ImGui::SetNextItemWidth(lw); if (ImGui::SliderFloat("##y", &deg[0], -180, 180, L.withView ? "From the left/right %.0f deg" : "Round the person %.0f deg")) { L.yaw = deg[0] * DEG; lightToMh(L); sceneModified = true; }
+            ImGui::SetNextItemWidth(lw); if (ImGui::SliderFloat("##p", &deg[1], -89, 89, "Height %.0f deg")) { L.pitch = deg[1] * DEG; lightToMh(L); sceneModified = true; }
             ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##s", &L.strength, 0, 3, "Strength %.2f");
             rgbSliders("lc", L.col, 1.5f, lw);
+            if (ImGui::TreeNode("Highlight colour")) { rgbSliders("ls", L.spec, 1.5f, lw - 20); ImGui::TreePop(); }
             if (lk.lights.size() > 1 && ImGui::SmallButton("Remove this light")) drop = (int)i;
             ImGui::PopID();
         }
         if (drop >= 0) lk.lights.erase(lk.lights.begin() + drop);
-        if (lk.lights.size() < 4 && ImGui::Button("Add a light", ImVec2(lw, 0))) lk.lights.push_back(Viewer::Look::Light{true, 45 * DEG, 30 * DEG, {1, 1, 1}, 0.5f, false});
+        if (lk.lights.size() < 8 && ImGui::Button("Add a light", ImVec2(lw, 0))) { lk.lights.push_back(Viewer::Look::Light{true, 45 * DEG, 30 * DEG, {1, 1, 1}, 0.5f, false}); lightToMh(lk.lights.back()); }
         groupBox("Overall");
         ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##li", &lk.light, 0.1f, 2.5f, "Brightness %.2f");
         for (int c = 0; c < 3; ++c) { static const char* n[] = {"Red %.2f", "Green %.2f", "Blue %.2f"}; ImGui::PushID(c); ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##lc", &lk.lightCol[c], 0, 1.5f, n[c]); ImGui::PopID(); }
@@ -1884,6 +2038,7 @@ static void frame() {
             ImGui::Checkbox("Symmetric modelling", &body.symmetry);
         } else if (t == "Statistics") statistics();
         else if (t == "Material Editor") materialEditor(lw);
+        else if (t == "Scene Editor") sceneEditorLeft(lw);
         else if (t == "Expression mixer") mixerLeft(lw);
         else if (t == "Targets") targetsView(lw);
         else if (t == "Save targets") saveTargetsLeft(lw);

@@ -40,6 +40,8 @@ GLF(void, glUniform1i, (GLint, GLint))
 GLF(void, glUniform1f, (GLint, GLfloat))
 GLF(void, glUniform3f, (GLint, GLfloat, GLfloat, GLfloat))
 GLF(void, glUniform4f, (GLint, GLfloat, GLfloat, GLfloat, GLfloat))
+GLF(void, glDisableVertexAttribArray, (GLuint))
+GLF(void, glVertexAttrib1f, (GLuint, GLfloat))
 GLF(void, glUniform3fv, (GLint, GLsizei, const GLfloat*))
 GLF(void, glUniform2f, (GLint, GLfloat, GLfloat))
 GLF(void, glGenVertexArrays, (GLsizei, GLuint*))
@@ -83,7 +85,9 @@ namespace Viewer {
 static Look lk;
 Look& look() { return lk; }
 static GLuint prog = 0, progLine = 0, progMh = 0;
-static float mhPos[24], mhCol[24], mhSpec[24]; static int mhN = 0;   // the scene's lights as MakeHuman's shaders take them   // progMh: MakeHuman's own shaders, by each object's material
+static float mhPos[24], mhCol[24], mhSpec[24]; static int mhN = 0;
+static GLuint progDbg = 0, dbgVao = 0, dbgVbo[2] = {0, 0};   // Skeleton Debug: coloured lines and triangles
+static std::vector<float> dbgWeights, dbgLines, dbgLineRgba, dbgTris, dbgTriRgba;   // the scene's lights as MakeHuman's shaders take them   // progMh: MakeHuman's own shaders, by each object's material
 // a mesh drawn corner by corner (uvs are per corner): the body, and each proxy (eyes, clothes, hair...)
 // what MakeHuman's shader needs of a material: its shader and defines, colours, textures and parameters
 struct MatGL {
@@ -92,7 +96,7 @@ struct MatGL {
     float diff[4] = {1, 1, 1, 1}, spec[4] = {1, 1, 1, 0.2f}, amb[3] = {1, 1, 1}, emis[3] = {0, 0, 0};
     float additive = 0, normalInt = 1, silhouette = 0.2f, toonShine = 20, ambI = 0.4f, specI = 0.2f, diffI = 0.4f, specTh = 0.3f, diffTh = 0.5f, edge = 1, xrayI = 0.7f;
 };
-struct Part { GLuint vao = 0, pos = 0, nrm = 0, uv = 0, tg = 0, tex = 0; int count = 0, mode = 3; bool cutout = false; float tint[3] = {1, 1, 1}; MatGL mat; };
+struct Part { GLuint vao = 0, pos = 0, nrm = 0, uv = 0, tg = 0, wt = 0, tex = 0; bool hasWt = false; int count = 0, mode = 3; bool cutout = false; float tint[3] = {1, 1, 1}; MatGL mat; };
 static Part bodyPart;
 static std::vector<Part> parts;
 static std::map<std::string, GLuint> texCache;
@@ -132,7 +136,7 @@ static GLuint textureLoad(const std::string& path) {
 bool init(const std::string& data) {
 #define L(name) name##_ = (PFN_##name)SDL_GL_GetProcAddress(#name); if (!name##_) return false;
     L(glCreateShader) L(glShaderSource) L(glCompileShader) L(glCreateProgram) L(glAttachShader) L(glLinkProgram) L(glUseProgram)
-    L(glGetUniformLocation) L(glUniformMatrix4fv) L(glUniform1i) L(glUniform1f) L(glUniform3f) L(glUniform4f) L(glUniform3fv) L(glUniform2f) L(glGenVertexArrays) L(glBindVertexArray)
+    L(glGetUniformLocation) L(glUniformMatrix4fv) L(glUniform1i) L(glUniform1f) L(glUniform3f) L(glUniform4f) L(glDisableVertexAttribArray) L(glVertexAttrib1f) L(glUniform3fv) L(glUniform2f) L(glGenVertexArrays) L(glBindVertexArray)
     L(glGenBuffers) L(glBindBuffer) L(glBufferData) L(glEnableVertexAttribArray) L(glVertexAttribPointer) L(glGenFramebuffers)
     L(glBindFramebuffer) L(glFramebufferTexture2D) L(glGenRenderbuffers) L(glBindRenderbuffer) L(glRenderbufferStorage)
     L(glFramebufferRenderbuffer) L(glGenerateMipmap) L(glActiveTexture)
@@ -186,11 +190,12 @@ void shade() {
   o = vec4(skin, 1);
 })");
     progMh = make(R"(#version 330
-layout(location=0) in vec3 p; layout(location=1) in vec3 n; layout(location=2) in vec2 t; layout(location=3) in vec3 tg;
-uniform mat4 mvp, view; out vec3 vN, vV, vTg; out vec2 vT;
-void main() { vN = mat3(view) * n; vTg = mat3(view) * tg; vV = vec3(view * vec4(p, 1)); vT = t; gl_Position = mvp * vec4(p, 1); })",
+layout(location=0) in vec3 p; layout(location=1) in vec3 n; layout(location=2) in vec2 t; layout(location=3) in vec3 tg; layout(location=4) in float wt;
+uniform mat4 mvp, view; out vec3 vN, vV, vTg; out vec2 vT; out float vW;
+void main() { vN = mat3(view) * n; vTg = mat3(view) * tg; vV = vec3(view * vec4(p, 1)); vT = t; vW = wt; gl_Position = mvp * vec4(p, 1); })",
                   R"(#version 330
-in vec3 vN, vV, vTg; in vec2 vT; out vec4 o;
+in vec3 vN, vV, vTg; in vec2 vT; in float vW; out vec4 o;
+uniform int weightView;
 uniform int sh;                 // 0 none (fixed function), 1 litsphere, 2 normalmap, 3 phong, 4 skin, 5 toon, 6 xray
 uniform int dDiffuse, dNormal, dAo, dAlpha, cutout, autoSkin, shadeless, blend;
 uniform sampler2D diffuseTexture, litsphereTexture, normalmapTexture, aomapTexture, alphaTexture, litA, litB, litC;
@@ -282,11 +287,21 @@ vec4 shadeIt() {
   return vec4(c * tex.rgb, mDiffuse.a * tex.a);
 }
 void main() {
+  if (weightView == 1) {   // Skeleton Debug: the bone's weight, dark blue (none) to red and yellow (all), on a see-through grey
+    vec3 n = normalize(vN); float e = 0.35 + 0.65 * abs(n.z);
+    vec3 c = vW <= 0.0 ? vec3(0.18, 0.2, 0.32) : mix(vec3(0.75, 0.08, 0.08), vec3(1.0, 0.9, 0.2), clamp(vW, 0.0, 1.0));
+    o = vec4(c * e, 1.0); return;
+  }
   o = shadeIt();
   if (cutout == 1 && o.a < 0.4) discard;
   if (blend == 0) o.a = 1.0; else if (sh != 6) o.a *= mDiffuse.a;
   o.rgb *= light * lcol * tint;
 })");
+    progDbg = make(R"(#version 330
+layout(location=0) in vec3 p; layout(location=1) in vec4 c; uniform mat4 mvp; out vec4 C; void main() { C = c; gl_Position = mvp * vec4(p, 1); })",
+                   R"(#version 330
+in vec4 C; out vec4 o; void main() { o = C; })");
+    glGenVertexArrays_(1, &dbgVao); glGenBuffers_(2, dbgVbo);
     progBg = make(R"(#version 330
 out vec2 T; void main() { vec2 p = vec2((gl_VertexID & 1) * 2 - 1, (gl_VertexID >> 1) * 2 - 1); T = p * 0.5 + 0.5; gl_Position = vec4(p, 0.999, 1); })",
                   R"(#version 330
@@ -497,6 +512,14 @@ void update(const Human::Body& b) {
         unroll(pos, vt, cuv, P, N, U, Tg);
         fill(bodyPart, P, N, U, Tg);
         matGL(b.skinMat, bodyPart.mat);
+        // Skeleton Debug: each corner's weight for the chosen bone
+        bodyPart.hasWt = !dbgWeights.empty() && !lk.smooth;
+        if (bodyPart.hasWt) {
+            std::vector<float> W; W.reserve(vt.size());
+            for (int v : vt) W.push_back((size_t)v < dbgWeights.size() ? dbgWeights[v] : 0.0f);
+            if (!bodyPart.wt) glGenBuffers_(1, &bodyPart.wt);
+            upload(bodyPart.vao, bodyPart.wt, 4, 1, W);
+        }
         bodyPart.tex = texture(b.skinTexture);
         bodyPart.mode = bodyPart.tex ? 4 : 0;
         for (int c = 0; c < 3; ++c) bodyPart.tint[c] = b.skinTint[c];
@@ -530,6 +553,10 @@ void update(const Human::Body& b) {
 void focus(const float at[3], float dist, float yaw, float pitch) {
     for (int c = 0; c < 3; ++c) target[c] = at[c];
     lk.dist = dist; lk.yaw = yaw; lk.pitch = pitch;
+}
+void setDebugWeights(const std::vector<float>& w) { dbgWeights = w; }
+void setDebugShapes(const std::vector<float>& lines, const std::vector<float>& lineRgba, const std::vector<float>& tris, const std::vector<float>& triRgba) {
+    dbgLines = lines; dbgLineRgba = lineRgba; dbgTris = tris; dbgTriRgba = triRgba;
 }
 void viewTarget(float at[3]) { for (int c = 0; c < 3; ++c) at[c] = target[c]; }
 void focusBody(float yaw, float pitch) {
@@ -683,6 +710,8 @@ unsigned render(int w, int h, bool hovered) {
         const GLuint tex[8] = {g.diffuse, g.litsphere, g.normal, g.ao, g.alpha, lit[0], lit[1], lit[2]};
         for (int k = 0; k < 8; ++k) { glActiveTexture_(GL_TEXTURE0 + k); glBindTexture(GL_TEXTURE_2D, tex[k]); }
         glUniform1i_(U("sh"), g.sh);
+        glUniform1i_(U("weightView"), &pt == &bodyPart && pt.hasWt ? 1 : 0);
+        if (!(&pt == &bodyPart && pt.hasWt)) { glBindVertexArray_(pt.vao); glDisableVertexAttribArray_(4); glVertexAttrib1f_(4, 0); }
         glUniform1i_(U("dDiffuse"), g.dDiffuse); glUniform1i_(U("dNormal"), g.dNormal); glUniform1i_(U("dAo"), g.dAo); glUniform1i_(U("dAlpha"), g.dAlpha);
         glUniform1i_(U("autoSkin"), g.autoSkin); glUniform1i_(U("shadeless"), g.shadeless); glUniform1i_(U("cutout"), pt.cutout ? 1 : 0); glUniform1i_(U("blend"), g.blend);
         glUniform3f_(U("tint"), pt.tint[0], pt.tint[1], pt.tint[2]);
@@ -752,6 +781,24 @@ unsigned render(int w, int h, bool hovered) {
         glUniform3f_(glGetUniformLocation_(progLine, "col"), 1.0f, 1.0f, 1.0f);
         glPointSize(5);
         glDrawArrays(GL_POINTS, 0, (GLsizei)(boneSegs.size() / 3));
+        glLineWidth(1);
+    }
+    if ((!dbgLines.empty() || !dbgTris.empty()) && progDbg) {   // Skeleton Debug: bone planes (see-through), then the axes over everything
+        glUseProgram_(progDbg);
+        glUniformMatrix4fv_(glGetUniformLocation_(progDbg, "mvp"), 1, GL_FALSE, mvp);
+        glBindVertexArray_(dbgVao);
+        auto drawSet = [&](const std::vector<float>& p, const std::vector<float>& c, GLenum mode) {
+            if (p.empty()) return;
+            glBindBuffer_(GL_ARRAY_BUFFER, dbgVbo[0]); glBufferData_(GL_ARRAY_BUFFER, (GLsizeiptr)(p.size() * 4), p.data(), GL_DYNAMIC_DRAW);
+            glEnableVertexAttribArray_(0); glVertexAttribPointer_(0, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
+            glBindBuffer_(GL_ARRAY_BUFFER, dbgVbo[1]); glBufferData_(GL_ARRAY_BUFFER, (GLsizeiptr)(c.size() * 4), c.data(), GL_DYNAMIC_DRAW);
+            glEnableVertexAttribArray_(1); glVertexAttribPointer_(1, 4, GL_FLOAT, GL_FALSE, 0, nullptr);
+            glDrawArrays(mode, 0, (GLsizei)(p.size() / 3));
+        };
+        glEnable(GL_DEPTH_TEST); glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); glDisable(GL_CULL_FACE);
+        drawSet(dbgTris, dbgTriRgba, GL_TRIANGLES);
+        glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glLineWidth(2);
+        drawSet(dbgLines, dbgLineRgba, GL_LINES);
         glLineWidth(1);
     }
     glBindVertexArray_(0); glUseProgram_(0);

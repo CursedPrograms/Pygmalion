@@ -840,7 +840,7 @@ static std::vector<std::string> tasksOfAll(int c) {
     case CAT_POSE: return {"Skeleton", "Pose", "Expression", "Animations"};
     case CAT_RENDERING: return {"Render", "Scene", "Viewer"};
     case CAT_SETTINGS: return {"Sliders", "General", "Background", "Mouse", "Shortcuts", "Plugins", "User Plugins"};
-    case CAT_UTILITIES: return {"Describe", "Symmetry", "Statistics", "Material Editor", "Scene Editor", "Expression mixer", "Targets", "Save targets", "Mass produce", "Shell", "Scripting", "Download", "Socket", "Profile", "Example", "Data", "Logs"};
+    case CAT_UTILITIES: return {"Describe", "Symmetry", "Statistics", "Material Editor", "Scene Editor", "Expression mixer", "Targets", "Save targets", "Mass produce", "Shell", "Scripting", "Download", "Socket", "Profile", "Example", "Skeleton Debug", "Data", "Logs"};
     default: return {"Help", "About", "Licence"};
     }
 }
@@ -2383,6 +2383,57 @@ static void userPluginsLeft(float lw) {
 
 // ---------- Utilities > Profile (MakeHuman's 7_profile): the main steps' timings, sortable, saved as text ----------
 static int profKey = 0, profDir = 0;
+
+// Utilities > Skeleton Debug (MakeHuman's 3_libraries_skeleton/debugtab.py, in its development builds): the chosen
+// skeleton's bones, each bone's axes (x red, y green, z blue), the planes that set each bone's roll, and one bone's
+// weights on the body
+static bool dbgWeightsOn = true, dbgAxis = true, dbgBones = true, dbgPlanes = false; static int dbgBone = 0; static bool dbgActive = false;
+static void skeletonDebugUpdate() {
+    const Skel::Skeleton& s = chosen.empty() ? rig : chosen;
+    if (!dbgActive || s.empty()) { Viewer::setDebugWeights({}); Viewer::setDebugShapes({}, {}, {}, {}); Viewer::look().bones = showBones; return; }
+    dbgBone = std::clamp(dbgBone, 0, (int)s.bones.size() - 1);
+    std::vector<float> w;
+    if (dbgWeightsOn && dbgBone < (int)s.weights.size()) { w.assign(body.base.size() / 3, 0.0f); for (const auto& [v, x] : s.weights[dbgBone]) if ((size_t)v < w.size()) w[v] = x; }
+    Viewer::setDebugWeights(w);
+    std::vector<float> L, LC, T, TC;
+    for (size_t i = 0; i < s.bones.size(); ++i) {
+        const auto& b = s.bones[i];
+        const Skel::Mat4& m = b.poseGlobal;
+        const float len = std::sqrt((b.tail[0] - b.head[0]) * (b.tail[0] - b.head[0]) + (b.tail[1] - b.head[1]) * (b.tail[1] - b.head[1]) + (b.tail[2] - b.head[2]) * (b.tail[2] - b.head[2]));
+        if (dbgAxis) for (int ax = 0; ax < 3; ++ax) {
+            const float o[3] = {m[12], m[13], m[14]}, d[3] = {m[ax * 4], m[ax * 4 + 1], m[ax * 4 + 2]};
+            const float k = std::max(0.15f, len * 0.35f);
+            L.insert(L.end(), {o[0], o[1], o[2], o[0] + d[0] * k, o[1] + d[1] * k, o[2] + d[2] * k});
+            const float c[4] = {ax == 0 ? 1.0f : 0.1f, ax == 1 ? 1.0f : 0.1f, ax == 2 ? 1.0f : 0.1f, 1.0f};
+            for (int r = 0; r < 2; ++r) LC.insert(LC.end(), c, c + 4);
+        }
+        if (dbgPlanes && !b.plane.empty()) {
+            auto pl = s.planes.find(b.plane);
+            if (pl == s.planes.end()) continue;
+            static const float COLS[6][3] = {{60, 230, 200}, {220, 60, 230}, {230, 180, 60}, {230, 90, 60}, {60, 230, 60}, {60, 120, 230}};
+            const float* c = COLS[i % 6];
+            bool ok = true; float P[3][3];
+            for (int k = 0; k < 3; ++k) { float jp[3]; if (!Human::jointPos(body, pl->second[k], jp)) { ok = false; break; } for (int q = 0; q < 3; ++q) P[k][q] = jp[q]; }
+            if (!ok) continue;
+            for (int k = 0; k < 3; ++k) { T.insert(T.end(), P[k], P[k] + 3); TC.insert(TC.end(), {c[0] / 255, c[1] / 255, c[2] / 255, 0.55f}); }
+        }
+    }
+    Viewer::setDebugShapes(L, LC, T, TC);
+    Viewer::look().bones = dbgBones;
+}
+static void skeletonDebugLeft(float lw) {
+    const Skel::Skeleton& s = chosen.empty() ? rig : chosen;
+    groupBox("Display");
+    bool ch = false;
+    ch |= ImGui::Checkbox("Show bone weights", &dbgWeightsOn); ch |= ImGui::Checkbox("Show bone axis", &dbgAxis);
+    ch |= ImGui::Checkbox("Show bones", &dbgBones); ch |= ImGui::Checkbox("Show bone planes", &dbgPlanes);
+    ImGui::TextDisabled("%s%s", s.name.empty() ? "The default skeleton" : s.name.c_str(), chosen.empty() ? " (none chosen: the default one)" : "");
+    groupBox("Bones");
+    ImGui::BeginChild("bones", ImVec2(lw, 420), true);
+    for (int i = 0; i < (int)s.bones.size(); ++i) if (ImGui::Selectable(s.bones[i].name.c_str(), dbgBone == i)) { dbgBone = i; ch = true; }
+    ImGui::EndChild();
+    if (ch || !dbgActive) { dbgActive = true; skeletonDebugUpdate(); dirty = true; }
+}
 static void profileLeft(float lw) {
     static const char* KEYS[] = {"Total calls", "Total time", "Total per call", "Cumulative time", "Cumulative per call", "Function"};
     groupBox("Sort");
@@ -3136,6 +3187,7 @@ static void frame() {
         else if (t == "Data") dataView();
         else if (t == "Profile") profileLeft(lw);
         else if (t == "Example") exampleLeft(lw);
+        else if (t == "Skeleton Debug") skeletonDebugLeft(lw);
         else logsView();
     } else if (cat == CAT_HELP) {
         if (t == "Help") helpLeft(lw);
@@ -3211,11 +3263,13 @@ static void frame() {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::Begin("view", nullptr, fixed);
     Viewer::look().dragging = ImGui::IsMouseDown(ImGuiMouseButton_Left) && ImGui::GetIO().WantCaptureMouse && ImGui::IsAnyItemActive();
+    if (dbgActive && !(cat == CAT_UTILITIES && task[CAT_UTILITIES] == "Skeleton Debug")) dirty = true;   // the debug view goes when its tab does
     if (dirty && loadErr.empty()) {
         Human::apply(body);
         if (!rig.empty()) Skel::build(rig, body.pos);
         if (!chosen.empty()) Skel::build(chosen, body.pos);
         repose();
+        { const bool want = cat == CAT_UTILITIES && task[CAT_UTILITIES] == "Skeleton Debug"; if (want || dbgActive) { if (!want) dbgActive = false; skeletonDebugUpdate(); } }
         Viewer::update(body);
         dirty = false;
     }

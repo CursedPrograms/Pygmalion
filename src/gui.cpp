@@ -1028,6 +1028,7 @@ static std::string findData(const std::string& rel, const char* sub) {
     if (f.empty()) for (const auto& c : filesIn(sub, fs::u8path(rel).extension().u8string().c_str())) if (fs::u8path(c).filename() == fs::u8path(rel).filename()) return c;
     return f;
 }
+static const char* SIDE_NAMES_M[] = {"front", "back", "left", "right", "top", "bottom", "other"};   // MakeHuman's background sides
 static char saveName[128] = "person";   // the file name (and the model's name when it has none of its own)
 static bool saveModel(const std::string& path, const std::string& name, std::string& err) {
     {   // MakeHuman's camera line: rotation x, y in degrees, translation, zoom
@@ -1041,12 +1042,36 @@ static bool saveModel(const std::string& path, const std::string& name, std::str
     if (!skeletonFile.empty()) o << "skeleton " << fs::u8path(skeletonFile).filename().u8string() << "\n";
     if (!poseFile.empty()) o << "pose " << relData(poseFile) << "\n";
     if (!expressionFile.empty()) o << "expression " << relData(expressionFile) << "\n";
+    {   // background <side> <file> <aspect> <x> <y> <scale>, then background enabled True|False
+        const Viewer::Look& lk = Viewer::look(); int n = 0;
+        for (int k = 0; k < 7; ++k) { const auto& sd = lk.sides[k]; if (sd.file.empty()) continue; o << "background " << SIDE_NAMES_M[k] << " " << sd.file << " " << sd.aspect << " " << sd.x << " " << sd.y << " " << sd.scale << "\n"; ++n; }
+        if (n) o << "background enabled " << (lk.sidesOn ? "True" : "False") << "\n";
+    }
     o << "subdivide " << (body.subdivide ? "True" : "False") << "\n";   // MakeHuman's last line
     return true;
 }
 static bool loadModel(const std::string& path, std::string& err) {
     if (!Human::loadMhm(body, path, err)) return false;
     Viewer::look().smooth = body.subdivide;
+    {   // the backgrounds kept in the model
+        Viewer::Look& lk = Viewer::look(); for (auto& sd : lk.sides) sd = Viewer::Look::BgSide(); lk.sidesOn = false;
+        std::ifstream bin(fs::u8path(path)); std::string bl;
+        while (std::getline(bin, bl)) {
+            if (!bl.empty() && bl.back() == '\r') bl.pop_back();
+            std::istringstream bs(bl); std::string k, side; bs >> k >> side;
+            if (k != "background") continue;
+            if (side == "enabled") { std::string v; bs >> v; for (auto& c : v) c = (char)tolower((unsigned char)c); lk.sidesOn = v == "true" || v == "yes"; continue; }
+            std::vector<std::string> w; std::string x; while (bs >> x) w.push_back(x);
+            if (w.size() < 5) continue;
+            int sk = -1; for (int q = 0; q < 7; ++q) if (side == SIDE_NAMES_M[q]) sk = q;
+            if (sk < 0) continue;
+            std::string file; for (size_t q = 0; q + 4 < w.size(); ++q) file += (q ? " " : "") + w[q];   // (a name with spaces)
+            const size_t e = w.size();
+            std::string f = Human::resolveAsset(file, ""); if (f.empty()) f = Human::resolveAsset("backgrounds/" + file, ""); if (f.empty()) { std::error_code ec; if (fs::exists(fs::u8path(file), ec)) f = file; }
+            if (f.empty()) continue;
+            auto& sd = lk.sides[sk]; sd.file = f; sd.aspect = (float)atof(w[e - 4].c_str()); sd.x = (float)atof(w[e - 3].c_str()); sd.y = (float)atof(w[e - 2].c_str()); sd.scale = (float)atof(w[e - 1].c_str());
+        }
+    }
     if (body.hasCamera) { Viewer::Look& lk = Viewer::look(); lk.pitch = std::clamp(body.camera[0] / 57.29578f, -1.4f, 1.4f); lk.yaw = -body.camera[1] / 57.29578f; }
     if (!body.name.empty()) snprintf(saveName, sizeof saveName, "%s", body.name.c_str());
     std::ifstream in(fs::u8path(path)); std::string line;
@@ -1250,6 +1275,8 @@ static void toolbar(float x, float y, float w) {
     if (btn("Symm", "Moving a left slider moves the right one too", body.symmetry)) body.symmetry = !body.symmetry;
     gap();
     const float PI = 3.14159265f;
+    { Viewer::Look& L2 = Viewer::look(); bool any = false; for (const auto& sd : L2.sides) if (!sd.file.empty()) any = true;
+      if (btn("Bg", "Background: the picture for this side (Settings > Background)", L2.sidesOn)) { if (any) L2.sidesOn = !L2.sidesOn; else say("No background image is set. To show a background, choose an image from the Background tab in Settings."); } }
     if (btn("Front", "Front view")) Viewer::focusBody(0, 0.05f);
     if (btn("Back", "Back view")) Viewer::focusBody(PI, 0.05f);
     if (btn("Left", "Left side")) Viewer::focusBody(PI / 2, 0.05f);
@@ -1619,11 +1646,54 @@ static void renderingLeft(const std::string& t, float lw) {
     }
 }
 
-// ---------- Settings > Background: a picture behind the person ----------
+// ---------- Settings > Background: MakeHuman's (plugins/0_modeling_background.py) ----------
+static const char* SIDE_NAMES[] = {"front", "back", "left", "right", "top", "bottom", "other"};
+static int bgSidePick = 0;
+static std::vector<std::string> backgroundFiles() {   // the backgrounds folders: MakeHuman's, Pygmalion's, the user's
+    std::vector<std::string> v;
+    for (const char* ext : {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}) for (const auto& f : filesIn("backgrounds", ext)) v.push_back(f);
+    std::sort(v.begin(), v.end());
+    return v;
+}
+static void setSideBackground(int side, const std::string& f) {
+    Viewer::Look& lk = Viewer::look();
+    auto& sd = lk.sides[side];
+    sd.file = f;
+    if (!f.empty()) { int w = 0, h = 0, n = 0; if (stbi_info(f.c_str(), &w, &h, &n) && h > 0) sd.aspect = (float)w / h; lk.sidesOn = true; }
+}
 static void backgroundLeft(float lw) {
     Viewer::Look& lk = Viewer::look();
-    groupBox("Background picture");
-    if (ImGui::Button("Choose a picture...", ImVec2(lw, 0))) {
+    groupBox("Side");
+    for (int k = 0; k < 7; ++k) {
+        std::string l = SIDE_NAMES[k]; l[0] = (char)toupper((unsigned char)l[0]);
+        if (ImGui::RadioButton(l.c_str(), &bgSidePick, k)) {   // the view turns to that side
+            const float PI = 3.14159265f;
+            const float turns[6][2] = {{0, 0.05f}, {PI, 0.05f}, {PI / 2, 0.05f}, {-PI / 2, 0.05f}, {0, 1.5f}, {0, -1.5f}};
+            if (k < 6) Viewer::focusBody(turns[k][0], turns[k][1]);
+        }
+    }
+    groupBox("Background settings");
+    ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##sop", &lk.sidesOpacity, 0, 100, "Opacity: %.0f%%");
+    ImGui::Checkbox("Move && Resize", &lk.sidesEdit);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Drag in the view to move the picture (right-drag: its size; Shift: finer).");
+    ImGui::Checkbox("Show in foreground", &lk.sidesFront);
+    ImGui::Checkbox("Background (shown)", &lk.sidesOn);
+    groupBox("Background");
+    {
+        std::string picked;
+        const std::string cur = lk.sides[bgSidePick].file;
+        if (chooser("bg", backgroundFiles(), cur, picked, lw, true, "None")) { setSideBackground(bgSidePick, picked); dirty = true; }
+        if (ImGui::Button("Choose a picture...", ImVec2(lw, 0))) {
+            const std::string p = fileDialog(false, L"Pictures\0*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff\0\0", L"png", homeDir() + "\\");
+            if (!p.empty()) setSideBackground(bgSidePick, p);
+        }
+        if (!cur.empty()) { ImGui::PushTextWrapPos(lw); ImGui::TextDisabled("%s", cur.c_str()); ImGui::PopTextWrapPos(); }
+        std::error_code ec; fs::create_directories(fs::u8path(userDataDir()) / "backgrounds", ec);
+        notYet(("If you want backgrounds to show up here, place the images in " + (fs::u8path(userDataDir()) / "backgrounds").u8string()).c_str());
+    }
+    // Pygmalion's own: a picture behind the whole view, whatever the side
+    groupBox("Behind the whole view");
+    if (ImGui::Button("Choose a picture...##whole", ImVec2(lw, 0))) {
         const std::string p = fileDialog(false, L"Pictures\0*.png;*.jpg;*.jpeg;*.bmp\0\0", L"png", homeDir() + "\\");
         if (!p.empty()) lk.bgImage = p;
     }
@@ -1632,7 +1702,6 @@ static void backgroundLeft(float lw) {
         ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##bo", &lk.bgOpacity, 0, 1, "Opacity %.2f");
         if (ImGui::Button("Remove", ImVec2(lw, 0))) lk.bgImage.clear();
     }
-    notYet("A photo or drawing behind the person to model against, like MakeHuman's background images.");
 }
 
 // ---------- Utilities ----------

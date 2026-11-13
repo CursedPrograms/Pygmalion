@@ -102,6 +102,7 @@ static std::vector<Part> parts;
 static std::map<std::string, GLuint> texCache;
 static GLuint gridVao = 0, gridVbo = 0; static int gridCount = 0;
 static GLuint progBg = 0, bgVao = 0, bgTex = 0; static std::string bgLoaded;
+static GLuint progPlane = 0;   // MakeHuman's side backgrounds: a textured quad in the scene
 static std::vector<float> boneSegs;
 static GLuint lit[3] = {0, 0, 0}, litEye = 0, lit_standard = 0;
 static GLuint fbo = 0, fboTex = 0, fboDepth = 0; static int fbW = 0, fbH = 0;
@@ -302,6 +303,10 @@ layout(location=0) in vec3 p; layout(location=1) in vec4 c; uniform mat4 mvp; ou
                    R"(#version 330
 in vec4 C; out vec4 o; void main() { o = C; })");
     glGenVertexArrays_(1, &dbgVao); glGenBuffers_(2, dbgVbo);
+    progPlane = make(R"(#version 330
+layout(location=0) in vec3 p; layout(location=1) in vec2 t; uniform mat4 mvp; out vec2 T; void main() { T = t; gl_Position = mvp * vec4(p, 1); })",
+                     R"(#version 330
+in vec2 T; out vec4 o; uniform sampler2D img; uniform float alpha; void main() { o = vec4(texture(img, T).rgb, alpha); })");
     progBg = make(R"(#version 330
 out vec2 T; void main() { vec2 p = vec2((gl_VertexID & 1) * 2 - 1, (gl_VertexID >> 1) * 2 - 1); T = p * 0.5 + 0.5; gl_Position = vec4(p, 0.999, 1); })",
                   R"(#version 330
@@ -599,11 +604,29 @@ static void mul(const float* a, const float* b, float* o) {
     memcpy(o, r, sizeof r);
 }
 
+int currentSide() {
+    const float PI = 3.14159265f;
+    float y = std::fmod(lk.yaw, 2 * PI); if (y > PI) y -= 2 * PI; if (y < -PI) y += 2 * PI;
+    auto closeTo = [](float a, float b) { return std::fabs(a - b) < 0.02f; };
+    if (closeTo(lk.pitch, 1.5f)) return 4;
+    if (closeTo(lk.pitch, -1.5f)) return 5;
+    if (!closeTo(lk.pitch, 0.05f) && !closeTo(lk.pitch, 0.0f)) return 6;
+    if (closeTo(y, 0)) return 0;
+    if (closeTo(std::fabs(y), PI)) return 1;
+    if (closeTo(y, PI / 2)) return 2;
+    if (closeTo(y, -PI / 2)) return 3;
+    return 6;
+}
 unsigned render(int w, int h, bool hovered) {
     PROF("Viewer::render");
     if (w < 8 || h < 8) return fboTex;
     ImGuiIO& io = ImGui::GetIO();
-    if (hovered) {
+    if (hovered && lk.sidesEdit && lk.sidesOn && !lk.sides[currentSide()].file.empty()) {
+        Look::BgSide& b = lk.sides[currentSide()];
+        const bool fine = io.KeyShift;
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Left) || ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) { const float d = fine ? 150.0f : 30.0f; b.x += io.MouseDelta.x / d; b.y -= io.MouseDelta.y / d; }
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Right)) { const float d = fine ? 500.0f : 100.0f; b.scale = std::fabs(b.scale + io.MouseDelta.y / d); }
+    } else if (hovered) {
         if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) { const float sg = lk.invertTurn ? -lk.turnSpeed : lk.turnSpeed; lk.yaw -= io.MouseDelta.x * 0.008f * sg; lk.pitch = std::clamp(lk.pitch + io.MouseDelta.y * 0.006f * sg, -1.4f, 1.4f); }
         if (ImGui::IsMouseDragging(ImGuiMouseButton_Right) || ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
             const float k = lk.dist * 0.0015f * lk.moveSpeed, cy = std::cos(lk.yaw), sy = std::sin(lk.yaw);
@@ -680,6 +703,32 @@ unsigned render(int w, int h, bool hovered) {
         glUniform3f_(glGetUniformLocation_(progLine, "col"), 0.23f, 0.23f, 0.23f);
         glDrawArrays(GL_LINES, 0, gridCount);
     }
+    auto drawSidePicture = [&]() {   // MakeHuman's background plane for the side the view faces
+        if (!lk.sidesOn || !progPlane) return;
+        const Look::BgSide& sd = lk.sides[currentSide()];
+        if (sd.file.empty()) return;
+        const GLuint t = texture(sd.file); if (!t) return;
+        const float hh = 10 * sd.scale, hw = hh * sd.aspect;
+        float c[3]; for (int k = 0; k < 3; ++k) c[k] = s[k] * sd.x + u[k] * sd.y;   // centred on the person, moved in its plane
+        float q[20]; const float corners[4][2] = {{-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
+        for (int k = 0; k < 4; ++k) {
+            for (int d = 0; d < 3; ++d) q[k * 5 + d] = c[d] + s[d] * corners[k][0] * hw + u[d] * corners[k][1] * hh;
+            q[k * 5 + 3] = (corners[k][0] + 1) / 2; q[k * 5 + 4] = (corners[k][1] + 1) / 2;
+        }
+        glUseProgram_(progPlane);
+        glUniformMatrix4fv_(glGetUniformLocation_(progPlane, "mvp"), 1, GL_FALSE, mvp);
+        glUniform1i_(glGetUniformLocation_(progPlane, "img"), 0); glUniform1f_(glGetUniformLocation_(progPlane, "alpha"), lk.sidesOpacity / 100.0f);
+        glActiveTexture_(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, t);
+        glBindVertexArray_(dbgVao);
+        glBindBuffer_(GL_ARRAY_BUFFER, dbgVbo[0]); glBufferData_(GL_ARRAY_BUFFER, sizeof q, q, GL_DYNAMIC_DRAW);
+        glEnableVertexAttribArray_(0); glVertexAttribPointer_(0, 3, GL_FLOAT, GL_FALSE, 20, nullptr);
+        glEnableVertexAttribArray_(1); glVertexAttribPointer_(1, 2, GL_FLOAT, GL_FALSE, 20, (const void*)12);
+        glDisable(GL_DEPTH_TEST); glDepthMask(GL_FALSE); glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glDisable(GL_BLEND); glDepthMask(GL_TRUE); glEnable(GL_DEPTH_TEST);
+        glUseProgram_(prog);
+    };
+    if (!lk.sidesFront) drawSidePicture();
     glUseProgram_(prog);
     glUniformMatrix4fv_(glGetUniformLocation_(prog, "mvp"), 1, GL_FALSE, mvp);
     glUniformMatrix4fv_(glGetUniformLocation_(prog, "view"), 1, GL_FALSE, V);
@@ -813,6 +862,7 @@ unsigned render(int w, int h, bool hovered) {
         glDrawArrays(GL_POINTS, 0, (GLsizei)(boneSegs.size() / 3));
         glLineWidth(1);
     }
+    if (lk.sidesFront) drawSidePicture();   // "Show in foreground"
     if ((!dbgLines.empty() || !dbgTris.empty()) && progDbg) {   // Skeleton Debug: bone planes (see-through), then the axes over everything
         glUseProgram_(progDbg);
         glUniformMatrix4fv_(glGetUniformLocation_(progDbg, "mvp"), 1, GL_FALSE, mvp);

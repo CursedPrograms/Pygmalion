@@ -18,6 +18,12 @@ struct Look {
     bool smooth = false;                            // MakeHuman's Smooth: one Catmull-Clark subdivision
     bool mhShaders = true;                          // each object drawn with its material's own MakeHuman shader
     // MakeHuman's slider behaviour: while a slider is dragged, refit the clothes / redo the normals (else when let go)
+    // MakeHuman's backgrounds (Settings > Background): a picture per side, shown when the view faces that side, on a
+    // plane 20 units high at the person (times its scale), moved and resized with the mouse ("Move & Resize")
+    struct BgSide { std::string file; float aspect = 1, x = 0, y = 0, scale = 1; };
+    BgSide sides[7];                                // front, back, left, right, top, bottom, other
+    bool sidesOn = false, sidesFront = false, sidesEdit = false;
+    float sidesOpacity = 40;                        // %
     float distort = 0;                              // Utilities > Example: the body pushed along its normals (view only)
     bool dragging = false, fitWhileDragging = true, normalsWhileDragging = true;
     std::string bgImage;                            // a picture behind the person (Settings > Background)
@@ -45,6 +51,7 @@ Look& look();
 void focus(const float at[3], float dist, float yaw, float pitch);
 void focusBody(float yaw, float pitch);         // the whole person
 void viewTarget(float at[3]);                   // the point the view turns round
+int currentSide();                              // MakeHuman's sides: 0 front .. 5 bottom, 6 any other view
 // Utilities > Skeleton Debug: the body coloured by one bone's weights (per body vertex, empty: off), and coloured
 // lines (axes) and triangles (bone planes), 3 floats a point and 4 a colour
 void setDebugWeights(const std::vector<float>& perVertex);

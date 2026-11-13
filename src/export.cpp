@@ -2,6 +2,7 @@
 #include "profile.h"
 #include "export.h"
 
+#include <stb_image.h>
 #include <stb_image_write.h>
 
 #include <algorithm>
@@ -813,6 +814,94 @@ bool saveLightmap(const Human::Body& b, const std::string& path, int size, std::
             if (cnt) { unsigned char* q = &out[((size_t)py * size + pxl) * 4]; q[0] = q[1] = q[2] = (unsigned char)(sum / cnt); q[3] = 255; }
         }
     if (!stbi_write_png(path.c_str(), size, size, 4, out.data(), size * 4)) { err = "Couldn't write " + path; return false; }
+    return true;
+}
+
+// one light's N.L over the uv layout (0..1, -1 where nothing is), each pixel blended from its triangle's corners
+static void bakeLight(const Human::Body& b, const float L[3], int size, std::vector<float>& out) {
+    const std::vector<float>& pos = b.shown.empty() ? b.pos : b.shown;
+    const std::vector<char> hid = Human::hiddenVerts(b);
+    std::vector<float> n; normalsOf(pos, b.tri, n);
+    std::vector<float> lit(pos.size() / 3);
+    for (size_t v = 0; v < lit.size(); ++v) {
+        float d[3] = {L[0] - pos[v * 3], L[1] - pos[v * 3 + 1], L[2] - pos[v * 3 + 2]};
+        const float l = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]); if (l > 0) for (float& c : d) c /= l;
+        lit[v] = std::max(0.0f, std::min(1.0f, d[0] * n[v * 3] + d[1] * n[v * 3 + 1] + d[2] * n[v * 3 + 2]));
+    }
+    out.assign((size_t)size * size, -1.0f);
+    for (size_t t = 0; t + 2 < b.tri.size(); t += 3) {
+        if (hid[b.tri[t]] || hid[b.tri[t + 1]] || hid[b.tri[t + 2]]) continue;
+        float x[3], y[3], c[3]; bool ok = true;
+        for (int k = 0; k < 3; ++k) {
+            const int u = b.triUv[t + k]; if (u < 0 || (size_t)u * 2 + 1 >= b.uv.size()) { ok = false; break; }
+            x[k] = b.uv[(size_t)u * 2] * size; y[k] = size - b.uv[(size_t)u * 2 + 1] * size; c[k] = lit[b.tri[t + k]];
+        }
+        if (!ok) continue;
+        const float area = (x[1] - x[0]) * (y[2] - y[0]) - (x[2] - x[0]) * (y[1] - y[0]);
+        if (std::fabs(area) < 1e-12f) continue;
+        const int x0 = std::max(0, (int)std::floor(std::min({x[0], x[1], x[2]}))), x1 = std::min(size - 1, (int)std::ceil(std::max({x[0], x[1], x[2]})));
+        const int y0 = std::max(0, (int)std::floor(std::min({y[0], y[1], y[2]}))), y1 = std::min(size - 1, (int)std::ceil(std::max({y[0], y[1], y[2]})));
+        for (int py = y0; py <= y1; ++py) for (int px = x0; px <= x1; ++px) {
+            const float sx = px + 0.5f, sy = py + 0.5f;
+            const float w0 = ((x[1] - sx) * (y[2] - sy) - (x[2] - sx) * (y[1] - sy)) / area, w1 = ((x[2] - sx) * (y[0] - sy) - (x[0] - sx) * (y[2] - sy)) / area, w2 = 1 - w0 - w1;
+            if (w0 < -1e-4f || w1 < -1e-4f || w2 < -1e-4f) continue;
+            out[(size_t)py * size + px] = w0 * c[0] + w1 * c[1] + w2 * c[2];
+        }
+    }
+}
+static void gaussBlur(std::vector<float>& ch, int size, float sigma) {   // image_operations.blurred: 13 taps
+    if (sigma <= 0.01f) return;
+    float k[13]; float sum = 0; for (int i = 0; i < 13; ++i) { const float x = (float)(i - 6); k[i] = std::exp(-x * x / (2 * sigma * sigma)); sum += k[i]; } for (float& v : k) v /= sum;
+    std::vector<float> tmp(ch.size());
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int y = 0; y < size; ++y) for (int x = 0; x < size; ++x) {
+            float a = 0; for (int i = 0; i < 13; ++i) { int xx = x, yy = y; if (pass == 0) xx = std::clamp(x + i - 6, 0, size - 1); else yy = std::clamp(y + i - 6, 0, size - 1); a += k[i] * ch[(size_t)yy * size + xx]; }
+            tmp[(size_t)y * size + x] = a;
+        }
+        ch.swap(tmp);
+    }
+}
+bool sssTexture(const Human::Body& b, const std::vector<WorldLight>& lights, const float amb[3], const float dif[3], float sssR, float sssG,
+                const std::string& diffuseTexture, int size, std::vector<unsigned char>& rgba, int& W, int& H) {
+    // mapSceneLighting: each light's map times its colour, added; scaled to 1 when there's more than one; then the ambience
+    std::vector<float> R((size_t)size * size, 0), G(R.size(), 0), B(R.size(), 0); std::vector<char> painted(R.size(), 0);
+    for (const auto& l : lights) {
+        std::vector<float> m; bakeLight(b, l.pos, size, m);
+        for (size_t i = 0; i < m.size(); ++i) if (m[i] >= 0) { R[i] += m[i] * l.col[0]; G[i] += m[i] * l.col[1]; B[i] += m[i] * l.col[2]; painted[i] = 1; }
+    }
+    if (lights.empty()) { std::vector<float> m; const float far[3] = {0, 0, 0}; bakeLight(b, far, size, m); for (size_t i = 0; i < m.size(); ++i) if (m[i] >= 0) painted[i] = 1; }
+    if (lights.size() > 1) { float mx = 0; for (size_t i = 0; i < R.size(); ++i) mx = std::max({mx, R[i], G[i], B[i]}); if (mx > 0) for (size_t i = 0; i < R.size(); ++i) { R[i] /= mx; G[i] /= mx; B[i] /= mx; } }
+    const float a[3] = {amb[0] * dif[0], amb[1] * dif[1], amb[2] * dif[2]};
+    for (size_t i = 0; i < R.size(); ++i) { R[i] += (1 - R[i]) * a[0]; G[i] += (1 - G[i]) * a[1]; B[i] += (1 - B[i]) * a[2]; }
+    // fixSeams: the empty pixels next to painted ones grow out by sssR pixels (at least one)
+    for (int it = 0; it < std::max(1, (int)std::ceil(sssR)); ++it) {
+        std::vector<char> next = painted;
+        for (int y = 0; y < size; ++y) for (int x = 0; x < size; ++x) {
+            const size_t i = (size_t)y * size + x; if (painted[i]) continue;
+            float sr = 0, sg = 0, sb = 0; int c = 0;
+            for (int dy = -1; dy <= 1; ++dy) for (int dx = -1; dx <= 1; ++dx) { const int qx = x + dx, qy = y + dy; if (qx < 0 || qy < 0 || qx >= size || qy >= size) continue; const size_t q = (size_t)qy * size + qx; if (painted[q]) { sr += R[q]; sg += G[q]; sb += B[q]; ++c; } }
+            if (c) { R[i] = sr / c; G[i] = sg / c; B[i] = sb / c; next[i] = 1; }
+        }
+        painted.swap(next);
+    }
+    // the scattering: red the most, green less, blue as it is (compose([lmapR, lmapG, lmap]))
+    gaussBlur(R, size, sssR); gaussBlur(G, size, sssG);
+    // times the skin's texture, at its size
+    stbi_set_flip_vertically_on_load(0);   // (the viewer leaves it on: here the top row comes first)
+    int tw = 0, th = 0, tn = 0; unsigned char* tex = diffuseTexture.empty() ? nullptr : stbi_load(diffuseTexture.c_str(), &tw, &th, &tn, 4);
+    stbi_set_flip_vertically_on_load(1);
+    W = tex ? tw : size; H = tex ? th : size;
+    rgba.assign((size_t)W * H * 4, 255);
+    for (int y = 0; y < H; ++y) for (int x = 0; x < W; ++x) {
+        const float fx = (x + 0.5f) * size / W - 0.5f, fy = (y + 0.5f) * size / H - 0.5f;   // bilinear
+        const int x0 = std::clamp((int)std::floor(fx), 0, size - 1), y0 = std::clamp((int)std::floor(fy), 0, size - 1), x1 = std::min(x0 + 1, size - 1), y1 = std::min(y0 + 1, size - 1);
+        const float ax = std::clamp(fx - x0, 0.0f, 1.0f), ay = std::clamp(fy - y0, 0.0f, 1.0f);
+        auto bil = [&](const std::vector<float>& c) { return (c[(size_t)y0 * size + x0] * (1 - ax) + c[(size_t)y0 * size + x1] * ax) * (1 - ay) + (c[(size_t)y1 * size + x0] * (1 - ax) + c[(size_t)y1 * size + x1] * ax) * ay; };
+        float v[3] = {bil(R), bil(G), bil(B)};
+        unsigned char* o = &rgba[((size_t)y * W + x) * 4];
+        for (int c = 0; c < 3; ++c) { float t = tex ? tex[((size_t)y * W + x) * 4 + c] / 255.0f : 1.0f; o[c] = (unsigned char)std::clamp(v[c] * t * 255.0f, 0.0f, 255.0f); }
+    }
+    if (tex) stbi_image_free(tex);
     return true;
 }
 

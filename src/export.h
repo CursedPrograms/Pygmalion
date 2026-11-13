@@ -51,6 +51,12 @@ bool saveUvMap(const Human::Body& b, const std::string& path, int size, std::str
 // MakeHuman's Lightmap export (9_export_light, projection.mapLighting): one light at (-10.99, 20, 20) baked into the
 // body's uv layout - each vertex's N.L, filled over the faces, the seams grown by a pixel - size x size
 bool saveLightmap(const Human::Body& b, const std::string& path, int size, std::string& err);
+// MakeHuman's "Lightmap SSS" (mh2opengl.Render): every light baked into the uv layout (projection.mapSceneLighting),
+// the ambience mixed in, red blurred by sssR and green by sssG (light scattered under the skin), times the skin's
+// texture (if it has one). lights: position xyz then colour rgb, in the body's own space. Out: rgba, w x h.
+struct WorldLight { float pos[3], col[3]; };
+bool sssTexture(const Human::Body& b, const std::vector<WorldLight>& lights, const float ambience[3], const float diffuse[3], float sssR, float sssG,
+                const std::string& diffuseTexture, int size, std::vector<unsigned char>& rgba, int& w, int& h);
 // the textures beside the export: copies each part's texture next to path, and returns the parts pointing there
 std::vector<Part> withTexturesBeside(const std::vector<Part>& parts, const std::string& path);
 

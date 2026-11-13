@@ -555,6 +555,34 @@ void focus(const float at[3], float dist, float yaw, float pitch) {
     lk.dist = dist; lk.yaw = yaw; lk.pitch = pitch;
 }
 void setDebugWeights(const std::vector<float>& w) { dbgWeights = w; }
+static GLuint skinOverride = 0;
+void setSkinOverride(const std::vector<unsigned char>& rgba, int w, int h) {
+    if (rgba.empty()) { if (skinOverride) { glDeleteTextures(1, &skinOverride); skinOverride = 0; } return; }
+    if (!skinOverride) glGenTextures(1, &skinOverride);
+    std::vector<unsigned char> flipped((size_t)w * h * 4);
+    for (int y = 0; y < h; ++y) memcpy(&flipped[(size_t)y * w * 4], &rgba[(size_t)(h - 1 - y) * w * 4], (size_t)w * 4);   // (textures are bottom row first)
+    glBindTexture(GL_TEXTURE_2D, skinOverride); glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, flipped.data());
+    glGenerateMipmap_(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+}
+void worldLights(std::vector<std::array<float, 6>>& out) {
+    out.clear();
+    const float cp = std::cos(lk.pitch), sp = std::sin(lk.pitch), cy = std::cos(lk.yaw), sy = std::sin(lk.yaw);
+    const float e[3] = {target[0] + lk.dist * cp * sy, target[1] + lk.dist * sp, target[2] + lk.dist * cp * cy};
+    float f[3] = {target[0] - e[0], target[1] - e[1], target[2] - e[2]};
+    const float fl = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]); if (fl > 0) for (float& v : f) v /= fl;
+    float s[3] = {-f[2], 0, f[0]}; const float sl = std::sqrt(s[0] * s[0] + s[2] * s[2]); if (sl > 0) { s[0] /= sl; s[2] /= sl; }
+    const float u[3] = {s[1] * f[2] - s[2] * f[1], s[2] * f[0] - s[0] * f[2], s[0] * f[1] - s[1] * f[0]};
+    for (const auto& L : lk.lights) {
+        if (!L.on) continue;
+        const float cp2 = std::cos(L.pitch), d[3] = {cp2 * std::sin(L.yaw), std::sin(L.pitch), cp2 * std::cos(L.yaw)};
+        float w[3];
+        if (L.withView) for (int c = 0; c < 3; ++c) w[c] = s[c] * d[0] + u[c] * d[1] - f[c] * d[2];   // view axes to the body's
+        else for (int c = 0; c < 3; ++c) w[c] = d[c];
+        out.push_back({target[0] + w[0] * 31, target[1] + w[1] * 31, target[2] + w[2] * 31, L.col[0] * L.strength, L.col[1] * L.strength, L.col[2] * L.strength});
+    }
+}
 void setDebugShapes(const std::vector<float>& lines, const std::vector<float>& lineRgba, const std::vector<float>& tris, const std::vector<float>& triRgba) {
     dbgLines = lines; dbgLineRgba = lineRgba; dbgTris = tris; dbgTriRgba = triRgba;
 }
@@ -704,7 +732,9 @@ unsigned render(int w, int h, bool hovered) {
         glUseProgram_(prog);
     }
     auto drawMh = [&](const Part& pt) {
-        const MatGL& g = pt.mat;
+        MatGL ov; const bool useOv = &pt == &bodyPart && skinOverride;   // Lightmap SSS: the baked skin, unlit
+        if (useOv) { ov = pt.mat; ov.shadeless = true; ov.dDiffuse = true; ov.diffuse = skinOverride; ov.dNormal = ov.dAo = ov.dAlpha = ov.blend = false; ov.diff[0] = ov.diff[1] = ov.diff[2] = ov.diff[3] = 1; }
+        const MatGL& g = useOv ? ov : pt.mat;
         glUseProgram_(progMh);
         auto U = [&](const char* n) { return glGetUniformLocation_(progMh, n); };
         const GLuint tex[8] = {g.diffuse, g.litsphere, g.normal, g.ao, g.alpha, lit[0], lit[1], lit[2]};

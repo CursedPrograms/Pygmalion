@@ -48,6 +48,10 @@ void viewTarget(float at[3]);                   // the point the view turns roun
 // Utilities > Skeleton Debug: the body coloured by one bone's weights (per body vertex, empty: off), and coloured
 // lines (axes) and triangles (bone planes), 3 floats a point and 4 a colour
 void setDebugWeights(const std::vector<float>& perVertex);
+// MakeHuman's Lightmap SSS: the skin drawn unlit with this picture (top row first; empty: back to its own material)
+void setSkinOverride(const std::vector<unsigned char>& rgba, int w, int h);
+// the scene's lights as points in the body's own space (the ones that turn with the view go where the view has them)
+void worldLights(std::vector<std::array<float, 6>>& out);
 void setDebugShapes(const std::vector<float>& lines, const std::vector<float>& lineRgba, const std::vector<float>& tris, const std::vector<float>& triRgba);
 float bodyHeight();
 unsigned render(int w, int h, bool hovered);

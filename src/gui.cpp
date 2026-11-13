@@ -1272,8 +1272,20 @@ static void toolbar(float x, float y, float w) {
 // ---------- Rendering: Render, Scene, Viewer ----------
 static int renderW = 1920, renderH = 1080, renderSS = 2; static bool renderTransparent = false;
 static std::vector<unsigned char> rendered; static int renderedW = 0, renderedH = 0; static GLuint renderedTex = 0;
+// Rendering > Render's methods (MakeHuman's 4_rendering_opengl): Quick Render, or Advanced Render with Lightmap SSS
+static int renderMethod = 0; static bool renderSSS = false;
 static bool renderNow(int w, int h) {
     Viewer::Look& lk = Viewer::look();
+    const bool sss = renderMethod == 1 && renderSSS;
+    if (sss) {   // the skin's light baked with the scattering, then drawn unlit (mh2opengl.Render)
+        std::vector<std::array<float, 6>> wl; Viewer::worldLights(wl);
+        std::vector<Export::WorldLight> lights; for (const auto& l : wl) lights.push_back({{l[0], l[1], l[2]}, {l[3], l[4], l[5]}});
+        std::vector<unsigned char> px; int tw = 0, th = 0;
+        const auto& m = body.skinMat;
+        Export::sssTexture(body, lights, lk.ambient, m.diffuse, m.sssEnabled ? m.sssRScale : 0, m.sssEnabled ? m.sssGScale : 0, m.diffuseTexture, 1024, px, tw, th);
+        Viewer::setSkinOverride(px, tw, th);
+    }
+    struct Undo { bool on; ~Undo() { if (on) Viewer::setSkinOverride({}, 0, 0); } } undoSss{sss};
     const bool was = lk.transparent;
     lk.transparent = renderTransparent;
     const bool ok = Viewer::renderImage(w, h, prefs.noSampleBuffers ? 1 : renderSS, rendered);
@@ -1517,6 +1529,13 @@ static void renderingLeft(const std::string& t, float lw) {
         groupBox("Quality");
         ImGui::SetNextItemWidth(lw); ImGui::SliderInt("##ss", &renderSS, 1, 4, "Anti-aliasing %dx");
         ImGui::Checkbox("Transparent background", &renderTransparent);
+        groupBox("Rendering methods");
+        ImGui::RadioButton("Quick Render", &renderMethod, 0); ImGui::RadioButton("Advanced Render", &renderMethod, 1);
+        if (renderMethod == 1) {
+            groupBox("Options");
+            ImGui::Checkbox("Lightmap SSS", &renderSSS);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Light scattering under the skin: the scene's lights baked into the skin, red spread wider than green (the skin material's sss scales).");
+        }
         if (ImGui::Button("Render", ImVec2(lw, 34))) {
             if (renderNow(renderW, renderH)) { say("Rendered " + std::to_string(renderW) + " x " + std::to_string(renderH) + " (Rendering > Viewer)"); forcedTask = "Viewer"; }
             else say("That size is too big for this graphics card");
@@ -2247,6 +2266,7 @@ static bool runCommand(const std::string& line0, std::string& err, const std::fu
     }
     else if (cmd == "randomize") randomizeMh(rest.empty() ? rSym : (float)atof(rest.c_str()), rMacro, rHeight, rFace, rBody, randomAmount);   // Modelling > Random, MakeHuman's way (randomize 0.7: the symmetry)
     else if (cmd == "savetarget") { Human::apply(body); std::istringstream ts(rest); std::string f, st; ts >> f >> st; ok = Human::saveTarget(body, f, err, st == "strip"); }   // savetarget file.target [strip]
+    else if (cmd == "renderopt") { if (a == "sss") { renderMethod = v != 0 ? 1 : 0; renderSSS = v != 0; } else if (a == "aa") renderSS = std::clamp((int)v, 1, 4); else { ok = false; err = "renderopt sss 0/1 | aa 1..4"; } }
     else if (cmd == "shaders") Viewer::look().mhShaders = rest != "off";   // MakeHuman's own shaders (on) or Pygmalion's
     else if (cmd == "download") ok = installPack(rest, err);
     else if (cmd == "kindof") out(kindOfProxy(rest));   // what Install would call a .mhclo

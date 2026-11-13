@@ -2258,6 +2258,7 @@ static std::string numbered(const std::string& s) {
     char b[16]; snprintf(b, sizeof b, "%0*d", (int)(e - a), ++counts[key]);
     return s.substr(0, a) + b + s.substr(e);
 }
+static void packsCommand(const std::string& cmd, const std::string& rest, const std::function<void(const std::string&)>& out);
 static bool runCommand(const std::string& line0, std::string& err, const std::function<void(const std::string&)>& out) {
     PROF("script command");
     std::istringstream ls(line0); std::string cmd; ls >> cmd;
@@ -2345,6 +2346,7 @@ static bool runCommand(const std::string& line0, std::string& err, const std::fu
     else if (cmd == "randomize") randomizeMh(rest.empty() ? rSym : (float)atof(rest.c_str()), rMacro, rHeight, rFace, rBody, randomAmount);   // Modelling > Random, MakeHuman's way (randomize 0.7: the symmetry)
     else if (cmd == "savetarget") { Human::apply(body); std::istringstream ts(rest); std::string f, st; ts >> f >> st; ok = Human::saveTarget(body, f, err, st == "strip"); }   // savetarget file.target [strip]
     else if (cmd == "renderopt") { if (a == "sss") { renderMethod = v != 0 ? 1 : 0; renderSSS = v != 0; } else if (a == "aa") renderSS = std::clamp((int)v, 1, 4); else { ok = false; err = "renderopt sss 0/1 | aa 1..4"; } }
+    else if (cmd == "packs" || cmd == "packshots") packsCommand(cmd, rest, out);   // packs: the asset list | packshots <pack>: its pictures
     else if (cmd == "shaders") Viewer::look().mhShaders = rest != "off";   // MakeHuman's own shaders (on) or Pygmalion's
     else if (cmd == "download") ok = installPack(rest, err);
     else if (cmd == "kindof") out(kindOfProxy(rest));   // what Install would call a .mhclo
@@ -2769,6 +2771,12 @@ static void scriptingRight() {
 
 // Download: MakeHuman's asset packs (CC0) from its mirror, into your own data folder
 static const char* MIRROR = "https://mirror1.makehuman.net/asset_packs/";
+static const char* MIRROR_ROOT = "https://mirror1.makehuman.net/";
+static const char* PACK_PAGES = "https://static.makehumancommunity.org/assets/assetpacks/";
+// MakeHuman's asset list (the mirror's functional/assetpacks.json: what the community site's asset database became
+// when the site shut down in October 2026): each pack's kind, description, size, licence and zip
+struct PackInfo { std::string type, descr, comment, url, license; float sizeMb = 0; };
+static std::map<std::string, PackInfo> packInfo;
 static std::vector<std::string> packs; static std::set<std::string> packsHave;
 static std::atomic<bool> dlBusy{false}, dlStop{false}; static std::atomic<int64_t> dlDone{0}, dlTotal{0};
 static std::string dlName, dlResult; static std::mutex dlMtx; static bool dlFinished = false;
@@ -2779,9 +2787,10 @@ static void loadPacksHave() {
 }
 static bool installPack(const std::string& pack, std::string& err) {
 #ifdef _WIN32
-    // the pack's own page names its zip: _cc0, _ccby or _cc-by (the licence: CC-BY packs want their authors credited)
-    std::string zipName = pack + "_cc0.zip";
-    {
+    // the asset list names its zip; else the pack's own page does: _cc0, _ccby or _cc-by (CC-BY packs want their authors credited)
+    std::string zipName = pack + "_cc0.zip", listedUrl;
+    { std::lock_guard<std::mutex> g(dlMtx); auto it = packInfo.find(pack); if (it != packInfo.end() && !it->second.url.empty()) listedUrl = std::string(MIRROR_ROOT) + it->second.url; }
+    if (listedUrl.empty()) {
         const Http::Response r = Http::get(std::string(MIRROR) + pack + "/");
         size_t at = 0;
         while ((at = r.body.find("href=\"", at)) != std::string::npos) {
@@ -2790,7 +2799,7 @@ static bool installPack(const std::string& pack, std::string& err) {
             if (h.size() > 4 && h.compare(h.size() - 4, 4, ".zip") == 0 && h.find('/') == std::string::npos) { zipName = h; break; }
         }
     }
-    const std::string url = std::string(MIRROR) + pack + "/" + zipName;
+    const std::string url = listedUrl.empty() ? std::string(MIRROR) + pack + "/" + zipName : listedUrl;
     const fs::path zip = fs::temp_directory_path() / ("pygmalion-" + pack + ".zip");
     if (!Http::download(url, zip.u8string(), [](int64_t d, int64_t t) { dlDone = d; dlTotal = t; }, &dlStop, err)) { if (err.empty()) err = "Download stopped"; return false; }
     // Windows' own tar opens zips
@@ -2817,12 +2826,55 @@ static void startDownload(const std::string& pack, bool listOnly) {
     std::thread([pack, listOnly] {
         std::string result;
         if (listOnly) {
-            const Http::Response r = Http::get(MIRROR);
-            std::vector<std::string> found;
-            size_t i = 0;
-            while ((i = r.body.find("data-sort=\"*", i)) != std::string::npos) { i += 12; const size_t e = r.body.find('"', i); found.push_back(r.body.substr(i, e - i)); }
+            // the asset list first; the mirror's folder listing if that isn't there
+            std::vector<std::string> found; std::map<std::string, PackInfo> info;
+            {
+                const Http::Response r = Http::get(std::string(MIRROR_ROOT) + "functional/assetpacks.json");
+                Json::Value v; size_t at = 0;
+                if (Json::parse(r.body, at, v) && v.get("packs"))
+                    for (const auto& [key, pk] : v.get("packs")->o) {
+                        const size_t sep = key.find("::");
+                        PackInfo pi; pi.type = sep == std::string::npos ? "" : key.substr(0, sep);
+                        const std::string name = sep == std::string::npos ? key : key.substr(sep + 2);
+                        pi.descr = pk.str("descr"); pi.comment = pk.str("comment"); pi.url = pk.str("url"); pi.license = pk.str("license"); pi.sizeMb = (float)pk.num("size");
+                        found.push_back(name); info[name] = pi;
+                    }
+            }
+            if (found.empty()) {
+                const Http::Response r = Http::get(MIRROR);
+                size_t i = 0;
+                while ((i = r.body.find("data-sort=\"*", i)) != std::string::npos) { i += 12; const size_t e = r.body.find('"', i); found.push_back(r.body.substr(i, e - i)); }
+            }
             std::lock_guard<std::mutex> g(dlMtx);
-            if (found.empty()) result = "Couldn't reach MakeHuman's mirror"; else { packs = found; result = std::to_string(found.size()) + " packs"; }
+            if (found.empty()) result = "Couldn't reach MakeHuman's mirror"; else { packs = found; packInfo = info; result = std::to_string(found.size()) + " packs"; }
+        } else if (pack.rfind("sync:", 0) == 0) {   // Synchronize: every pack named, one after another
+            std::istringstream ns(pack.substr(5)); std::string one; int n = 0, failed = 0;
+            while (std::getline(ns, one, '|')) {
+                if (one.empty() || dlStop) continue;
+                { std::lock_guard<std::mutex> g(dlMtx); dlName = one; }
+                std::string err; if (installPack(one, err)) ++n; else ++failed;
+            }
+            result = "Synchronized: " + std::to_string(n) + " pack(s) installed" + (failed ? ", " + std::to_string(failed) + " failed" : "");
+        } else if (pack.rfind("shots:", 0) == 0) {   // the pack page's pictures, into the screenshots folder
+            const std::string name = pack.substr(6);
+            const fs::path dir = fs::u8path(userDataDir()) / "packs" / "screenshots" / name;
+            std::error_code ec; fs::create_directories(dir, ec);
+            const Http::Response r = Http::get(std::string(PACK_PAGES) + name + ".html");
+            std::set<std::string> imgs; size_t at = 0;
+            while ((at = r.body.find("figure-image\"", at)) != std::string::npos) {
+                const size_t sAt = r.body.find("src=\"", at); if (sAt == std::string::npos) break;
+                const size_t e = r.body.find('"', sAt + 5); const std::string src = r.body.substr(sAt + 5, e - sAt - 5);
+                if (!src.empty() && src.find('/') == std::string::npos) imgs.insert(src);
+                at = e;
+            }
+            int n = 0;
+            for (const auto& im : imgs) {
+                if (dlStop || n >= 24) break;
+                const fs::path out = dir / fs::u8path(im);
+                if (fs::exists(out, ec)) { ++n; continue; }
+                std::string err; if (Http::download(std::string(PACK_PAGES) + im, out.u8string(), [](int64_t d, int64_t t) { dlDone = d; dlTotal = t; }, &dlStop, err)) ++n;
+            }
+            result = imgs.empty() ? "No pictures on " + name + "'s page" : std::to_string(n) + " picture(s) of " + name;
         } else {
             std::string err;
             result = installPack(pack, err) ? "Installed " + pack : err;
@@ -2976,29 +3028,101 @@ static void installLeft(float lw) {
     ImGui::TextDisabled("Dropping a .zip on the window installs it too.");
 }
 
+static void openUrl(const char* u);
+// Utilities > Download (MakeHuman's 8_asset_downloader, now on the asset packs): filter, the list, a pack's details and
+// pictures, Download / View details / Synchronize / Update list
+static char packFilter[64] = ""; static int packType = 0; static std::string packSel; static bool packOnlyMissing = false;
 static void downloadLeft(float lw) {
     installLeft(lw);
-    groupBox("MakeHuman's asset packs");
-    notYet("Clothes, hair, shoes, hats, poses, skins and more from MakeHuman's community (all CC0), into your own data folder.");
+    groupBox("MakeHuman's assets");
+    notYet("Clothes, hair, shoes, hats, poses, skins and more from MakeHuman's community, into your own data folder. "
+           "(MakeHuman's site with its asset database shut down in October 2026: its assets live on as these packs.)");
     if (dlBusy) {
         ImGui::Text("%s", dlName.empty() ? "Getting the list..." : ("Downloading " + dlName).c_str());
         ImGui::ProgressBar(dlTotal > 0 ? (float)dlDone / dlTotal : 0.0f, ImVec2(lw, 0));
         if (ImGui::Button("Stop", ImVec2(lw, 0))) dlStop = true;
         return;
     }
-    if (packs.empty()) { if (ImGui::Button("Get the list", ImVec2(lw, 30))) { loadPacksHave(); dlName.clear(); startDownload("", true); } return; }
-    ImGui::BeginChild("packs");
+    if (packs.empty()) { if (ImGui::Button("Update list", ImVec2(lw, 30))) { loadPacksHave(); dlName.clear(); startDownload("", true); } return; }
     std::lock_guard<std::mutex> g(dlMtx);
+    // Filter assets
+    groupBox("Filter assets");
+    std::vector<std::string> types = {"All"}; for (const auto& [n, pi] : packInfo) if (!pi.type.empty() && std::find(types.begin(), types.end(), pi.type) == types.end()) types.push_back(pi.type);
+    std::sort(types.begin() + 1, types.end());
+    std::vector<const char*> tc; for (const auto& t : types) tc.push_back(t.c_str());
+    packType = std::clamp(packType, 0, (int)tc.size() - 1);
+    ImGui::SetNextItemWidth(lw); ImGui::Combo("##ptype", &packType, tc.data(), (int)tc.size());
+    ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##pfilt", "Title or description", packFilter, sizeof packFilter);
+    ImGui::Checkbox("Only the ones not installed", &packOnlyMissing);
+    std::string q = packFilter; for (auto& c : q) c = (char)tolower((unsigned char)c);
+    std::vector<std::string> shown;
     for (const auto& p : packs) {
-        ImGui::PushID(p.c_str());
-        const bool have = packsHave.count(p) > 0;
-        if (have) ImGui::PushStyleColor(ImGuiCol_Button, col4(C_DEEP));
-        if (ImGui::Button(have ? "Again" : "Get", ImVec2(60, 0))) startDownload(p, false);
-        if (have) ImGui::PopStyleColor();
-        ImGui::SameLine(); ImGui::TextUnformatted(p.c_str());
-        ImGui::PopID();
+        auto it = packInfo.find(p); const PackInfo* pi = it == packInfo.end() ? nullptr : &it->second;
+        if (packType > 0 && (!pi || pi->type != types[packType])) continue;
+        if (packOnlyMissing && packsHave.count(p)) continue;
+        if (!q.empty()) { std::string t = p + " " + (pi ? pi->descr : ""); for (auto& c : t) c = (char)tolower((unsigned char)c); if (t.find(q) == std::string::npos) continue; }
+        shown.push_back(p);
+    }
+    if (ImGui::Button("Update list", ImVec2(lw / 2 - 4, 0))) { loadPacksHave(); dlName.clear(); startDownload("", true); }
+    ImGui::SameLine();
+    if (ImGui::Button("Synchronize", ImVec2(lw / 2 - 4, 0))) {   // every pack in the list that isn't installed
+        std::string names; for (const auto& p : shown) if (!packsHave.count(p)) names += p + "|";
+        if (names.empty()) say("Everything in the list is installed"); else startDownload("sync:" + names, false);
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Download every pack in the list that isn't installed yet.");
+    // the list
+    ImGui::BeginChild("packs", ImVec2(lw, 300), true);
+    if (ImGui::BeginTable("pk", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
+        ImGui::TableSetupColumn("Pack", ImGuiTableColumnFlags_WidthStretch); ImGui::TableSetupColumn("Type"); ImGui::TableSetupColumn("MB"); ImGui::TableSetupColumn("");
+        ImGui::TableHeadersRow();
+        for (const auto& p : shown) {
+            auto it = packInfo.find(p);
+            ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::PushID(p.c_str());
+            if (ImGui::Selectable(p.c_str(), packSel == p, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) packSel = p;
+            ImGui::TableNextColumn(); ImGui::TextDisabled("%s", it == packInfo.end() ? "" : it->second.type.c_str());
+            ImGui::TableNextColumn(); if (it != packInfo.end()) ImGui::TextDisabled("%.1f", it->second.sizeMb);
+            ImGui::TableNextColumn();
+            const bool have = packsHave.count(p) > 0;
+            if (have) ImGui::PushStyleColor(ImGuiCol_Button, col4(C_DEEP));
+            if (ImGui::SmallButton(have ? "Again" : "Get")) startDownload(p, false);
+            if (have) ImGui::PopStyleColor();
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
     }
     ImGui::EndChild();
+    // View details: the pack chosen
+    if (!packSel.empty()) {
+        auto it = packInfo.find(packSel);
+        groupBox(packSel.c_str());
+        if (it != packInfo.end()) {
+            ImGui::PushTextWrapPos(lw);
+            ImGui::TextWrapped("%s", it->second.descr.c_str());
+            if (!it->second.comment.empty()) ImGui::TextDisabled("%s", it->second.comment.c_str());
+            ImGui::TextDisabled("Licence: %s   Size: %.1f MB   %s", it->second.license.c_str(), it->second.sizeMb, packsHave.count(packSel) ? "Installed" : "Not installed");
+            ImGui::PopTextWrapPos();
+        }
+        if (ImGui::Button("Download", ImVec2(lw / 2 - 4, 0))) startDownload(packSel, false);
+        ImGui::SameLine();
+        if (ImGui::Button("View details", ImVec2(lw / 2 - 4, 0))) openUrl((std::string(PACK_PAGES) + packSel + ".html").c_str());
+        if (ImGui::Button("Download screenshots", ImVec2(lw, 0))) startDownload("shots:" + packSel, false);
+        // the pictures already fetched
+        const fs::path dir = fs::u8path(userDataDir()) / "packs" / "screenshots" / packSel;
+        std::error_code ec; int n = 0; const int cols = std::max(1, (int)(lw / 104));
+        for (const auto& e : fs::directory_iterator(dir, ec)) {
+            if (n % cols) ImGui::SameLine();
+            const GLuint t = picture(e.path().u8string());
+            if (t) { ImGui::Image((ImTextureID)(intptr_t)t, ImVec2(96, 96)); tip(e.path().stem().u8string()); }
+            ++n;
+        }
+    }
+}
+
+static void packsCommand(const std::string& cmd, const std::string& rest, const std::function<void(const std::string&)>& out) {
+    startDownload(cmd == "packs" ? std::string() : "shots:" + rest, cmd == "packs");
+    while (dlBusy) SDL_Delay(50);
+    std::lock_guard<std::mutex> g(dlMtx); dlFinished = false; out(dlResult);
+    if (cmd == "packs") { std::map<std::string, int> byType; for (const auto& [n, pi] : packInfo) ++byType[pi.type]; for (const auto& [t, c] : byType) out("  " + (t.empty() ? std::string("(none)") : t) + ": " + std::to_string(c)); }
 }
 
 static void dataView() {

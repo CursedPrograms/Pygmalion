@@ -348,25 +348,25 @@ static void socketOpen() {
     if (!Sock::start(sockCfg.host, sockCfg.port, err)) { say(err); sockCfg.accept = false; }
 }
 static void socketLeft(float lw) {
-    groupBox("Server");
-    if (ImGui::Checkbox("Accept connections", &sockCfg.accept)) { if (sockCfg.accept) socketOpen(); else Sock::stop(); }
-    ImGui::Checkbox("Advanced settings", &sockCfg.advanced);
+    groupBox(T("Server"));
+    if (ImGui::Checkbox(T("Accept connections"), &sockCfg.accept)) { if (sockCfg.accept) socketOpen(); else Sock::stop(); }
+    ImGui::Checkbox(T("Advanced settings"), &sockCfg.advanced);
     if (sockCfg.advanced) {
-        ImGui::TextUnformatted("Host [Default=127.0.0.1]:"); ImGui::SetNextItemWidth(lw); ImGui::InputText("##host", sockHost, sizeof sockHost);
-        ImGui::TextUnformatted("Port [Default=12345]:"); ImGui::SetNextItemWidth(lw); ImGui::InputText("##port", sockPort, sizeof sockPort, ImGuiInputTextFlags_CharsDecimal);
-        if (ImGui::Button("Change host + port", ImVec2(lw, 0))) {
+        ImGui::TextUnformatted(T("Host [Default=127.0.0.1]:")); ImGui::SetNextItemWidth(lw); ImGui::InputText("##host", sockHost, sizeof sockHost);
+        ImGui::TextUnformatted(T("Port [Default=12345]:")); ImGui::SetNextItemWidth(lw); ImGui::InputText("##port", sockPort, sizeof sockPort, ImGuiInputTextFlags_CharsDecimal);
+        if (ImGui::Button(T("Change host + port"), ImVec2(lw, 0))) {
             sockCfg.host = sockHost; sockCfg.port = std::clamp(atoi(sockPort), 1, 65535);
-            say("The host and port must be changed in Blender, too");
+            say(T("The host and port must be changed in Blender, too"));
             sockCfg.accept = true; socketOpen();
         }
     }
-    notYet("Blender's MakeHuman add-on (MPFB) reads the person straight from here: turn this on, then use MPFB's \"Import from MakeHuman\".");
-    groupBox("Messages");
+    notYet(T("Blender's MakeHuman add-on (MPFB) reads the person straight from here: turn this on, then use MPFB's \"Import from MakeHuman\"."));
+    groupBox(T("Messages"));
     ImGui::BeginChild("socklog", ImVec2(lw, 260), true, ImGuiWindowFlags_HorizontalScrollbar);
     for (const auto& m : sockLog) ImGui::TextUnformatted(m.c_str());
     if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4) ImGui::SetScrollHereY(1);
     ImGui::EndChild();
-    if (ImGui::Button("Clear", ImVec2(lw, 0))) sockLog.clear();
+    if (ImGui::Button(T("Clear"), ImVec2(lw, 0))) sockLog.clear();
 }
 // once a frame: the server's own messages into the log, then the calls waiting
 static void socketPoll() {

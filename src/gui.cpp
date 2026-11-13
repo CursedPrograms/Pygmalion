@@ -13,6 +13,7 @@
 #include "viewer.h"
 #include "export.h"
 #include "mhscene.h"
+#include "lang.h"
 #include "profile.h"
 #ifdef _WIN32
 #include "http.h"
@@ -115,13 +116,27 @@ static void applyStyle() {
 
 static bool fileExists(const char* f) { if (FILE* t = fopen(f, "rb")) { fclose(t); return true; } return false; }
 
+static void mergeFont(const char* file, float size, const ImWchar* ranges) {
+    if (!fileExists(file)) return;
+    ImFontConfig merge; merge.MergeMode = true; merge.OversampleH = 1;
+    ImGui::GetIO().Fonts->AddFontFromFileTTF(file, size, &merge, ranges);
+}
 static void loadFont() {
     ImGuiIO& io = ImGui::GetIO();
     const char* f = "C:/Windows/Fonts/segoeui.ttf";
     if (!fileExists(f)) { io.Fonts->AddFontDefault(); return; }
-    static const ImWchar ranges[] = {0x0020, 0x00FF, 0x2013, 0x2026, 0x2190, 0x21FF, 0};
+    // Latin (with its extensions, for Maaya t'aan and Deitsch), Greek, Cyrillic (Russian, Serbian), punctuation, arrows
+    static const ImWchar ranges[] = {0x0020, 0x024F, 0x0300, 0x036F, 0x0370, 0x03FF, 0x0400, 0x052F, 0x1E00, 0x1EFF, 0x2000, 0x206F, 0x20A0, 0x20CF, 0x2190, 0x21FF, 0x2600, 0x26FF, 0};
     auto add = [&](const char* file, float size) { return io.Fonts->AddFontFromFileTTF(file, size, nullptr, ranges); };
     add(f, 16.0f);
+    {   // a CJK font for a CJK language only; else just the language list's own few characters
+        const Lang::Info& L = Lang::current();
+        if (L.font) mergeFont(L.font, 16.0f, L.glyphs == 1 ? io.Fonts->GetGlyphRangesJapanese() : L.glyphs == 2 ? io.Fonts->GetGlyphRangesChineseSimplifiedCommon() : io.Fonts->GetGlyphRangesKorean());
+        static const ImWchar ja[] = {0x65E5, 0x65E5, 0x672C, 0x672C, 0x8A9E, 0x8A9E, 0}, zh[] = {0x4E2D, 0x4E2D, 0x6587, 0x6587, 0}, ko[] = {0xAD6D, 0xAD6D, 0xC5B4, 0xC5B4, 0xD55C, 0xD55C, 0};
+        if (L.glyphs != 1) mergeFont("C:/Windows/Fonts/YuGothM.ttc", 16.0f, ja);
+        if (L.glyphs != 2) mergeFont("C:/Windows/Fonts/msyh.ttc", 16.0f, zh);
+        if (L.glyphs != 3) mergeFont("C:/Windows/Fonts/malgun.ttf", 16.0f, ko);
+    }
     const char* light = fileExists("C:/Windows/Fonts/segoeuil.ttf") ? "C:/Windows/Fonts/segoeuil.ttf" : f;
     Splash::setFonts(add(light, 50.0f), add(f, 13.0f));
 }
@@ -331,7 +346,9 @@ struct Prefs {
     bool noSampleBuffers = false;  // no anti-aliasing in renders
     bool sliderEdit = false;       // a number box beside each slider (MakeHuman's "Slider's edit widget")
     int win[4] = {0, 0, 0, 0};     // the window's place and size, kept when restoreWindow is on
+    std::string language = "en";   // Settings > General > Language
 };
+static bool fontsDirty = false;    // a new language: the fonts made again before the next frame
 static Prefs prefs;
 static std::string shortcutSettings();                                   // (Settings > Shortcuts, kept with the rest)
 static void shortcutSetting(const std::string& id, const std::string& v);
@@ -356,7 +373,7 @@ static void saveSettings() {
       << "\nexcluded=" << [] { std::string s; for (const auto& e : excludedTasks) s += (s.empty() ? "" : "|") + e; return s; }()
       << "\nuserPlugins=" << [] { std::string s; for (const auto& e : activeUserPlugins) s += (s.empty() ? "" : "|") + e; return s; }()
       << shortcutSettings()
-      << "\ntheme=" << theme << "\nwindow=" << prefs.win[0] << " " << prefs.win[1] << " " << prefs.win[2] << " " << prefs.win[3] << "\n";
+      << "\nlanguage=" << prefs.language << "\ntheme=" << theme << "\nwindow=" << prefs.win[0] << " " << prefs.win[1] << " " << prefs.win[2] << " " << prefs.win[3] << "\n";
     o << "socketAccept=" << sockCfg.accept << "\nsocketAdvanced=" << sockCfg.advanced << "\nsocketHost=" << sockCfg.host << "\nsocketPort=" << sockCfg.port << "\n";
 }
 static void loadSettings() {
@@ -380,6 +397,7 @@ static void loadSettings() {
         else if (k == "preload") prefs.preload = b; else if (k == "restoreWindow") prefs.restoreWindow = b; else if (k == "hdpi") prefs.hdpi = b;
         else if (k == "noSampleBuffers") prefs.noSampleBuffers = b; else if (k == "sliderEdit") prefs.sliderEdit = b;
         else if (k == "theme") theme = std::clamp(atoi(v.c_str()), 0, 2);
+        else if (k == "language" && !v.empty()) prefs.language = v;
         else if (k.rfind("shortcut.", 0) == 0) shortcutSetting(k.substr(9), v);
         else if (k == "excluded") { excludedTasks.clear(); std::istringstream es(v); std::string one; while (std::getline(es, one, '|')) if (!one.empty()) excludedTasks.insert(one); excludedAtStart = excludedTasks; }
         else if (k == "userPlugins") { activeUserPlugins.clear(); std::istringstream es(v); std::string one; while (std::getline(es, one, '|')) if (!one.empty()) activeUserPlugins.push_back(one); }
@@ -465,7 +483,7 @@ static void modSlider(int i, float w, const std::string& tabCam) {
     float sw = w;
     if (pic) { ImGui::Image((ImTextureID)(intptr_t)pic, ImVec2(46, 46)); ImGui::SameLine(); sw = w - 53; ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 12); }
     float v = m.value;
-    std::string fmt = m.label;
+    std::string fmt = T(m.label);
     // Measure's sliders say the measurement itself
     const float cm = m.group == "measure" ? Human::measureCm(body, m.fullName()) : -1;
     if (prefs.showValues) fmt += cm >= 0 ? ": " + units(cm) : (m.min() < 0 ? ": %+.2f" : ": %.2f");
@@ -482,13 +500,13 @@ static void modSlider(int i, float w, const std::string& tabCam) {
         ImGui::SetNextItemWidth(sw);
         if (ImGui::InputFloat("##e", &e, 0, 0, "%.6f", ImGuiInputTextFlags_EnterReturnsTrue)) { remember(m.label); Human::setModifier(body, i, std::clamp(e, m.min(), 1.0f)); dirty = true; }
     }
-    if (off) { ImGui::EndDisabled(); if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Wear a topology with genitals first (Geometries > Topologies): MakeHuman's community has them to download."); }
+    if (off) { ImGui::EndDisabled(); if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(T("Wear a topology with genitals first (Geometries > Topologies): MakeHuman's community has them to download.")); }
     ImGui::PopID();
 }
 
 static void groupBox(const char* title) {
     ImGui::Spacing();
-    ImGui::PushStyleColor(ImGuiCol_Text, col4(C_PINK)); ImGui::TextUnformatted(title); ImGui::PopStyleColor();
+    ImGui::PushStyleColor(ImGuiCol_Text, col4(C_PINK)); ImGui::TextUnformatted(T(title)); ImGui::PopStyleColor();
     ImGui::Separator();
 }
 
@@ -546,14 +564,14 @@ static const Skel::Pose* footPose() {
             for (const std::string& sub : {std::string("special_poses/foot/") + n, n}) { want = Human::resolveAsset(sub, folder); if (!want.empty()) break; }
             if (!want.empty()) break;
         }
-        static std::string told; if (want.empty() && told != p.file) { told = p.file; say("No foot pose " + it->second + " for " + p.name); }
+        static std::string told; if (want.empty() && told != p.file) { told = p.file; say(T("No foot pose ") + it->second + " for " + p.name); }
     }
     footPoseFile = want;
     if (want.empty()) return nullptr;
     auto c = cache.find(want);
     if (c == cache.end()) {
         std::vector<Skel::Pose> frames; std::string err;
-        if (!Skel::loadBvh(want, frames, err, nullptr, &rig) || frames.empty()) { say("Foot pose: " + err); cache[want] = Skel::Pose(); }
+        if (!Skel::loadBvh(want, frames, err, nullptr, &rig) || frames.empty()) { say(T("Foot pose: ") + err); cache[want] = Skel::Pose(); }
         else cache[want] = frames[0];
         c = cache.find(want);
     }
@@ -664,17 +682,17 @@ static std::string fileLabel(const std::string& f) {   // the file's own name wi
 }
 static std::vector<std::string> chooserFilter(const std::string& id, const std::vector<std::string>& files, float w) {
     ChooserState& st = chooserStates[id];
-    ImGui::SetNextItemWidth(w); ImGui::InputTextWithHint("##search", "Search", st.search, sizeof st.search);
+    ImGui::SetNextItemWidth(w); ImGui::InputTextWithHint("##search", T("Search"), st.search, sizeof st.search);
     std::set<std::string> all;
     for (const auto& f : files) for (const auto& t : Human::fileTags(f)) all.insert(t);
     static const char* MODES[] = {"OR", "AND", "NOT OR", "NOT AND"};
-    if (!all.empty() && ImGui::TreeNode("tf", "Tag Filter [Mode : %s]", MODES[prefs.tagMode])) {
+    if (!all.empty() && ImGui::TreeNode(T("tf"), "Tag Filter [Mode : %s]", MODES[prefs.tagMode])) {
         for (const auto& t : all) {
             std::string title = t; bool up = true; for (auto& c : title) { if (up) c = (char)toupper((unsigned char)c); up = c == ' '; }
             bool on = st.tags.count(t) > 0;
             if (ImGui::Checkbox(title.c_str(), &on)) { if (on) st.tags.insert(t); else st.tags.erase(t); }
         }
-        if (!st.tags.empty() && ImGui::SmallButton("Clear")) st.tags.clear();
+        if (!st.tags.empty() && ImGui::SmallButton(T("Clear"))) st.tags.clear();
         ImGui::TreePop();
     }
     static const char* SORTS[] = {"By name", "By created", "By modified", "By size"};
@@ -762,14 +780,14 @@ static void putOn(const std::string& f, const std::string& kind) {
 static void geometriesLeft(const std::string& t, float lw) {
     const std::string kind = kindOf(t);
     groupBox(t.c_str());
-    if (assetsDir().empty() && kind != "eyes") { notYet("MakeHuman's clothes, hair, eyebrows, eyelashes, teeth, tongue, topologies and skins are its asset pack (CC0). Put its \"system\" folder's contents in assets-mh beside data."); return; }
+    if (assetsDir().empty() && kind != "eyes") { notYet(T("MakeHuman's clothes, hair, eyebrows, eyelashes, teeth, tongue, topologies and skins are its asset pack (CC0). Put its \"system\" folder's contents in assets-mh beside data.")); return; }
     const auto& files = kind == "proxymeshes" ? library("proxymeshes", ".proxy") : library(kind, ".mhclo");
     std::string picked;
     if (kind == "clothes") {
         // several at once: a click puts one on, a second click takes it off; the worn ones are pink
-        ImGui::Checkbox("Hide faces under clothes", &body.hideUnderClothes);
+        ImGui::Checkbox(T("Hide faces under clothes"), &body.hideUnderClothes);
         if (ImGui::IsItemEdited()) dirty = true;
-        if (ImGui::Button("Take everything off", ImVec2(lw, 0))) { remember("Geometry"); Human::takeOff(body, "clothes"); dirty = true; }
+        if (ImGui::Button(T("Take everything off"), ImVec2(lw, 0))) { remember("Geometry"); Human::takeOff(body, "clothes"); dirty = true; }
         const int cols = std::max(1, (int)(lw / 104));
         int n = 0;
         ImGui::PushID("clothes");
@@ -798,7 +816,7 @@ static void geometriesLeft(const std::string& t, float lw) {
 static void materialsLeft(float lw) {
     // MakeHuman's Skin/Material: the skins, then each worn proxy's own materials (eye colours, hair colours...)
     std::string picked;
-    groupBox("Skin");
+    groupBox(T("Skin"));
     std::vector<std::string> skins = library("skins", ".mhmat");
     if (chooser("skin", skins, body.skinMaterial, picked, lw, true, "Default")) { remember("Skin"); Human::setSkin(body, picked); dirty = true; say(picked.empty() ? "The default skin" : niceName(picked)); }
     for (const auto& p : body.proxies) {
@@ -873,18 +891,18 @@ static void macroSliders(float w) {
         }
     };
     char b[96];
-    macro("Gender", [&](float v) { snprintf(b, sizeof b, "Gender: %.2f%%", v * 100); return std::string(b); }, "Female to male");
-    macro("Age", [&](float) { snprintf(b, sizeof b, "Age: %.1f years", Human::ageYears(body)); return std::string(b); }, "1 to 90 years");
-    macro("Muscle", [&](float v) { snprintf(b, sizeof b, "Muscle: %.2f%%", v * 100); return std::string(b); }, "");
+    macro("Gender", [&](float v) { snprintf(b, sizeof b, T("Gender: %.2f%%"), v * 100); return std::string(b); }, T("Female to male"));
+    macro("Age", [&](float) { snprintf(b, sizeof b, T("Age: %.1f years"), Human::ageYears(body)); return std::string(b); }, T("1 to 90 years"));
+    macro("Muscle", [&](float v) { snprintf(b, sizeof b, T("Muscle: %.2f%%"), v * 100); return std::string(b); }, "");
     macro("Weight", [&](float v) {
-        if (!prefs.realWeight) snprintf(b, sizeof b, "Weight: %.2f%%", 50 + (150 - 50) * v);
-        else { const float kg = Human::weightKg(body); if (prefs.metric) snprintf(b, sizeof b, "Weight: %.1f kg", kg); else snprintf(b, sizeof b, "Weight: %.1f lb", kg * 2.20462f); }
+        if (!prefs.realWeight) snprintf(b, sizeof b, T("Weight: %.2f%%"), 50 + (150 - 50) * v);
+        else { const float kg = Human::weightKg(body); if (prefs.metric) snprintf(b, sizeof b, T("Weight: %.1f kg"), kg); else snprintf(b, sizeof b, T("Weight: %.1f lb"), kg * 2.20462f); }
         return std::string(b); }, "");
     macro("Height", [&](float) { return "Height: " + units(Human::heightCm(body)); }, "");
-    macro("BodyProportions", [&](float v) { snprintf(b, sizeof b, "Proportions: %.2f%%", v * 100); return std::string(b); }, "Uncommon to ideal proportions");
-    macro("African", [&](float v) { snprintf(b, sizeof b, "African: %.2f%%", v * 100); return std::string(b); }, "");
-    macro("Asian", [&](float v) { snprintf(b, sizeof b, "Asian: %.2f%%", v * 100); return std::string(b); }, "");
-    macro("Caucasian", [&](float v) { snprintf(b, sizeof b, "Caucasian: %.2f%%", v * 100); return std::string(b); }, "");
+    macro("BodyProportions", [&](float v) { snprintf(b, sizeof b, T("Proportions: %.2f%%"), v * 100); return std::string(b); }, T("Uncommon to ideal proportions"));
+    macro("African", [&](float v) { snprintf(b, sizeof b, T("African: %.2f%%"), v * 100); return std::string(b); }, "");
+    macro("Asian", [&](float v) { snprintf(b, sizeof b, T("Asian: %.2f%%"), v * 100); return std::string(b); }, "");
+    macro("Caucasian", [&](float v) { snprintf(b, sizeof b, T("Caucasian: %.2f%%"), v * 100); return std::string(b); }, "");
 }
 
 // a modelling tab: the chosen Category's sliders on the left, the Category list on the right
@@ -910,21 +928,21 @@ static void modTabLeft(const Human::Tab& t, float w) {
     }
 }
 static void modTabRight(const Human::Tab& t) {
-    groupBox("Category");
+    groupBox(T("Category"));
     int& c = category[t.name];
-    for (int k = 0; k < (int)t.groups.size(); ++k) if (ImGui::RadioButton(t.groups[k].name.c_str(), &c, k)) lookFor(t.name == "Face" ? "faceCamera" : "");
+    for (int k = 0; k < (int)t.groups.size(); ++k) if (ImGui::RadioButton(T(t.groups[k].name), &c, k)) lookFor(t.name == "Face" ? "faceCamera" : "");
 }
 
 static void statistics() {
-    groupBox("Statistics");
-    ImGui::Text("Height: %s", units(Human::heightCm(body)).c_str());
-    ImGui::Text("Chest: %s", units(Human::measureCm(body, "measure/measure-bust-circ-decr|incr")).c_str());
-    ImGui::Text("Waist: %s", units(Human::measureCm(body, "measure/measure-waist-circ-decr|incr")).c_str());
-    ImGui::Text("Hips: %s", units(Human::measureCm(body, "measure/measure-hips-circ-decr|incr")).c_str());
+    groupBox(T("Statistics"));
+    ImGui::Text(T("Height: %s"), units(Human::heightCm(body)).c_str());
+    ImGui::Text(T("Chest: %s"), units(Human::measureCm(body, "measure/measure-bust-circ-decr|incr")).c_str());
+    ImGui::Text(T("Waist: %s"), units(Human::measureCm(body, "measure/measure-waist-circ-decr|incr")).c_str());
+    ImGui::Text(T("Hips: %s"), units(Human::measureCm(body, "measure/measure-hips-circ-decr|incr")).c_str());
     // MakeHuman's brassiere sizes (its syncBraSizes, its box switched off there): band from the underbust, cup from the difference
     const float bust = Human::measureCm(body, "measure/measure-bust-circ-decr|incr"), under = Human::measureCm(body, "measure/measure-underbust-circ-decr|incr");
     if (under > 0 && bust > 0) {
-        groupBox("Brassiere size");
+        groupBox(T("Brassiere size"));
         static const char* EU[] = {"AA", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"};
         static const char* JP[] = {"AAA", "AA", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"};
         static const char* US[] = {"AA", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"};
@@ -932,11 +950,11 @@ static void statistics() {
         const int mod = (int)under % 5;
         const float band = mod < 2.5f ? under - mod : under - mod + 5;
         int cup = std::clamp((int)std::lround((bust - under - 10) / 2), 0, 11);
-        ImGui::Text("EU: %d%s", (int)band, EU[cup]);
-        ImGui::Text("JP: %d%s", (int)band, JP[std::clamp((int)std::lround((bust - under - 5) / 2.5f), 0, 12)]);
+        ImGui::Text(T("EU: %d%s"), (int)band, EU[cup]);
+        ImGui::Text(T("JP: %d%s"), (int)band, JP[std::clamp((int)std::lround((bust - under - 5) / 2.5f), 0, 12)]);
         float usBand = under * 0.393700787f; usBand = ((int)usBand % 2) ? usBand + 5 : usBand + 4;
-        ImGui::Text("US: %d%s", (int)usBand, US[cup]);
-        ImGui::Text("UK: %d%s", (int)usBand, UK[cup]);
+        ImGui::Text(T("US: %d%s"), (int)usBand, US[cup]);
+        ImGui::Text(T("UK: %d%s"), (int)usBand, UK[cup]);
     }
 }
 
@@ -1007,14 +1025,14 @@ static void randomizeMh(float symmetry, bool macro, bool height, bool face, bool
     body.symmetry = sym;
 }
 static void randomLeft(float w) {
-    groupBox("Randomize settings");
-    ImGui::Checkbox("Macro", &rMacro); ImGui::Checkbox("Face", &rFace); ImGui::Checkbox("Body", &rBody); ImGui::Checkbox("Height", &rHeight);
-    ImGui::SetNextItemWidth(w); ImGui::SliderFloat("##sym", &rSym, 0, 1, "Symmetry: %.2f");
-    ImGui::SetNextItemWidth(w); ImGui::SliderFloat("##amt", &randomAmount, 0.1f, 2.0f, "Amount: %.2f");
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Pygmalion's own: the spread MakeHuman uses, times this (1 is MakeHuman's).");
-    if (ImGui::Button("Randomize", ImVec2(w, 0))) { remember("Randomize"); redo.clear(); randomizeMh(rSym, rMacro, rHeight, rFace, rBody, randomAmount); dirty = true; }
-    groupBox("Restore settings");
-    if (ImGui::Button("Restore to defaults", ImVec2(w, 0))) { rMacro = rFace = rBody = true; rHeight = false; rSym = 0.7f; randomAmount = 1.0f; }
+    groupBox(T("Randomize settings"));
+    ImGui::Checkbox(T("Macro"), &rMacro); ImGui::Checkbox(T("Face"), &rFace); ImGui::Checkbox(T("Body"), &rBody); ImGui::Checkbox(T("Height"), &rHeight);
+    ImGui::SetNextItemWidth(w); ImGui::SliderFloat("##sym", &rSym, 0, 1, T("Symmetry: %.2f"));
+    ImGui::SetNextItemWidth(w); ImGui::SliderFloat("##amt", &randomAmount, 0.1f, 2.0f, T("Amount: %.2f"));
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("Pygmalion's own: the spread MakeHuman uses, times this (1 is MakeHuman's)."));
+    if (ImGui::Button(T("Randomize"), ImVec2(w, 0))) { remember("Randomize"); redo.clear(); randomizeMh(rSym, rMacro, rHeight, rFace, rBody, randomAmount); dirty = true; }
+    groupBox(T("Restore settings"));
+    if (ImGui::Button(T("Restore to defaults"), ImVec2(w, 0))) { rMacro = rFace = rBody = true; rHeight = false; rSym = 0.7f; randomAmount = 1.0f; }
 }
 
 // Files
@@ -1139,46 +1157,46 @@ static bool wantThumb = false; static std::string thumbPath;
 
 static void filesLeft(float w) {
     if (task[CAT_FILES] == "Load") {
-        groupBox("Load a model");
-        ImGui::TextDisabled("Models in %s", homeDir().c_str());
-        if (ImGui::Button("Load from another folder...", ImVec2(w, 0))) {
+        groupBox(T("Load a model"));
+        ImGui::TextDisabled(T("Models in %s"), homeDir().c_str());
+        if (ImGui::Button(T("Load from another folder..."), ImVec2(w, 0))) {
             const std::string p = fileDialog(false, L"MakeHuman model\0*.mhm\0\0", L"mhm", homeDir() + "\\");
             std::string err;
-            if (!p.empty()) { remember("Load"); if (loadModel(p, err)) { dirty = true; say("Loaded " + fs::u8path(p).filename().u8string()); } else say(err); }
+            if (!p.empty()) { remember("Load"); if (loadModel(p, err)) { dirty = true; say(T("Loaded ") + fs::u8path(p).filename().u8string()); } else say(err); }
         }
         {
             std::string picked;
-            if (chooser("models", modelFiles(), "", picked, w, false) && !picked.empty()) { std::string err; remember("Load"); if (loadModel(picked, err)) { dirty = true; say("Loaded " + fs::u8path(picked).filename().u8string()); } else say(err); }
+            if (chooser("models", modelFiles(), "", picked, w, false) && !picked.empty()) { std::string err; remember("Load"); if (loadModel(picked, err)) { dirty = true; say(T("Loaded ") + fs::u8path(picked).filename().u8string()); } else say(err); }
         }
     } else if (task[CAT_FILES] == "Save") {
-        groupBox("Save the model");
-        ImGui::TextUnformatted("File Name:");
+        groupBox(T("Save the model"));
+        ImGui::TextUnformatted(T("File Name:"));
         ImGui::SetNextItemWidth(w); ImGui::InputText("##name", saveName, sizeof saveName);
-        if (ImGui::Button("Save", ImVec2(w, 0))) {
+        if (ImGui::Button(T("Save"), ImVec2(w, 0))) {
             const std::string p = (fs::u8path(homeDir()) / (std::string(saveName) + ".mhm")).u8string();
             std::string err;
-            if (saveModel(p, saveName, err)) { say("Saved " + p + " (MakeHuman opens it too)"); wantThumb = true; thumbPath = fs::u8path(p).replace_extension(".thumb").u8string(); }
+            if (saveModel(p, saveName, err)) { say(T("Saved ") + p + " (MakeHuman opens it too)"); wantThumb = true; thumbPath = fs::u8path(p).replace_extension(".thumb").u8string(); }
             else say(err);
         }
-        if (ImGui::Button("Save as...", ImVec2(w, 0))) {
+        if (ImGui::Button(T("Save as..."), ImVec2(w, 0))) {
             const std::string p = fileDialog(true, L"MakeHuman model\0*.mhm\0\0", L"mhm", homeDir() + "\\" + saveName + ".mhm");
             std::string err;
-            if (!p.empty()) { if (saveModel(p, fs::u8path(p).stem().u8string(), err)) { say("Saved"); wantThumb = true; thumbPath = fs::u8path(p).replace_extension(".thumb").u8string(); } else say(err); }
+            if (!p.empty()) { if (saveModel(p, fs::u8path(p).stem().u8string(), err)) { say(T("Saved")); wantThumb = true; thumbPath = fs::u8path(p).replace_extension(".thumb").u8string(); } else say(err); }
         }
-        ImGui::TextDisabled("A picture of the view is saved beside it (.thumb), as MakeHuman does.");
+        ImGui::TextDisabled(T("A picture of the view is saved beside it (.thumb), as MakeHuman does."));
         // MakeHuman's metadata: the person's name, a uuid, tags (Settings > General > Tags Count of them)
-        groupBox("Human Name");
+        groupBox(T("Human Name"));
         { static char nb[128]; static std::string was = "\x01"; if (was != body.name) { snprintf(nb, sizeof nb, "%s", body.name.c_str()); was = body.name; }
           ImGui::SetNextItemWidth(w); if (ImGui::InputText("##hname", nb, sizeof nb)) { body.name = nb; was = body.name; } }
-        groupBox("UUID");
+        groupBox(T("UUID"));
         ImGui::PushTextWrapPos(w); ImGui::TextDisabled("%s", body.uuid.empty() ? "(none)" : body.uuid.c_str()); ImGui::PopTextWrapPos();
-        if (ImGui::Button("Generate UUID", ImVec2(w, 0))) {
+        if (ImGui::Button(T("Generate UUID"), ImVec2(w, 0))) {
             std::random_device rd; std::mt19937_64 g(((uint64_t)rd() << 32) ^ rd()); std::uniform_int_distribution<int> d(0, 15);
             const char* hex = "0123456789abcdef"; std::string u;
             for (int k = 0; k < 36; ++k) u += (k == 8 || k == 13 || k == 18 || k == 23) ? '-' : k == 14 ? '4' : k == 19 ? hex[8 + d(g) % 4] : hex[d(g)];
             body.uuid = u;
         }
-        groupBox("Tags");
+        groupBox(T("Tags"));
         {
             std::vector<std::string> t = body.tags;   // (sorted when saved, as MakeHuman does)
             t.resize((size_t)prefs.tagCount);
@@ -1191,11 +1209,11 @@ static void filesLeft(float w) {
             }
             if (ch) { body.tags.clear(); for (const auto& x : t) if (!x.empty() && std::find(body.tags.begin(), body.tags.end(), x) == body.tags.end()) body.tags.push_back(x); }
         }
-        if (ImGui::Button("Reset Metadata", ImVec2(w, 0))) { body.name.clear(); body.uuid.clear(); body.tags.clear(); }
+        if (ImGui::Button(T("Reset Metadata"), ImVec2(w, 0))) { body.name.clear(); body.uuid.clear(); body.tags.clear(); }
     } else {
-        groupBox("Export");
+        groupBox(T("Export"));
         ImGui::SetNextItemWidth(w); ImGui::InputText("##ename", saveName, sizeof saveName);
-        if (ImGui::Button("Export...", ImVec2(w, 0))) {
+        if (ImGui::Button(T("Export..."), ImVec2(w, 0))) {
             std::wstring filter = L"File\0*", ext;
             const std::string dot = EXPORT_EXT[exportFormat];
             for (char c : dot) filter += (wchar_t)c;
@@ -1207,34 +1225,34 @@ static void filesLeft(float w) {
         ImGui::PushTextWrapPos(w);
         if (exportFormat == EX_DAE || exportFormat == EX_FBX || exportFormat == EX_OGRE)
             ImGui::TextDisabled(chosen.empty() ? "No skeleton is chosen (Pose/Animate > Skeleton): the mesh goes without one." : "With the %s skeleton and its weights; textures are copied beside it.", chosen.name.c_str());
-        else if (exportFormat == EX_BVH) ImGui::TextDisabled("The %s skeleton and the current pose (or the animation).", chosen.empty() ? "default" : chosen.name.c_str());
-        else if (exportFormat == EX_UV) ImGui::TextDisabled("The body's UV layout as a 2048 x 2048 picture, for painting skins.");
-        else if (exportFormat == EX_LIGHT) ImGui::TextDisabled("MakeHuman's lightmap: one light, from the front left and above, baked into the body's UV layout (1024 x 1024).");
+        else if (exportFormat == EX_BVH) ImGui::TextDisabled(T("The %s skeleton and the current pose (or the animation)."), chosen.empty() ? "default" : chosen.name.c_str());
+        else if (exportFormat == EX_UV) ImGui::TextDisabled(T("The body's UV layout as a 2048 x 2048 picture, for painting skins."));
+        else if (exportFormat == EX_LIGHT) ImGui::TextDisabled(T("MakeHuman's lightmap: one light, from the front left and above, baked into the body's UV layout (1024 x 1024)."));
         ImGui::PopTextWrapPos();
     }
 }
 static void filesRight() {
     if (task[CAT_FILES] != "Export") return;
-    groupBox("Mesh format");
+    groupBox(T("Mesh format"));
     for (int k = 0; k < EX_COUNT; ++k) ImGui::RadioButton(EXPORT_NAMES[k], &exportFormat, k);
-    groupBox("Options");
-    ImGui::TextUnformatted("Scale units");
+    groupBox(T("Options"));
+    ImGui::TextUnformatted(T("Scale units"));
     ImGui::SetNextItemWidth(-1); ImGui::Combo("##units", &exportUnits, UNIT_NAMES, 5);
-    if (exportFormat != EX_UV && exportFormat != EX_LIGHT && exportFormat != EX_GLB) ImGui::Checkbox("Feet on ground", &exportFeet);
-    if (exportFormat == EX_DAE || exportFormat == EX_FBX || exportFormat == EX_OGRE || exportFormat == EX_OBJ || exportFormat == EX_STL) ImGui::Checkbox("In the current pose", &exportPosed);
-    if (exportFormat == EX_DAE || exportFormat == EX_FBX || exportFormat == EX_OBJ || exportFormat == EX_STL) ImGui::Checkbox("Helper geometry", &exportHelpers);
-    if (exportFormat == EX_OBJ) ImGui::Checkbox("Normals", &exportObjNormals);
-    if (exportFormat == EX_FBX) ImGui::Checkbox("Binary FBX", &exportFbxBinary);
-    if (exportFormat == EX_STL) ImGui::Checkbox("Binary STL", &exportStlBinary);
+    if (exportFormat != EX_UV && exportFormat != EX_LIGHT && exportFormat != EX_GLB) ImGui::Checkbox(T("Feet on ground"), &exportFeet);
+    if (exportFormat == EX_DAE || exportFormat == EX_FBX || exportFormat == EX_OGRE || exportFormat == EX_OBJ || exportFormat == EX_STL) ImGui::Checkbox(T("In the current pose"), &exportPosed);
+    if (exportFormat == EX_DAE || exportFormat == EX_FBX || exportFormat == EX_OBJ || exportFormat == EX_STL) ImGui::Checkbox(T("Helper geometry"), &exportHelpers);
+    if (exportFormat == EX_OBJ) ImGui::Checkbox(T("Normals"), &exportObjNormals);
+    if (exportFormat == EX_FBX) ImGui::Checkbox(T("Binary FBX"), &exportFbxBinary);
+    if (exportFormat == EX_STL) ImGui::Checkbox(T("Binary STL"), &exportStlBinary);
     if (exportFormat == EX_DAE) {
-        ImGui::Checkbox("Facial pose-units", &exportFaceUnits);
-        ImGui::TextUnformatted("Orientation");
-        ImGui::RadioButton("Y up, face Z", &exportOrient, 0); ImGui::RadioButton("Y up, face X", &exportOrient, 1);
-        ImGui::RadioButton("Z up, face -Y", &exportOrient, 2); ImGui::RadioButton("Z up, face X", &exportOrient, 3);
-        ImGui::TextUnformatted("Bone orientation");
-        ImGui::RadioButton("Along local Y", &exportBoneAxis, 0); ImGui::RadioButton("Along local X", &exportBoneAxis, 1); ImGui::RadioButton("Local = Global", &exportBoneAxis, 2);
+        ImGui::Checkbox(T("Facial pose-units"), &exportFaceUnits);
+        ImGui::TextUnformatted(T("Orientation"));
+        ImGui::RadioButton(T("Y up, face Z"), &exportOrient, 0); ImGui::RadioButton(T("Y up, face X"), &exportOrient, 1);
+        ImGui::RadioButton(T("Z up, face -Y"), &exportOrient, 2); ImGui::RadioButton(T("Z up, face X"), &exportOrient, 3);
+        ImGui::TextUnformatted(T("Bone orientation"));
+        ImGui::RadioButton(T("Along local Y"), &exportBoneAxis, 0); ImGui::RadioButton(T("Along local X"), &exportBoneAxis, 1); ImGui::RadioButton(T("Local = Global"), &exportBoneAxis, 2);
     }
-    if (exportFormat == EX_BVH) ImGui::Checkbox("The whole animation", &exportAnim);
+    if (exportFormat == EX_BVH) ImGui::Checkbox(T("The whole animation"), &exportAnim);
 }
 
 // ---------- the toolbar: MakeHuman's edit, view, symmetry and camera buttons ----------
@@ -1264,35 +1282,35 @@ static void toolbar(float x, float y, float w) {
         if (ImGui::GetCursorPosX() + bw > ImGui::GetWindowContentRegionMax().x) ImGui::NewLine();
         if (on) ImGui::PushStyleColor(ImGuiCol_Button, col4(C_DEEP)); const bool r = ImGui::SmallButton(l); if (on) ImGui::PopStyleColor(); tip(t); ImGui::SameLine(); return r; };
     auto gap = [] { ImGui::SameLine(0, 12); };
-    if (btn("Undo", "Undo (Ctrl+Z)") && !undo.empty()) { redo.push_back({snapshot(), undo.back().second}); restore(undo.back().first); undo.pop_back(); }
-    if (btn("Redo", "Redo (Ctrl+Y)") && !redo.empty()) { undo.push_back({snapshot(), redo.back().second}); restore(redo.back().first); redo.pop_back(); }
-    if (btn("Reset", "Reset the human to the start")) { remember("Reset"); Human::resetAll(body); Human::defaultGear(body); dirty = true; }
+    if (btn(T("Undo"), T("Undo (Ctrl+Z)")) && !undo.empty()) { redo.push_back({snapshot(), undo.back().second}); restore(undo.back().first); undo.pop_back(); }
+    if (btn(T("Redo"), T("Redo (Ctrl+Y)")) && !redo.empty()) { undo.push_back({snapshot(), redo.back().second}); restore(redo.back().first); redo.pop_back(); }
+    if (btn(T("Reset"), T("Reset the human to the start"))) { remember("Reset"); Human::resetAll(body); Human::defaultGear(body); dirty = true; }
     gap();
     Viewer::Look& lk = Viewer::look();
-    if (btn("Wire", "Show the mesh's lines", lk.wire)) lk.wire = !lk.wire;
-    if (btn("Clay", "Plain grey instead of skin", lk.shading == 1)) lk.shading = lk.shading == 1 ? 0 : 1;
-    if (btn("Floor", "The grid under the feet", lk.grid)) lk.grid = !lk.grid;
-    if (btn("Bones", "Show the skeleton", lk.bones)) { lk.bones = !lk.bones; showBones = lk.bones; }
-    if (btn("Ortho", "Orthographic view (no perspective)", lk.ortho)) lk.ortho = !lk.ortho;
-    if (btn("Smooth", "Smooth the mesh (subdivided once, as MakeHuman's Smooth)", lk.smooth)) { lk.smooth = !lk.smooth; dirty = true; }
+    if (btn(T("Wire"), T("Show the mesh's lines"), lk.wire)) lk.wire = !lk.wire;
+    if (btn(T("Clay"), T("Plain grey instead of skin"), lk.shading == 1)) lk.shading = lk.shading == 1 ? 0 : 1;
+    if (btn(T("Floor"), T("The grid under the feet"), lk.grid)) lk.grid = !lk.grid;
+    if (btn(T("Bones"), T("Show the skeleton"), lk.bones)) { lk.bones = !lk.bones; showBones = lk.bones; }
+    if (btn(T("Ortho"), T("Orthographic view (no perspective)"), lk.ortho)) lk.ortho = !lk.ortho;
+    if (btn(T("Smooth"), T("Smooth the mesh (subdivided once, as MakeHuman's Smooth)"), lk.smooth)) { lk.smooth = !lk.smooth; dirty = true; }
     gap();
-    if (btn("R>L", "Copy the right side's shapes to the left")) symmetry(true);
-    if (btn("L>R", "Copy the left side's shapes to the right")) symmetry(false);
-    if (btn("Symm", "Moving a left slider moves the right one too", body.symmetry)) body.symmetry = !body.symmetry;
+    if (btn(T("R>L"), T("Copy the right side's shapes to the left"))) symmetry(true);
+    if (btn(T("L>R"), T("Copy the left side's shapes to the right"))) symmetry(false);
+    if (btn(T("Symm"), T("Moving a left slider moves the right one too"), body.symmetry)) body.symmetry = !body.symmetry;
     gap();
     const float PI = 3.14159265f;
     { Viewer::Look& L2 = Viewer::look(); bool any = false; for (const auto& sd : L2.sides) if (!sd.file.empty()) any = true;
-      if (btn("Bg", "Background: the picture for this side (Settings > Background)", L2.sidesOn)) { if (any) L2.sidesOn = !L2.sidesOn; else say("No background image is set. To show a background, choose an image from the Background tab in Settings."); } }
-    if (btn("Front", "Front view")) Viewer::focusBody(0, 0.05f);
-    if (btn("Back", "Back view")) Viewer::focusBody(PI, 0.05f);
-    if (btn("Left", "Left side")) Viewer::focusBody(PI / 2, 0.05f);
-    if (btn("Right", "Right side")) Viewer::focusBody(-PI / 2, 0.05f);
-    if (btn("Top", "From above")) Viewer::focusBody(0, 1.5f);
-    if (btn("Under", "From below")) Viewer::focusBody(0, -1.5f);
-    if (btn("Face", "The face, close")) lookFor("faceCamera");
-    if (btn("Home", "The whole person, from the front")) Viewer::focusBody(0, 0.05f);
+      if (btn(T("Bg"), T("Background: the picture for this side (Settings > Background)"), L2.sidesOn)) { if (any) L2.sidesOn = !L2.sidesOn; else say(T("No background image is set. To show a background, choose an image from the Background tab in Settings.")); } }
+    if (btn(T("Front"), T("Front view"))) Viewer::focusBody(0, 0.05f);
+    if (btn(T("Back"), T("Back view"))) Viewer::focusBody(PI, 0.05f);
+    if (btn(T("Left"), T("Left side"))) Viewer::focusBody(PI / 2, 0.05f);
+    if (btn(T("Right"), T("Right side"))) Viewer::focusBody(-PI / 2, 0.05f);
+    if (btn(T("Top"), T("From above"))) Viewer::focusBody(0, 1.5f);
+    if (btn(T("Under"), T("From below"))) Viewer::focusBody(0, -1.5f);
+    if (btn(T("Face"), T("The face, close"))) lookFor("faceCamera");
+    if (btn(T("Home"), T("The whole person, from the front"))) Viewer::focusBody(0, 0.05f);
     gap();
-    if (btn("Shot", "Save a picture of the view (F12)") || wantShot) {
+    if (btn(T("Shot"), T("Save a picture of the view (F12)")) || wantShot) {
         wantShot = false;
         const std::string p = fileDialog(true, L"PNG\0*.png\0\0", L"png", homeDir() + "\\screenshot.png");
         if (!p.empty()) { wantThumb = true; thumbPath = p; }
@@ -1486,7 +1504,7 @@ static bool loadScene(const std::string& path, std::string& err) {
 static int sceneItem = 0;              // 0 the environment, 1.. a light, -1 "Add scene item"
 static void sceneEditorLeft(float lw) {
     Viewer::Look& lk = Viewer::look();
-    groupBox("Scene");
+    groupBox(T("Scene"));
     ImGui::TextUnformatted((sceneFile.empty() ? std::string("<New scene>") : fs::u8path(sceneFile).filename().u8string() + (sceneModified ? "*" : "")).c_str());
     const float hw = lw / 2 - 4;
     auto saveAs = [&] {
@@ -1494,23 +1512,23 @@ static void sceneEditorLeft(float lw) {
                                          (fs::u8path(userDataDir()) / "scenes" / "scene.mhscene").u8string());
         if (!p.empty()) { std::error_code ec; fs::create_directories(fs::u8path(p).parent_path(), ec); say(saveScene(p) ? "Saved " + p : "Couldn't save " + p); }
     };
-    if (ImGui::Button("Save", ImVec2(hw, 0))) { if (sceneFile.empty()) saveAs(); else say(saveScene(sceneFile) ? "Saved " + sceneFile : "Couldn't save " + sceneFile); }
+    if (ImGui::Button(T("Save"), ImVec2(hw, 0))) { if (sceneFile.empty()) saveAs(); else say(saveScene(sceneFile) ? "Saved " + sceneFile : "Couldn't save " + sceneFile); }
     ImGui::SameLine();
-    if (ImGui::Button("Load ...", ImVec2(hw, 0))) {
+    if (ImGui::Button(T("Load ..."), ImVec2(hw, 0))) {
         const std::string p = fileDialog(false, L"MakeHuman scene\0*.mhscene\0Pygmalion scene\0*.pygscene\0All files\0*.*\0\0", L"mhscene", (fs::u8path(userDataDir()) / "scenes").u8string() + "\\");
         if (!p.empty()) { std::string err; say(loadScene(p, err) ? "Scene " + fs::u8path(p).stem().u8string() : err); sceneItem = 0; }
     }
-    if (ImGui::Button("Save As...", ImVec2(hw, 0))) saveAs();
+    if (ImGui::Button(T("Save As..."), ImVec2(hw, 0))) saveAs();
     ImGui::SameLine();
-    if (ImGui::Button("Close", ImVec2(hw, 0))) {   // MakeHuman's reset: its default light and ambience
-        MhScene::Scene s; fromMhScene(s); sceneFile.clear(); sceneModified = false; sceneItem = 0; say("A new scene");
+    if (ImGui::Button(T("Close"), ImVec2(hw, 0))) {   // MakeHuman's reset: its default light and ambience
+        MhScene::Scene s; fromMhScene(s); sceneFile.clear(); sceneModified = false; sceneItem = 0; say(T("A new scene"));
     }
-    groupBox("Items");
+    groupBox(T("Items"));
     ImGui::BeginChild("items", ImVec2(lw, std::min(200.0f, 30.0f + 22.0f * (float)(lk.lights.size() + 1))), true);
-    if (ImGui::Selectable("Environment", sceneItem == 0)) sceneItem = 0;
+    if (ImGui::Selectable(T("Environment"), sceneItem == 0)) sceneItem = 0;
     for (size_t i = 0; i < lk.lights.size(); ++i) if (ImGui::Selectable(("Light " + std::to_string(i)).c_str(), sceneItem == (int)i + 1)) sceneItem = (int)i + 1;
     ImGui::EndChild();
-    if (ImGui::Button("Add...", ImVec2(lw, 0))) sceneItem = -1;
+    if (ImGui::Button(T("Add..."), ImVec2(lw, 0))) sceneItem = -1;
     bool changed = false;
     auto slider3 = [&](const char* id, float* v, float lo, float hi, const char* a, const char* b, const char* c) {
         ImGui::PushID(id); const char* n[] = {a, b, c}; bool ch = false;
@@ -1518,35 +1536,35 @@ static void sceneEditorLeft(float lw) {
         ImGui::PopID(); return ch;
     };
     if (sceneItem == -1) {
-        groupBox("Add scene item");
-        if (lk.lights.size() < 8 && ImGui::Button("Add light", ImVec2(lw, 0))) {
+        groupBox(T("Add scene item"));
+        if (lk.lights.size() < 8 && ImGui::Button(T("Add light"), ImVec2(lw, 0))) {
             Viewer::Look::Light L; L.withView = true; L.strength = 1; lightFromMh(L);   // MakeHuman's new light: (-10.99, 20, 20) at the centre
             lk.lights.push_back(L); sceneItem = (int)lk.lights.size(); changed = true;
         }
-        if (lk.lights.size() >= 8) ImGui::TextDisabled("Eight lights is MakeHuman's limit.");
+        if (lk.lights.size() >= 8) ImGui::TextDisabled(T("Eight lights is MakeHuman's limit."));
     } else if (sceneItem == 0) {
-        groupBox("Environment properties");
-        ImGui::TextUnformatted("Ambience");
+        groupBox(T("Environment properties"));
+        ImGui::TextUnformatted(T("Ambience"));
         changed |= slider3("amb", lk.ambient, 0, 1, "Red %.3f", "Green %.3f", "Blue %.3f");
-        if (!lk.skybox.empty()) ImGui::TextDisabled("Skybox: %s", lk.skybox.c_str());
+        if (!lk.skybox.empty()) ImGui::TextDisabled(T("Skybox: %s"), lk.skybox.c_str());
     } else if (sceneItem <= (int)lk.lights.size()) {
         auto& L = lk.lights[(size_t)sceneItem - 1];
         groupBox(("Light " + std::to_string(sceneItem - 1) + " properties").c_str());
-        ImGui::TextUnformatted("Position");
+        ImGui::TextUnformatted(T("Position"));
         if (slider3("pos", L.pos, -60, 60, "X %.2f", "Y %.2f", "Z %.2f")) { lightFromMh(L); L.withView = true; changed = true; }
-        ImGui::TextUnformatted("Focus");
+        ImGui::TextUnformatted(T("Focus"));
         if (slider3("foc", L.focus, -30, 30, "X %.2f", "Y %.2f", "Z %.2f")) { lightFromMh(L); L.withView = true; changed = true; }
-        ImGui::TextUnformatted("Color");
+        ImGui::TextUnformatted(T("Color"));
         changed |= slider3("col", L.col, 0, 1.5f, "Red %.3f", "Green %.3f", "Blue %.3f");
-        ImGui::TextUnformatted("Specular");
+        ImGui::TextUnformatted(T("Specular"));
         changed |= slider3("spe", L.spec, 0, 1.5f, "Red %.3f", "Green %.3f", "Blue %.3f");
-        ImGui::SetNextItemWidth(lw); changed |= ImGui::SliderFloat("##fov", &L.fov, 1, 180, "Spot angle %.1f");
-        ImGui::SetNextItemWidth(lw); changed |= ImGui::SliderFloat("##att", &L.attenuation, 0, 1, "Attenuation %.3f");
+        ImGui::SetNextItemWidth(lw); changed |= ImGui::SliderFloat("##fov", &L.fov, 1, 180, T("Spot angle %.1f"));
+        ImGui::SetNextItemWidth(lw); changed |= ImGui::SliderFloat("##att", &L.attenuation, 0, 1, T("Attenuation %.3f"));
         bool soft = L.areaLights > 1;
-        if (ImGui::Checkbox("Soft light", &soft)) { L.areaLights = soft ? std::max(L.areaLights, 2) : 1; changed = true; }
-        ImGui::SetNextItemWidth(lw); changed |= ImGui::SliderFloat("##size", &L.areaLightSize, 0, 20, "Softness %.2f");
-        ImGui::SetNextItemWidth(lw); changed |= ImGui::SliderInt("##samp", &L.areaLights, 1, 16, "Samples %d");
-        ImGui::TextDisabled("Spot angle, attenuation and softness are kept in the scene file for renderers; the view lights by position and colour, as MakeHuman's does.");
+        if (ImGui::Checkbox(T("Soft light"), &soft)) { L.areaLights = soft ? std::max(L.areaLights, 2) : 1; changed = true; }
+        ImGui::SetNextItemWidth(lw); changed |= ImGui::SliderFloat("##size", &L.areaLightSize, 0, 20, T("Softness %.2f"));
+        ImGui::SetNextItemWidth(lw); changed |= ImGui::SliderInt("##samp", &L.areaLights, 1, 16, T("Samples %d"));
+        ImGui::TextDisabled(T("Spot angle, attenuation and softness are kept in the scene file for renderers; the view lights by position and colour, as MakeHuman's does."));
         if (ImGui::Button(("Remove light " + std::to_string(sceneItem - 1)).c_str(), ImVec2(lw, 0))) { lk.lights.erase(lk.lights.begin() + (sceneItem - 1)); sceneItem = 0; changed = true; }
     } else sceneItem = 0;
     if (changed) sceneModified = true;
@@ -1555,28 +1573,28 @@ static void sceneEditorLeft(float lw) {
 static void renderingLeft(const std::string& t, float lw) {
     Viewer::Look& lk = Viewer::look();
     if (t == "Render") {
-        groupBox("Resolution");
-        ImGui::SetNextItemWidth(lw); ImGui::SliderInt("##rw", &renderW, 64, 8192, "Width %d px");
-        ImGui::SetNextItemWidth(lw); ImGui::SliderInt("##rh", &renderH, 64, 8192, "Height %d px");
+        groupBox(T("Resolution"));
+        ImGui::SetNextItemWidth(lw); ImGui::SliderInt("##rw", &renderW, 64, 8192, T("Width %d px"));
+        ImGui::SetNextItemWidth(lw); ImGui::SliderInt("##rh", &renderH, 64, 8192, T("Height %d px"));
         const struct { const char* n; int w, h; } presets[] = {{"HD", 1280, 720}, {"Full HD", 1920, 1080}, {"4K", 3840, 2160}, {"Square", 2048, 2048}, {"Portrait", 1080, 1920}};
         for (int k = 0; k < 5; ++k) { if (k) ImGui::SameLine(); if (ImGui::SmallButton(presets[k].n)) { renderW = presets[k].w; renderH = presets[k].h; } }
-        groupBox("Quality");
-        ImGui::SetNextItemWidth(lw); ImGui::SliderInt("##ss", &renderSS, 1, 4, "Anti-aliasing %dx");
-        ImGui::Checkbox("Transparent background", &renderTransparent);
-        groupBox("Rendering methods");
-        ImGui::RadioButton("Quick Render", &renderMethod, 0); ImGui::RadioButton("Advanced Render", &renderMethod, 1);
+        groupBox(T("Quality"));
+        ImGui::SetNextItemWidth(lw); ImGui::SliderInt("##ss", &renderSS, 1, 4, T("Anti-aliasing %dx"));
+        ImGui::Checkbox(T("Transparent background"), &renderTransparent);
+        groupBox(T("Rendering methods"));
+        ImGui::RadioButton(T("Quick Render"), &renderMethod, 0); ImGui::RadioButton(T("Advanced Render"), &renderMethod, 1);
         if (renderMethod == 1) {
-            groupBox("Options");
-            ImGui::Checkbox("Lightmap SSS", &renderSSS);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Light scattering under the skin: the scene's lights baked into the skin, red spread wider than green (the skin material's sss scales).");
+            groupBox(T("Options"));
+            ImGui::Checkbox(T("Lightmap SSS"), &renderSSS);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("Light scattering under the skin: the scene's lights baked into the skin, red spread wider than green (the skin material's sss scales)."));
         }
-        if (ImGui::Button("Render", ImVec2(lw, 34))) {
-            if (renderNow(renderW, renderH)) { say("Rendered " + std::to_string(renderW) + " x " + std::to_string(renderH) + " (Rendering > Viewer)"); forcedTask = "Viewer"; }
-            else say("That size is too big for this graphics card");
+        if (ImGui::Button(T("Render"), ImVec2(lw, 34))) {
+            if (renderNow(renderW, renderH)) { say(T("Rendered ") + std::to_string(renderW) + " x " + std::to_string(renderH) + " (Rendering > Viewer)"); forcedTask = "Viewer"; }
+            else say(T("That size is too big for this graphics card"));
         }
-        ImGui::TextDisabled("The view as it is now, at this size.");
+        ImGui::TextDisabled(T("The view as it is now, at this size."));
     } else if (t == "Scene") {
-        groupBox("Scene");
+        groupBox(T("Scene"));
         int pre = -1;
         ImGui::SetNextItemWidth(lw);
         if (ImGui::BeginCombo("##pre", "A ready-made scene...")) {
@@ -1585,7 +1603,7 @@ static void renderingLeft(const std::string& t, float lw) {
         }
         if (pre >= 0) { scenePreset(pre); sceneFile.clear(); for (auto& L : lk.lights) lightToMh(L); say(std::string(SCENE_PRESETS[pre]) + " scene"); }
         // MakeHuman's scenes: the .mhscene files in its scenes folders (and Pygmalion's own .pygscene)
-        groupBox("Scene files");
+        groupBox(T("Scene files"));
         {
             std::vector<std::string> files = filesIn("scenes", ".mhscene");
             for (const auto& f : filesIn("scenes", ".pygscene")) files.push_back(f);
@@ -1597,56 +1615,56 @@ static void renderingLeft(const std::string& t, float lw) {
             }
             ImGui::EndChild();
         }
-        if (ImGui::Button("Load...", ImVec2(lw / 2 - 4, 0))) {
+        if (ImGui::Button(T("Load..."), ImVec2(lw / 2 - 4, 0))) {
             const std::string p = fileDialog(false, L"Scene (*.mhscene, *.pygscene)\0*.mhscene;*.pygscene\0\0", L"mhscene", homeDir() + "\\");
             if (!p.empty()) { std::string err; say(loadScene(p, err) ? "Scene " + fs::u8path(p).stem().u8string() : err); }
         }
         ImGui::SameLine();
-        if (ImGui::Button("Save...", ImVec2(lw / 2 - 4, 0))) {
+        if (ImGui::Button(T("Save..."), ImVec2(lw / 2 - 4, 0))) {
             const std::string p = fileDialog(true, L"MakeHuman scene\0*.mhscene\0Pygmalion scene (keeps every setting)\0*.pygscene\0\0", L"mhscene", homeDir() + "\\scene.mhscene");
             if (!p.empty()) say(saveScene(p) ? "Saved " + p : "Couldn't save " + p);
         }
-        groupBox("Ambient light");
+        groupBox(T("Ambient light"));
         rgbSliders("amb", lk.ambient, 1.5f, lw);
-        ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##sh", &lk.shine, 0, 1, "Shine %.2f");
-        ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##shn", &lk.shininess, 2, 128, "Sharpness %.0f", ImGuiSliderFlags_Logarithmic);
-        ImGui::Checkbox("Light the skin by the scene", &lk.sceneSkin);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("MakeHuman's skin has its light painted in (a litsphere). On, the scene's lights shade it instead.");
+        ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##sh", &lk.shine, 0, 1, T("Shine %.2f"));
+        ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##shn", &lk.shininess, 2, 128, T("Sharpness %.0f"), ImGuiSliderFlags_Logarithmic);
+        ImGui::Checkbox(T("Light the skin by the scene"), &lk.sceneSkin);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("MakeHuman's skin has its light painted in (a litsphere). On, the scene's lights shade it instead."));
         int drop = -1;
         for (size_t i = 0; i < lk.lights.size(); ++i) {
             auto& L = lk.lights[i];
             ImGui::PushID(100 + (int)i);
             groupBox(("Light " + std::to_string(i + 1)).c_str());
-            ImGui::Checkbox("On", &L.on); ImGui::SameLine(); ImGui::Checkbox("Turns with the view", &L.withView);
+            ImGui::Checkbox(T("On"), &L.on); ImGui::SameLine(); ImGui::Checkbox(T("Turns with the view"), &L.withView);
             float deg[2] = {L.yaw / DEG, L.pitch / DEG};
             ImGui::SetNextItemWidth(lw); if (ImGui::SliderFloat("##y", &deg[0], -180, 180, L.withView ? "From the left/right %.0f deg" : "Round the person %.0f deg")) { L.yaw = deg[0] * DEG; lightToMh(L); sceneModified = true; }
-            ImGui::SetNextItemWidth(lw); if (ImGui::SliderFloat("##p", &deg[1], -89, 89, "Height %.0f deg")) { L.pitch = deg[1] * DEG; lightToMh(L); sceneModified = true; }
-            ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##s", &L.strength, 0, 3, "Strength %.2f");
+            ImGui::SetNextItemWidth(lw); if (ImGui::SliderFloat("##p", &deg[1], -89, 89, T("Height %.0f deg"))) { L.pitch = deg[1] * DEG; lightToMh(L); sceneModified = true; }
+            ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##s", &L.strength, 0, 3, T("Strength %.2f"));
             rgbSliders("lc", L.col, 1.5f, lw);
-            if (ImGui::TreeNode("Highlight colour")) { rgbSliders("ls", L.spec, 1.5f, lw - 20); ImGui::TreePop(); }
-            if (lk.lights.size() > 1 && ImGui::SmallButton("Remove this light")) drop = (int)i;
+            if (ImGui::TreeNode(T("Highlight colour"))) { rgbSliders("ls", L.spec, 1.5f, lw - 20); ImGui::TreePop(); }
+            if (lk.lights.size() > 1 && ImGui::SmallButton(T("Remove this light"))) drop = (int)i;
             ImGui::PopID();
         }
         if (drop >= 0) lk.lights.erase(lk.lights.begin() + drop);
-        if (lk.lights.size() < 8 && ImGui::Button("Add a light", ImVec2(lw, 0))) { lk.lights.push_back(Viewer::Look::Light{true, 45 * DEG, 30 * DEG, {1, 1, 1}, 0.5f, false}); lightToMh(lk.lights.back()); }
-        groupBox("Overall");
-        ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##li", &lk.light, 0.1f, 2.5f, "Brightness %.2f");
+        if (lk.lights.size() < 8 && ImGui::Button(T("Add a light"), ImVec2(lw, 0))) { lk.lights.push_back(Viewer::Look::Light{true, 45 * DEG, 30 * DEG, {1, 1, 1}, 0.5f, false}); lightToMh(lk.lights.back()); }
+        groupBox(T("Overall"));
+        ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##li", &lk.light, 0.1f, 2.5f, T("Brightness %.2f"));
         for (int c = 0; c < 3; ++c) { static const char* n[] = {"Red %.2f", "Green %.2f", "Blue %.2f"}; ImGui::PushID(c); ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##lc", &lk.lightCol[c], 0, 1.5f, n[c]); ImGui::PopID(); }
-        ImGui::TextDisabled("Tint");
-        if (ImGui::SmallButton("White")) lk.lightCol[0] = lk.lightCol[1] = lk.lightCol[2] = 1;
-        ImGui::SameLine(); if (ImGui::SmallButton("Warm")) { lk.lightCol[0] = 1.1f; lk.lightCol[1] = 0.98f; lk.lightCol[2] = 0.85f; }
-        ImGui::SameLine(); if (ImGui::SmallButton("Cold")) { lk.lightCol[0] = 0.88f; lk.lightCol[1] = 0.96f; lk.lightCol[2] = 1.12f; }
-        groupBox("Background");
+        ImGui::TextDisabled(T("Tint"));
+        if (ImGui::SmallButton(T("White"))) lk.lightCol[0] = lk.lightCol[1] = lk.lightCol[2] = 1;
+        ImGui::SameLine(); if (ImGui::SmallButton(T("Warm"))) { lk.lightCol[0] = 1.1f; lk.lightCol[1] = 0.98f; lk.lightCol[2] = 0.85f; }
+        ImGui::SameLine(); if (ImGui::SmallButton(T("Cold"))) { lk.lightCol[0] = 0.88f; lk.lightCol[1] = 0.96f; lk.lightCol[2] = 1.12f; }
+        groupBox(T("Background"));
         for (int c = 0; c < 3; ++c) { static const char* n[] = {"Red %.2f", "Green %.2f", "Blue %.2f"}; ImGui::PushID(10 + c); ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##bg", &lk.bg[c], 0, 1, n[c]); ImGui::PopID(); }
-        groupBox("Camera");
-        ImGui::Checkbox("Orthographic", &lk.ortho);
+        groupBox(T("Camera"));
+        ImGui::Checkbox(T("Orthographic"), &lk.ortho);
     } else {
-        groupBox("Viewer");
-        if (rendered.empty()) { notYet("Nothing rendered yet: Rendering > Render makes a picture, shown here."); return; }
-        ImGui::Text("%d x %d", renderedW, renderedH);
-        groupBox("Tools");
-        if (ImGui::Button("Refresh", ImVec2(lw, 0))) { if (!renderNow(renderedW, renderedH)) say("That size is too big for this graphics card"); }   // the same picture made again, as the person is now
-        if (ImGui::Button("Save As...", ImVec2(lw, 0))) {
+        groupBox(T("Viewer"));
+        if (rendered.empty()) { notYet(T("Nothing rendered yet: Rendering > Render makes a picture, shown here.")); return; }
+        ImGui::Text(T("%d x %d"), renderedW, renderedH);
+        groupBox(T("Tools"));
+        if (ImGui::Button(T("Refresh"), ImVec2(lw, 0))) { if (!renderNow(renderedW, renderedH)) say(T("That size is too big for this graphics card")); }   // the same picture made again, as the person is now
+        if (ImGui::Button(T("Save As..."), ImVec2(lw, 0))) {
             const std::string p = fileDialog(true, L"PNG\0*.png\0\0", L"png", homeDir() + "\\render.png");
             if (!p.empty()) say(saveRendered(p) ? "Saved " + p : "Couldn't save " + p);
         }
@@ -1670,7 +1688,7 @@ static void setSideBackground(int side, const std::string& f) {
 }
 static void backgroundLeft(float lw) {
     Viewer::Look& lk = Viewer::look();
-    groupBox("Side");
+    groupBox(T("Side"));
     for (int k = 0; k < 7; ++k) {
         std::string l = SIDE_NAMES[k]; l[0] = (char)toupper((unsigned char)l[0]);
         if (ImGui::RadioButton(l.c_str(), &bgSidePick, k)) {   // the view turns to that side
@@ -1679,18 +1697,18 @@ static void backgroundLeft(float lw) {
             if (k < 6) Viewer::focusBody(turns[k][0], turns[k][1]);
         }
     }
-    groupBox("Background settings");
-    ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##sop", &lk.sidesOpacity, 0, 100, "Opacity: %.0f%%");
-    ImGui::Checkbox("Move && Resize", &lk.sidesEdit);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Drag in the view to move the picture (right-drag: its size; Shift: finer).");
-    ImGui::Checkbox("Show in foreground", &lk.sidesFront);
-    ImGui::Checkbox("Background (shown)", &lk.sidesOn);
-    groupBox("Background");
+    groupBox(T("Background settings"));
+    ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##sop", &lk.sidesOpacity, 0, 100, T("Opacity: %.0f%%"));
+    ImGui::Checkbox(T("Move && Resize"), &lk.sidesEdit);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("Drag in the view to move the picture (right-drag: its size; Shift: finer)."));
+    ImGui::Checkbox(T("Show in foreground"), &lk.sidesFront);
+    ImGui::Checkbox(T("Background (shown)"), &lk.sidesOn);
+    groupBox(T("Background"));
     {
         std::string picked;
         const std::string cur = lk.sides[bgSidePick].file;
         if (chooser("bg", backgroundFiles(), cur, picked, lw, true, "None")) { setSideBackground(bgSidePick, picked); dirty = true; }
-        if (ImGui::Button("Choose a picture...", ImVec2(lw, 0))) {
+        if (ImGui::Button(T("Choose a picture..."), ImVec2(lw, 0))) {
             const std::string p = fileDialog(false, L"Pictures\0*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff\0\0", L"png", homeDir() + "\\");
             if (!p.empty()) setSideBackground(bgSidePick, p);
         }
@@ -1699,15 +1717,15 @@ static void backgroundLeft(float lw) {
         notYet(("If you want backgrounds to show up here, place the images in " + (fs::u8path(userDataDir()) / "backgrounds").u8string()).c_str());
     }
     // Pygmalion's own: a picture behind the whole view, whatever the side
-    groupBox("Behind the whole view");
-    if (ImGui::Button("Choose a picture...##whole", ImVec2(lw, 0))) {
+    groupBox(T("Behind the whole view"));
+    if (ImGui::Button(T("Choose a picture...##whole"), ImVec2(lw, 0))) {
         const std::string p = fileDialog(false, L"Pictures\0*.png;*.jpg;*.jpeg;*.bmp\0\0", L"png", homeDir() + "\\");
         if (!p.empty()) lk.bgImage = p;
     }
     if (!lk.bgImage.empty()) {
         ImGui::PushTextWrapPos(lw); ImGui::TextDisabled("%s", lk.bgImage.c_str()); ImGui::PopTextWrapPos();
-        ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##bo", &lk.bgOpacity, 0, 1, "Opacity %.2f");
-        if (ImGui::Button("Remove", ImVec2(lw, 0))) lk.bgImage.clear();
+        ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##bo", &lk.bgOpacity, 0, 1, T("Opacity %.2f"));
+        if (ImGui::Button(T("Remove"), ImVec2(lw, 0))) lk.bgImage.clear();
     }
 }
 
@@ -1716,7 +1734,7 @@ static int matPick = 0;   // 0: the skin; k: proxy k-1
 // Utilities > Material Editor: MakeHuman's (plugins/7_material_editor.py) - the object, its shader, the shader's
 // config, custom defines and parameters, every material setting (sliders), a description, and the .mhmat file
 static void materialEditor(float lw) {
-    groupBox("Object");
+    groupBox(T("Object"));
     std::vector<std::string> names = {"Skin"};
     for (const auto& p : body.proxies) names.push_back(niceName(p.file) + " (" + p.kind + ")");
     matPick = std::clamp(matPick, 0, (int)names.size() - 1);
@@ -1725,11 +1743,11 @@ static void materialEditor(float lw) {
     Mat::Material& m = px ? px->mat : body.skinMat;
     bool changed = false;
     // ---- Shader: [None] and MakeHuman's six
-    groupBox("Shader");
-    if (ImGui::RadioButton("[None]", m.shader.empty())) { m.shader.clear(); changed = true; }
+    groupBox(T("Shader"));
+    if (ImGui::RadioButton(T("[None]"), m.shader.empty())) { m.shader.clear(); changed = true; }
     for (int k = 0; k < Mat::SHADER_COUNT; ++k) if (ImGui::RadioButton(Mat::SHADERS[k], m.shader == Mat::SHADERS[k])) { m.shader = Mat::SHADERS[k]; changed = true; }
     // ---- Shader config: on only where the material has the texture and the shader takes it
-    groupBox("Shader config");
+    groupBox(T("Shader config"));
     {
         const auto& defs = m.shader.empty() ? std::vector<std::string>() : Mat::defineables(m.shader);
         auto takes = [&](const char* d, const char* u) {
@@ -1754,7 +1772,7 @@ static void materialEditor(float lw) {
         std::vector<std::string> custom;
         for (const auto& d : Mat::defineables(m.shader)) { bool cfg = false; for (int k = 0; k < 8; ++k) if (d == Mat::CONFIG_DEFINES[k]) cfg = true; if (!cfg) custom.push_back(d); }
         if (!custom.empty()) {
-            groupBox("Custom shader defines");
+            groupBox(T("Custom shader defines"));
             for (const auto& d : custom) {
                 bool on = std::find(m.shaderDefines.begin(), m.shaderDefines.end(), d) != m.shaderDefines.end();
                 if (ImGui::Checkbox(d.c_str(), &on)) {
@@ -1766,7 +1784,7 @@ static void materialEditor(float lw) {
     }
     // ---- Shader parameters: the shader's uniforms the material doesn't set itself
     if (!m.shader.empty()) {
-        groupBox("Shader parameters");
+        groupBox(T("Shader parameters"));
         int shown = 0;
         for (const auto& u : Mat::uniforms(m.shader)) {
             if (Mat::isMaterialParam(u.name)) continue;
@@ -1775,11 +1793,11 @@ static void materialEditor(float lw) {
             if (u.type == "sampler2D") {
                 ImGui::TextUnformatted(u.name.c_str());
                 ImGui::PushTextWrapPos(lw); ImGui::TextDisabled("%s", v.empty() ? "(none)" : fs::u8path(v).filename().u8string().c_str()); ImGui::PopTextWrapPos();
-                if (ImGui::Button("Browse...", ImVec2(lw / 2 - 4, 0))) {
+                if (ImGui::Button(T("Browse..."), ImVec2(lw / 2 - 4, 0))) {
                     const std::string f = fileDialog(false, L"Pictures\0*.png;*.jpg;*.jpeg;*.bmp;*.tga\0\0", L"png", (fs::u8path(dataDir) / "litspheres").u8string() + "\\");
                     if (!f.empty()) { m.setParam(u.name, f); changed = true; }
                 }
-                ImGui::SameLine(); if (ImGui::Button("Clear", ImVec2(lw / 2 - 4, 0))) { m.shaderParams.erase(std::remove_if(m.shaderParams.begin(), m.shaderParams.end(), [&](const auto& q) { return q.first == u.name; }), m.shaderParams.end()); changed = true; }
+                ImGui::SameLine(); if (ImGui::Button(T("Clear"), ImVec2(lw / 2 - 4, 0))) { m.shaderParams.erase(std::remove_if(m.shaderParams.begin(), m.shaderParams.end(), [&](const auto& q) { return q.first == u.name; }), m.shaderParams.end()); changed = true; }
             } else if (u.type == "float" || u.type == "int") {
                 float f = (float)atof(v.c_str());
                 const float hi = std::max(1.0f, std::fabs((float)atof(u.def.c_str())) * 4);
@@ -1792,13 +1810,13 @@ static void materialEditor(float lw) {
                 bool ch = false;
                 for (int k = 0; k < n; ++k) { ImGui::PushID(k); ImGui::SetNextItemWidth(lw); ch |= ImGui::SliderFloat("##c", &x[k], 0, 1, "%.3f"); ImGui::PopID(); }
                 if (ch) { std::string t; for (int k = 0; k < n; ++k) { char b2[32]; snprintf(b2, sizeof b2, "%g", x[k]); t += (k ? " " : "") + std::string(b2); } m.setParam(u.name, t); changed = true; }
-            } else ImGui::TextDisabled("%s (%s)", u.name.c_str(), u.type.c_str());
+            } else ImGui::TextDisabled(T("%s (%s)"), u.name.c_str(), u.type.c_str());
             ImGui::PopID();
         }
-        if (!shown) ImGui::TextDisabled("This shader has none of its own.");
+        if (!shown) ImGui::TextDisabled(T("This shader has none of its own."));
     }
     // ---- Material settings
-    groupBox("Material settings");
+    groupBox(T("Material settings"));
     auto colour = [&](const char* label, float* c, bool enabled) {
         ImGui::BeginDisabled(!enabled); ImGui::TextUnformatted(label);
         ImGui::PushID(label);
@@ -1813,11 +1831,11 @@ static void materialEditor(float lw) {
         ImGui::TextUnformatted(label);
         ImGui::PushID(label);
         ImGui::PushTextWrapPos(lw); ImGui::TextDisabled("%s", t.empty() ? "(none)" : fs::u8path(t).filename().u8string().c_str()); ImGui::PopTextWrapPos();
-        if (ImGui::Button("Browse...", ImVec2(lw / 2 - 4, 0))) {
+        if (ImGui::Button(T("Browse..."), ImVec2(lw / 2 - 4, 0))) {
             const std::string f = fileDialog(false, L"Pictures\0*.png;*.jpg;*.jpeg;*.bmp;*.tga\0\0", L"png", (t.empty() ? homeDir() : fs::u8path(t).parent_path().u8string()) + "\\");
             if (!f.empty()) { t = f; changed = true; }
         }
-        ImGui::SameLine(); if (ImGui::Button("Clear", ImVec2(lw / 2 - 4, 0))) { t.clear(); changed = true; }
+        ImGui::SameLine(); if (ImGui::Button(T("Clear"), ImVec2(lw / 2 - 4, 0))) { t.clear(); changed = true; }
         ImGui::PopID(); ImGui::EndDisabled();
     };
     const bool sh = !m.shader.empty();
@@ -1849,12 +1867,12 @@ static void materialEditor(float lw) {
     image("Ambient Occlusion texture", m.aoMapTexture, sh && (uni("aomapTexture") || def("AOMAP")));
     scalar("##AO map intensity", &m.aoMapIntensity, sh && (uni("aomapTexture") || def("AOMAP")));
     {   // the uv map: one of MakeHuman's uv sets (data/uvs), or the mesh's own
-        ImGui::TextUnformatted("UV map");
+        ImGui::TextUnformatted(T("UV map"));
         std::vector<std::string> uvs = filesIn("uvs", ".mhuv"); for (const auto& f : filesIn("uvs", ".obj")) uvs.push_back(f);
         const std::string cur = m.uvMap.empty() ? "default" : fs::u8path(m.uvMap).stem().u8string();
         ImGui::SetNextItemWidth(lw);
         if (ImGui::BeginCombo("##uv", cur.c_str())) {
-            if (ImGui::Selectable("default", m.uvMap.empty())) { m.uvMap.clear(); changed = true; }
+            if (ImGui::Selectable(T("default"), m.uvMap.empty())) { m.uvMap.clear(); changed = true; }
             for (const auto& f : uvs) { const std::string n = fs::u8path(f).stem().u8string(); if (n == "default") continue; if (ImGui::Selectable(n.c_str(), m.uvMap == f)) { m.uvMap = f; changed = true; } }
             ImGui::EndCombo();
         }
@@ -1862,11 +1880,11 @@ static void materialEditor(float lw) {
     {
         static char nameBuf[128]; static const Mat::Material* nameOf = nullptr;
         if (nameOf != &m) { snprintf(nameBuf, sizeof nameBuf, "%s", m.name.c_str()); nameOf = &m; }
-        ImGui::TextUnformatted("Material name");
+        ImGui::TextUnformatted(T("Material name"));
         ImGui::SetNextItemWidth(lw); if (ImGui::InputText("##mname", nameBuf, sizeof nameBuf)) m.name = nameBuf;
     }
     // ---- Description: the object, its size and its licence
-    groupBox("Description");
+    groupBox(T("Description"));
     {
         size_t nv, nf; int vpf; std::string author = "unknown", license = "unknown", file = "internal", nm;
         if (px) {
@@ -1874,18 +1892,18 @@ static void materialEditor(float lw) {
             author = px->author; license = px->license; file = px->file; nm = px->name;
         } else { nv = body.base.size() / 3; nf = body.faces4.size() / 4; vpf = 4; nm = "base.obj"; }
         ImGui::PushTextWrapPos(lw);
-        ImGui::TextWrapped("%s:\n%zu vertices\n%zu faces\n%d vertices per face.\nAuthor: %s\nLicense: %s\n\nFile: %s", nm.c_str(), nv, nf, vpf, author.c_str(), license.c_str(), file.c_str());
+        ImGui::TextWrapped(T("%s:\n%zu vertices\n%zu faces\n%d vertices per face.\nAuthor: %s\nLicense: %s\n\nFile: %s"), nm.c_str(), nv, nf, vpf, author.c_str(), license.c_str(), file.c_str());
         ImGui::PopTextWrapPos();
     }
     // ---- Material file
-    groupBox("Material file");
-    if (ImGui::Button("Load", ImVec2(lw / 2 - 4, 0))) {
+    groupBox(T("Material file"));
+    if (ImGui::Button(T("Load"), ImVec2(lw / 2 - 4, 0))) {
         const std::string dir = m.filename.empty() ? homeDir() : fs::u8path(m.filename).parent_path().u8string();
         const std::string f = fileDialog(false, L"MakeHuman Material (*.mhmat)\0*.mhmat\0\0", L"mhmat", dir + "\\");
         if (!f.empty()) { remember("Material"); if (px) Human::setProxyMaterial(body, px->kind, f); else Human::setSkin(body, f); dirty = true; }
     }
     ImGui::SameLine();
-    if (ImGui::Button("Save", ImVec2(lw / 2 - 4, 0))) {
+    if (ImGui::Button(T("Save"), ImVec2(lw / 2 - 4, 0))) {
         const std::string dir = m.filename.empty() ? (fs::u8path(userDataDir()) / "skins").u8string() : fs::u8path(m.filename).parent_path().u8string();
         std::string f = fileDialog(true, L"MakeHuman Material (*.mhmat)\0*.mhmat\0\0", L"mhmat", dir + "\\" + (m.name.empty() ? std::string("material") : m.name) + ".mhmat");
         if (!f.empty()) {
@@ -1903,17 +1921,17 @@ static void materialEditor(float lw) {
 
 static char targetFilter[64] = "";
 static void targetsView(float lw) {
-    groupBox("Targets in use");
-    ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##tf", "filter", targetFilter, sizeof targetFilter);
+    groupBox(T("Targets in use"));
+    ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##tf", T("filter"), targetFilter, sizeof targetFilter);
     int n = 0;
     ImGui::BeginChild("tl", ImVec2(lw, 0));
     for (const auto& t : body.targets) {
         if (std::fabs(t.weight) < 1e-4f) continue;
         if (targetFilter[0] && t.path.find(targetFilter) == std::string::npos) continue;
-        ImGui::TextDisabled("%.3f", t.weight); ImGui::SameLine(); ImGui::TextUnformatted(t.path.c_str());
+        ImGui::TextDisabled(T("%.3f"), t.weight); ImGui::SameLine(); ImGui::TextUnformatted(t.path.c_str());
         ++n;
     }
-    if (!n) ImGui::TextDisabled("(none)");
+    if (!n) ImGui::TextDisabled(T("(none)"));
     ImGui::EndChild();
 }
 
@@ -1941,70 +1959,70 @@ static std::vector<float> diffBase;   // "Set Base": the base model's shape (Mak
 static std::string targetsDir() { std::string d; customFolder(d); return d; }
 static void saveFullTarget(const std::string& p) {
     std::string err;
-    if (Human::saveTarget(body, p, err, stripBase)) { say("Saving target to " + p); const int m = Human::addCustomTarget(body, p); if (m >= 0) customFolderOf[m] = ""; }
+    if (Human::saveTarget(body, p, err, stripBase)) { say(T("Saving target to ") + p); const int m = Human::addCustomTarget(body, p); if (m >= 0) customFolderOf[m] = ""; }
     else say(err);
 }
 static void saveTargetsLeft(float lw) {
-    groupBox("Save Model as Target");
-    ImGui::TextUnformatted("Filename:");
+    groupBox(T("Save Model as Target"));
+    ImGui::TextUnformatted(T("Filename:"));
     ImGui::SetNextItemWidth(lw); ImGui::InputText("##tn", targetName, sizeof targetName);
-    ImGui::Checkbox("Strip Base Targets", &stripBase);
-    if (ImGui::Button("Save", ImVec2(lw, 0))) {
+    ImGui::Checkbox(T("Strip Base Targets"), &stripBase);
+    if (ImGui::Button(T("Save"), ImVec2(lw, 0))) {
         std::string n = targetName; if (fs::u8path(n).extension() != ".target") n += ".target";
         saveFullTarget((fs::u8path(targetsDir()) / n).u8string());
     }
-    if (ImGui::Button("Save As ...", ImVec2(lw, 0))) {
+    if (ImGui::Button(T("Save As ..."), ImVec2(lw, 0))) {
         const std::string p = fileDialog(true, L"MakeHuman Target (*.target)\0*.target\0All files (*.*)\0*.*\0\0", L"target", (fs::u8path(targetsDir()) / targetName).u8string());
         if (!p.empty()) {
-            if (fs::u8path(p).extension() != ".target") say("Cannot save target to file: " + p + " - expected a path to a .target file");
+            if (fs::u8path(p).extension() != ".target") say(T("Cannot save target to file: ") + p + " - expected a path to a .target file");
             else { saveFullTarget(p); snprintf(targetName, sizeof targetName, "%s", fs::u8path(p).filename().u8string().c_str()); }
         }
     }
-    groupBox("Save Diff Target");
+    groupBox(T("Save Diff Target"));
     ImGui::SetNextItemWidth(lw); ImGui::InputText("##dn", diffName, sizeof diffName);
-    if (ImGui::Button("Set Base", ImVec2(lw, 0))) { diffBase = body.pos; say("The base model is set: change or load the second model, then Save"); }
+    if (ImGui::Button(T("Set Base"), ImVec2(lw, 0))) { diffBase = body.pos; say(T("The base model is set: change or load the second model, then Save")); }
     auto saveDiff = [&](const std::string& p) {
-        if (diffBase.empty()) { say("No Base Model defined. Press \"Set Base\""); return; }
-        std::string err; if (Human::saveTarget(body, p, err, false, &diffBase)) say("Saving target to " + p); else say(err);
+        if (diffBase.empty()) { say(T("No Base Model defined. Press \"Set Base\"")); return; }
+        std::string err; if (Human::saveTarget(body, p, err, false, &diffBase)) say(T("Saving target to ") + p); else say(err);
     };
-    if (ImGui::Button("Save##diff", ImVec2(lw, 0))) { std::string n = diffName; if (fs::u8path(n).extension() != ".target") n += ".target"; saveDiff((fs::u8path(targetsDir()) / n).u8string()); }
-    if (ImGui::Button("Save As ...##diff", ImVec2(lw, 0))) {
+    if (ImGui::Button(T("Save##diff"), ImVec2(lw, 0))) { std::string n = diffName; if (fs::u8path(n).extension() != ".target") n += ".target"; saveDiff((fs::u8path(targetsDir()) / n).u8string()); }
+    if (ImGui::Button(T("Save As ...##diff"), ImVec2(lw, 0))) {
         const std::string p = fileDialog(true, L"MakeHuman Target (*.target)\0*.target\0All files (*.*)\0*.*\0\0", L"target", (fs::u8path(targetsDir()) / diffName).u8string());
         if (!p.empty()) saveDiff(p);
     }
-    if (ImGui::Button("Clear Cache", ImVec2(lw, 0))) { diffBase.clear(); say("The base model is forgotten"); }
-    groupBox("Info");
-    notYet("Save target saves the current state of all targets applied to the default start up mesh as one global target. The strip option will "
+    if (ImGui::Button(T("Clear Cache"), ImVec2(lw, 0))) { diffBase.clear(); say(T("The base model is forgotten")); }
+    groupBox(T("Info"));
+    notYet(T("Save target saves the current state of all targets applied to the default start up mesh as one global target. The strip option will "
            "remove all targets that constitute the default mesh from the global target. This is mandatory when reusing the global target inside "
            "MakeHuman (or Pygmalion: it appears in Modelling > Custom). For usage on the base mesh in MakeTarget uncheck the strip option.\n\n"
            "Save diff target saves the data difference of two models as a global target. First create or load a model and press \"Set Base\". "
            "Then create or load a second model. Pressing \"Save\" will create a global target, which can transform the first model into the "
            "second one. The resulting global diff target is absolutely specific to the first model and will not work on any other model.\n\n"
-           "The default license of the saved global targets is AGPL3.");
+           "The default license of the saved global targets is AGPL3."));
 }
 
 static void customLeft(float lw) {
-    groupBox("Custom targets");
+    groupBox(T("Custom targets"));
     std::string dir; customFolder(dir);
-    if (ImGui::Button("Rescan targets' folder", ImVec2(lw / 2 - 4, 0))) {
+    if (ImGui::Button(T("Rescan targets' folder"), ImVec2(lw / 2 - 4, 0))) {
         // Keep Values: the sliders keep what they were set to, else every custom one goes back to 0
         if (!keepCustomValues) for (auto& [m, f] : customFolderOf) Human::setModifier(body, m, 0);
         loadCustomTargets(); dirty = true;
     }
     ImGui::SameLine();
 #ifdef _WIN32
-    if (ImGui::Button("Open the folder", ImVec2(lw / 2 - 4, 0))) ShellExecuteW(nullptr, L"open", fs::u8path(dir).wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    if (ImGui::Button(T("Open the folder"), ImVec2(lw / 2 - 4, 0))) ShellExecuteW(nullptr, L"open", fs::u8path(dir).wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 #endif
-    ImGui::Checkbox("Keep Values", &keepCustomValues);
+    ImGui::Checkbox(T("Keep Values"), &keepCustomValues);
     // the folders that have targets, as MakeHuman's folder buttons
     std::map<std::string, int> folders;
     for (const auto& [m, f] : customFolderOf) ++folders[f];
     if (folders.size() > 1) {
-        groupBox("Folders");
+        groupBox(T("Folders"));
         if (!folders.count(customShown)) customShown = folders.begin()->first;
         for (const auto& [f, c] : folders) if (ImGui::RadioButton((f.empty() ? std::string("Targets") : f).c_str(), customShown == f)) customShown = f;
     } else if (!folders.empty()) customShown = folders.begin()->first;
-    groupBox("Targets");
+    groupBox(T("Targets"));
     int n = 0;
     for (const auto& [m, f] : customFolderOf) if (f == customShown && m < (int)body.mods.size()) { modSlider(m, lw, "frontView"); ++n; }
     if (!n) notYet(("Put your own .target files (from Blender's MakeTarget, or Utilities > Save targets) in " + dir + " and they appear here as sliders.").c_str());
@@ -2158,7 +2176,7 @@ static void massStep() {
     else exportTo((fs::u8path(homeDir()) / (std::string(nb) + EXPORT_EXT[mass.format])).u8string(), mass.format, err);
     if (!err.empty()) say(err);
     ++massDone; --massLeft;
-    if (!massLeft) { restore(massStart); say("Done! Made " + std::to_string(massDone) + " in " + homeDir()); }
+    if (!massLeft) { restore(massStart); say(T("Done! Made ") + std::to_string(massDone) + " in " + homeDir()); }
     dirty = true;
 }
 static void massTable3(const char* title, const char* first, std::map<std::string, std::array<bool, 3>>& t, float lw) {
@@ -2199,23 +2217,23 @@ static void massLeftPanel(float lw) {
         ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##hi", hi, 0, 1, (std::string("Maximum ") + label + " %.2f").c_str());
         ImGui::PopID(); ImGui::EndDisabled();
     };
-    groupBox("Macro settings");
+    groupBox(T("Macro settings"));
     range("age", &mass.randAge, &mass.ageMin, &mass.ageMax);
     range("weight", &mass.randWeight, &mass.weightMin, &mass.weightMax);
     range("height", &mass.randHeight, &mass.heightMin, &mass.heightMax);
     range("muscle", &mass.randMuscle, &mass.muscleMin, &mass.muscleMax);
-    ImGui::Checkbox("Randomize gender", &mass.gender); ImGui::Checkbox("Absolute gender", &mass.genderAbs);
-    ImGui::Checkbox("Randomize ethnicity", &mass.ethnicity); ImGui::Checkbox("Absolute ethnicity", &mass.ethnicityAbs);
-    groupBox("Modeling settings");
+    ImGui::Checkbox(T("Randomize gender"), &mass.gender); ImGui::Checkbox(T("Absolute gender"), &mass.genderAbs);
+    ImGui::Checkbox(T("Randomize ethnicity"), &mass.ethnicity); ImGui::Checkbox(T("Absolute ethnicity"), &mass.ethnicityAbs);
+    groupBox(T("Modeling settings"));
     for (auto& [g, on] : mass.groups) ImGui::Checkbox(("Randomize " + (g == "breast" ? std::string("breasts (if fem)") : g)).c_str(), &on);
-    ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##md", &mass.maxdev, 0, 1, "Max deviation from default %.2f");
-    groupBox("Randomize clothes and body parts");
-    ImGui::Checkbox("Randomize hair", &mass.hair); ImGui::Checkbox("Randomize eyelashes", &mass.eyelashes); ImGui::Checkbox("Randomize eyebrows", &mass.eyebrows);
-    ImGui::Checkbox("Randomize full body clothes", &mass.fullClothes); ImGui::Checkbox("Randomize upper body clothes", &mass.upperClothes);
-    ImGui::Checkbox("Randomize lower body clothes", &mass.lowerClothes); ImGui::Checkbox("Randomize shoes", &mass.shoes);
-    groupBox("Randomize materials");
-    ImGui::Checkbox("Randomize skins", &mass.skins);
-    groupBox("Allowed");
+    ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##md", &mass.maxdev, 0, 1, T("Max deviation from default %.2f"));
+    groupBox(T("Randomize clothes and body parts"));
+    ImGui::Checkbox(T("Randomize hair"), &mass.hair); ImGui::Checkbox(T("Randomize eyelashes"), &mass.eyelashes); ImGui::Checkbox(T("Randomize eyebrows"), &mass.eyebrows);
+    ImGui::Checkbox(T("Randomize full body clothes"), &mass.fullClothes); ImGui::Checkbox(T("Randomize upper body clothes"), &mass.upperClothes);
+    ImGui::Checkbox(T("Randomize lower body clothes"), &mass.lowerClothes); ImGui::Checkbox(T("Randomize shoes"), &mass.shoes);
+    groupBox(T("Randomize materials"));
+    ImGui::Checkbox(T("Randomize skins"), &mass.skins);
+    groupBox(T("Allowed"));
     massSkinTable("Allowed female skins", mass.femaleSkins, lw);
     massSkinTable("Allowed male skins", mass.maleSkins, lw);
     massTable3("Allowed hair", "Hair", mass.hairT, lw);
@@ -2225,18 +2243,18 @@ static void massLeftPanel(float lw) {
     massTable3("Allowed upper body clothes", "Clothes", mass.upperT, lw);
     massTable3("Allowed lower body clothes", "Clothes", mass.lowerT, lw);
     massTable3("Allowed shoes", "Clothes", mass.shoesT, lw);
-    groupBox("Export settings");
-    ImGui::TextUnformatted("File name base"); ImGui::SetNextItemWidth(lw); ImGui::InputText("##fnb", mass.base, sizeof mass.base);
-    ImGui::TextUnformatted("File format");
+    groupBox(T("Export settings"));
+    ImGui::TextUnformatted(T("File name base")); ImGui::SetNextItemWidth(lw); ImGui::InputText("##fnb", mass.base, sizeof mass.base);
+    ImGui::TextUnformatted(T("File format"));
     std::vector<const char*> f = {"MHM"}; for (int k = 0; k < EX_COUNT; ++k) f.push_back(EXPORT_NAMES[k]);
     int sel = mass.format + 1; ImGui::SetNextItemWidth(lw); if (ImGui::Combo("##mf", &sel, f.data(), (int)f.size())) mass.format = sel - 1;
-    ImGui::TextDisabled("Files end up in %s, named with the file name base plus four digits plus file extension.", homeDir().c_str());
-    groupBox("Produce");
-    ImGui::SetNextItemWidth(lw); ImGui::SliderInt("##mc", &mass.count, 1, 500, "Number of characters: %d");
+    ImGui::TextDisabled(T("Files end up in %s, named with the file name base plus four digits plus file extension."), homeDir().c_str());
+    groupBox(T("Produce"));
+    ImGui::SetNextItemWidth(lw); ImGui::SliderInt("##mc", &mass.count, 1, 500, T("Number of characters: %d"));
     if (massLeft > 0) {
         ImGui::ProgressBar((float)massDone / std::max(1, massTotal), ImVec2(lw, 0), (std::to_string(massDone) + " / " + std::to_string(massTotal)).c_str());
-        if (ImGui::Button("Stop", ImVec2(lw, 0))) { massLeft = 0; restore(massStart); dirty = true; }
-    } else if (ImGui::Button("Produce", ImVec2(lw, 34))) { remember("Mass produce"); massStart = snapshot(); massLeft = massTotal = mass.count; massDone = 0; }
+        if (ImGui::Button(T("Stop"), ImVec2(lw, 0))) { massLeft = 0; restore(massStart); dirty = true; }
+    } else if (ImGui::Button(T("Produce"), ImVec2(lw, 34))) { remember("Mass produce"); massStart = snapshot(); massLeft = massTotal = mass.count; massDone = 0; }
 }
 
 static bool installPack(const std::string& pack, std::string& err);
@@ -2347,6 +2365,7 @@ static bool runCommand(const std::string& line0, std::string& err, const std::fu
     else if (cmd == "savetarget") { Human::apply(body); std::istringstream ts(rest); std::string f, st; ts >> f >> st; ok = Human::saveTarget(body, f, err, st == "strip"); }   // savetarget file.target [strip]
     else if (cmd == "renderopt") { if (a == "sss") { renderMethod = v != 0 ? 1 : 0; renderSSS = v != 0; } else if (a == "aa") renderSS = std::clamp((int)v, 1, 4); else { ok = false; err = "renderopt sss 0/1 | aa 1..4"; } }
     else if (cmd == "packs" || cmd == "packshots") packsCommand(cmd, rest, out);   // packs: the asset list | packshots <pack>: its pictures
+    else if (cmd == "language") { prefs.language = rest.empty() ? "en" : rest; Lang::load(dataDir, prefs.language); fontsDirty = true; }   // language de (en, ja, zh, es, ko, fr, de, ru, sr, af, yua, pdc...)
     else if (cmd == "shaders") Viewer::look().mhShaders = rest != "off";   // MakeHuman's own shaders (on) or Pygmalion's
     else if (cmd == "download") ok = installPack(rest, err);
     else if (cmd == "kindof") out(kindOfProxy(rest));   // what Install would call a .mhclo
@@ -2435,11 +2454,11 @@ static std::string pluginFile(const std::string& name) {
 }
 static void runPlugin(const std::string& name) {
     std::ifstream in(fs::u8path(pluginFile(name))); std::ostringstream ss; ss << in.rdbuf();
-    runScript(ss.str()); say("Plugin " + name + " ran");
+    runScript(ss.str()); say(T("Plugin ") + name + " ran");
 }
 static void pluginsLeft(float lw) {
-    groupBox("Plugins");
-    ImGui::TextWrapped("Untick a part to leave it out; it's gone after a restart (MakeHuman's plugins work the same way).");
+    groupBox(T("Plugins"));
+    ImGui::TextWrapped(T("Untick a part to leave it out; it's gone after a restart (MakeHuman's plugins work the same way)."));
     for (int c = 0; c < CAT_COUNT; ++c) {
         if (!ImGui::TreeNode(CAT_NAMES[c])) continue;
         for (const auto& t : tasksOfAll(c)) {
@@ -2452,33 +2471,33 @@ static void pluginsLeft(float lw) {
     }
 }
 static void userPluginsLeft(float lw) {
-    groupBox("User Plugins");
+    groupBox(T("User Plugins"));
     const auto list = userPlugins();
-    if (list.empty()) ImGui::TextDisabled("None in %s", pluginsDir().c_str());
+    if (list.empty()) ImGui::TextDisabled(T("None in %s"), pluginsDir().c_str());
     for (const auto& n : list) {
         bool on = std::find(activeUserPlugins.begin(), activeUserPlugins.end(), n) != activeUserPlugins.end();
         if (ImGui::Checkbox(n.c_str(), &on)) { if (on) activeUserPlugins.push_back(n); else activeUserPlugins.erase(std::remove(activeUserPlugins.begin(), activeUserPlugins.end(), n), activeUserPlugins.end()); }
     }
     ImGui::Spacing();
-    if (ImGui::Button("Install Plugin File", ImVec2(lw, 0))) {
+    if (ImGui::Button(T("Install Plugin File"), ImVec2(lw, 0))) {
         const std::string f = fileDialog(false, L"Pygmalion script (*.pygscript)\0*.pygscript\0All files\0*.*\0\0", L"pygscript", homeDir() + "\\");
         if (!f.empty()) {
             std::error_code ec; fs::copy_file(fs::u8path(f), fs::u8path(pluginsDir()) / fs::u8path(f).filename(), fs::copy_options::overwrite_existing, ec);
             say(ec ? "Failed to copy " + f + " to the user plugins folder" : "The plugin copied successfully. To activate, check the plugin in the list and press \"Activate Plugins\" or restart Pygmalion.");
         }
     }
-    if (ImGui::Button("Install Zipped Plugin", ImVec2(lw, 0))) {
+    if (ImGui::Button(T("Install Zipped Plugin"), ImVec2(lw, 0))) {
         const std::string f = fileDialog(false, L"Zip files\0*.zip\0All files\0*.*\0\0", L"zip", homeDir() + "\\");
         if (!f.empty()) say(runQuiet(L"tar.exe -xf \"" + fs::u8path(f).wstring() + L"\" -C \"" + fs::u8path(pluginsDir()).wstring() + L"\"")
                             ? "The plugin copied successfully. To activate, check the plugin in the list and press \"Activate Plugins\" or restart Pygmalion." : "Not a zip file " + f);
     }
-    if (ImGui::Button("Reload Plugins Folder", ImVec2(lw, 0))) say("Plugins folder read again");
-    if (ImGui::Button("Activate Plugins", ImVec2(lw, 0))) for (const auto& n : activeUserPlugins) runPlugin(n);
-    if (ImGui::Button("Open the plugins folder", ImVec2(lw, 0))) ShellExecuteW(nullptr, L"open", fs::u8path(pluginsDir()).wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-    groupBox("Info");
-    ImGui::TextWrapped("Install new plugins by either copying to the user plugins folder or using the built in installer. A plugin is a Pygmalion script "
+    if (ImGui::Button(T("Reload Plugins Folder"), ImVec2(lw, 0))) say(T("Plugins folder read again"));
+    if (ImGui::Button(T("Activate Plugins"), ImVec2(lw, 0))) for (const auto& n : activeUserPlugins) runPlugin(n);
+    if (ImGui::Button(T("Open the plugins folder"), ImVec2(lw, 0))) ShellExecuteW(nullptr, L"open", fs::u8path(pluginsDir()).wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    groupBox(T("Info"));
+    ImGui::TextWrapped(T("Install new plugins by either copying to the user plugins folder or using the built in installer. A plugin is a Pygmalion script "
                        "(.pygscript: the Scripting tab's commands, one a line), or a folder with a main.pygscript in it.\n\nTo activate a plugin it must be "
-                       "checked in the list. Then click the \"Activate Plugins\" button or restart Pygmalion. MakeHuman's own Python plugins can't run here.");
+                       "checked in the list. Then click the \"Activate Plugins\" button or restart Pygmalion. MakeHuman's own Python plugins can't run here."));
 }
 
 // ---------- Utilities > Profile (MakeHuman's 7_profile): the main steps' timings, sortable, saved as text ----------
@@ -2523,12 +2542,12 @@ static void skeletonDebugUpdate() {
 }
 static void skeletonDebugLeft(float lw) {
     const Skel::Skeleton& s = chosen.empty() ? rig : chosen;
-    groupBox("Display");
+    groupBox(T("Display"));
     bool ch = false;
-    ch |= ImGui::Checkbox("Show bone weights", &dbgWeightsOn); ch |= ImGui::Checkbox("Show bone axis", &dbgAxis);
-    ch |= ImGui::Checkbox("Show bones", &dbgBones); ch |= ImGui::Checkbox("Show bone planes", &dbgPlanes);
-    ImGui::TextDisabled("%s%s", s.name.empty() ? "The default skeleton" : s.name.c_str(), chosen.empty() ? " (none chosen: the default one)" : "");
-    groupBox("Bones");
+    ch |= ImGui::Checkbox(T("Show bone weights"), &dbgWeightsOn); ch |= ImGui::Checkbox(T("Show bone axis"), &dbgAxis);
+    ch |= ImGui::Checkbox(T("Show bones"), &dbgBones); ch |= ImGui::Checkbox(T("Show bone planes"), &dbgPlanes);
+    ImGui::TextDisabled(T("%s%s"), s.name.empty() ? "The default skeleton" : s.name.c_str(), chosen.empty() ? " (none chosen: the default one)" : "");
+    groupBox(T("Bones"));
     ImGui::BeginChild("bones", ImVec2(lw, 420), true);
     for (int i = 0; i < (int)s.bones.size(); ++i) if (ImGui::Selectable(s.bones[i].name.c_str(), dbgBone == i)) { dbgBone = i; ch = true; }
     ImGui::EndChild();
@@ -2536,24 +2555,24 @@ static void skeletonDebugLeft(float lw) {
 }
 static void profileLeft(float lw) {
     static const char* KEYS[] = {"Total calls", "Total time", "Total per call", "Cumulative time", "Cumulative per call", "Function"};
-    groupBox("Sort");
+    groupBox(T("Sort"));
     for (int k = 0; k < 6; ++k) ImGui::RadioButton(KEYS[k], &profKey, k);
-    groupBox("Sort ");
-    ImGui::RadioButton("Descending", &profDir, 0); ImGui::RadioButton("Ascending", &profDir, 1);
-    groupBox("Profile");
-    ImGui::Checkbox("Timing on", &Prof::on);
-    if (ImGui::Button("Clear", ImVec2(lw, 0))) Prof::reset();
-    groupBox("Save");
-    if (ImGui::Button("Save...", ImVec2(lw, 0))) {
+    groupBox(T("Sort "));
+    ImGui::RadioButton(T("Descending"), &profDir, 0); ImGui::RadioButton(T("Ascending"), &profDir, 1);
+    groupBox(T("Profile"));
+    ImGui::Checkbox(T("Timing on"), &Prof::on);
+    if (ImGui::Button(T("Clear"), ImVec2(lw, 0))) Prof::reset();
+    groupBox(T("Save"));
+    if (ImGui::Button(T("Save..."), ImVec2(lw, 0))) {
         const std::string f = fileDialog(true, L"Text\0*.txt\0\0", L"txt", homeDir() + "\\profile.txt");
         if (!f.empty()) {
             std::ofstream o(fs::u8path(f));
             o << "Calls\tTotal\tTotal/Call\tCumul.\tCumul/Call\tFunction\n";
             for (const auto& [n, s] : Prof::stats()) o << s.calls << "\t" << s.total << "\t" << (s.calls ? s.total / s.calls : 0) << "\t" << s.cumul << "\t" << (s.calls ? s.cumul / s.calls : 0) << "\t" << n << "\n";
-            say("Saved " + f);
+            say(T("Saved ") + f);
         }
     }
-    groupBox("Statistics");
+    groupBox(T("Statistics"));
     void profileTable(float w, float h);
     profileTable(lw, 420);
 }
@@ -2575,11 +2594,11 @@ void profileTable(float w, float h) {
         ImGui::TableHeadersRow();
         for (const auto& [n, s] : rows) {
             ImGui::TableNextRow();
-            ImGui::TableNextColumn(); ImGui::Text("%lld", s.calls);
-            ImGui::TableNextColumn(); ImGui::Text("%.3f", s.total);
-            ImGui::TableNextColumn(); ImGui::Text("%.3f", s.calls ? s.total / s.calls : 0);
-            ImGui::TableNextColumn(); ImGui::Text("%.3f", s.cumul);
-            ImGui::TableNextColumn(); ImGui::Text("%.3f", s.calls ? s.cumul / s.calls : 0);
+            ImGui::TableNextColumn(); ImGui::Text(T("%lld"), s.calls);
+            ImGui::TableNextColumn(); ImGui::Text(T("%.3f"), s.total);
+            ImGui::TableNextColumn(); ImGui::Text(T("%.3f"), s.calls ? s.total / s.calls : 0);
+            ImGui::TableNextColumn(); ImGui::Text(T("%.3f"), s.cumul);
+            ImGui::TableNextColumn(); ImGui::Text(T("%.3f"), s.calls ? s.cumul / s.calls : 0);
             ImGui::TableNextColumn(); ImGui::TextUnformatted(n.c_str());
         }
         ImGui::EndTable();
@@ -2589,21 +2608,21 @@ void profileTable(float w, float h) {
 // ---------- Utilities > Example (MakeHuman's 7_example): every kind of widget, and a slider that pushes the mesh ----------
 static int exPushed = 0, exRadio = 0; static bool exToggle = false; static float exSlider = 0.5f; static char exText[128] = "Some text";
 static void exampleLeft(float lw) {
-    groupBox("Example");
-    if (ImGui::Button("Button", ImVec2(lw, 0))) ++exPushed;
-    ImGui::Text("Pushed %d times", exPushed);
-    ImGui::Checkbox("ToggleButton", &exToggle);
+    groupBox(T("Example"));
+    if (ImGui::Button(T("Button"), ImVec2(lw, 0))) ++exPushed;
+    ImGui::Text(T("Pushed %d times"), exPushed);
+    ImGui::Checkbox(T("ToggleButton"), &exToggle);
     ImGui::TextUnformatted(exToggle ? "Selected" : "Not selected");
-    ImGui::RadioButton("RadioButton1", &exRadio, 0); ImGui::RadioButton("RadioButton2", &exRadio, 1);
+    ImGui::RadioButton(T("RadioButton1"), &exRadio, 0); ImGui::RadioButton(T("RadioButton2"), &exRadio, 1);
     ImGui::TextUnformatted(exRadio == 0 ? "Button 1 is selected" : "Button 2 is selected");
-    ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##exs", &exSlider, 0, 1, "Slider %.2f");
-    ImGui::Text("Value is %f", exSlider);
+    ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##exs", &exSlider, 0, 1, T("Slider %.2f"));
+    ImGui::Text(T("Value is %f"), exSlider);
     ImGui::ProgressBar(exSlider, ImVec2(lw, 0));
     ImGui::SetNextItemWidth(lw); ImGui::InputText("##ext", exText, sizeof exText);
     // MakeHuman's "Mesh distort": the body pushed out along its normals (in the view only: the shape itself is untouched)
     ImGui::SetNextItemWidth(lw);
-    if (ImGui::SliderFloat("##exm", &Viewer::look().distort, -0.5f, 0.5f, "Mesh distort %0.2f")) dirty = true;
-    ImGui::TextDisabled("This is an example plugin; see plugins/7_example.py in MakeHuman.");
+    if (ImGui::SliderFloat("##exm", &Viewer::look().distort, -0.5f, 0.5f, T("Mesh distort %0.2f"))) dirty = true;
+    ImGui::TextDisabled(T("This is an example plugin; see plugins/7_example.py in MakeHuman."));
 }
 
 static void runScript(const std::string& text) {
@@ -2658,35 +2677,35 @@ static const char* SCRIPT_EXAMPLES[][2] = {
 static int exampleSel = 0;
 static int canvasW = 0, canvasH = 0, viewW = 0, viewH = 0;   // Fixed canvas size; the 3D view's size now
 static void scriptingLeft(float lw) {
-    groupBox("Script");
+    groupBox(T("Script"));
     ImGui::InputTextMultiline("##sc", script, sizeof script, ImVec2(lw, 300));
-    if (ImGui::Button("Run", ImVec2(lw, 30))) { remember("Script"); runScript(script); say("The script ran"); }
-    if (ImGui::Button("Load...", ImVec2(lw / 2 - 4, 0))) {
+    if (ImGui::Button(T("Run"), ImVec2(lw, 30))) { remember("Script"); runScript(script); say(T("The script ran")); }
+    if (ImGui::Button(T("Load..."), ImVec2(lw / 2 - 4, 0))) {
         const std::string p = fileDialog(false, L"Pygmalion script\0*.pyg;*.pygscript;*.txt\0\0", L"pyg", homeDir() + "\\");
         if (!p.empty()) { std::ifstream in(fs::u8path(p)); std::ostringstream ss; ss << in.rdbuf(); snprintf(script, sizeof script, "%s", ss.str().c_str()); }
     }
     ImGui::SameLine();
-    if (ImGui::Button("Save...", ImVec2(lw / 2 - 4, 0))) {
+    if (ImGui::Button(T("Save..."), ImVec2(lw / 2 - 4, 0))) {
         const std::string p = fileDialog(true, L"Pygmalion script\0*.pyg\0\0", L"pyg", homeDir() + "\\script.pyg");
         if (!p.empty()) { std::ofstream o(fs::u8path(p)); o << script; }
     }
-    groupBox("Examples");
-    ImGui::TextUnformatted("Append example to script");
+    groupBox(T("Examples"));
+    ImGui::TextUnformatted(T("Append example to script"));
     ImGui::BeginChild("ex", ImVec2(lw, 160), true);
     for (int k = 0; k < (int)(sizeof SCRIPT_EXAMPLES / sizeof SCRIPT_EXAMPLES[0]); ++k) if (ImGui::Selectable(SCRIPT_EXAMPLES[k][0], exampleSel == k)) exampleSel = k;
     ImGui::EndChild();
-    if (ImGui::Button("Append", ImVec2(lw, 0))) {
+    if (ImGui::Button(T("Append"), ImVec2(lw, 0))) {
         std::string t = script; if (!t.empty() && t.back() != '\n') t += "\n";
         t += SCRIPT_EXAMPLES[exampleSel][1];
         snprintf(script, sizeof script, "%s", t.c_str());
     }
-    groupBox("Fixed canvas size");
+    groupBox(T("Fixed canvas size"));
     ImGui::SetNextItemWidth(lw); ImGui::InputInt("Width", &canvasW);
     ImGui::SetNextItemWidth(lw); ImGui::InputInt("Height", &canvasH);
-    if (ImGui::Button("Get", ImVec2(lw / 2 - 4, 0))) { canvasW = viewW; canvasH = viewH; }
+    if (ImGui::Button(T("Get"), ImVec2(lw / 2 - 4, 0))) { canvasW = viewW; canvasH = viewH; }
     ImGui::SameLine();
-    if (ImGui::Button("Set", ImVec2(lw / 2 - 4, 0))) {
-        if (canvasW < 100 || canvasH < 100) say("Width and height must be at least 100 pixels each");
+    if (ImGui::Button(T("Set"), ImVec2(lw / 2 - 4, 0))) {
+        if (canvasW < 100 || canvasH < 100) say(T("Width and height must be at least 100 pixels each"));
         else {   // the window grows or shrinks by what the view is short of
             SDL_Window* w = SDL_GL_GetCurrentWindow(); int ww, wh; SDL_RestoreWindow(w); SDL_GetWindowSize(w, &ww, &wh);
             SDL_SetWindowSize(w, ww + (canvasW - viewW), wh + (canvasH - viewH));
@@ -2708,17 +2727,17 @@ static void shellRun(const std::string& line) {
 }
 static char mixName[64] = "my expression", mixDesc[256] = "No description set", mixTags[256] = "", mixAuthor[128] = "MakeHuman Team", mixCopyright[128] = "", mixLicense[128] = "CC0", mixSite[256] = "http://www.makehumancommunity.org";
 static void mixerLeft(float lw) {
-    groupBox("Expression mixer");
-    notYet("Every face pose unit is a slider on the right. Mix them, then save the mix: it joins Pose/Animate > Expression.");
-    ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##mn", "name", mixName, sizeof mixName);
-    ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##md", "description", mixDesc, sizeof mixDesc);
-    ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##mt", "Tags (separate with ;)", mixTags, sizeof mixTags);
-    ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##ma", "Author", mixAuthor, sizeof mixAuthor);
-    ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##mc", "Copyright", mixCopyright, sizeof mixCopyright);
-    ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##ml", "License", mixLicense, sizeof mixLicense);
-    ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##mw", "Website", mixSite, sizeof mixSite);
+    groupBox(T("Expression mixer"));
+    notYet(T("Every face pose unit is a slider on the right. Mix them, then save the mix: it joins Pose/Animate > Expression."));
+    ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##mn", T("name"), mixName, sizeof mixName);
+    ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##md", T("description"), mixDesc, sizeof mixDesc);
+    ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##mt", T("Tags (separate with ;)"), mixTags, sizeof mixTags);
+    ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##ma", T("Author"), mixAuthor, sizeof mixAuthor);
+    ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##mc", T("Copyright"), mixCopyright, sizeof mixCopyright);
+    ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##ml", T("License"), mixLicense, sizeof mixLicense);
+    ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##mw", T("Website"), mixSite, sizeof mixSite);
     auto json = [](const std::string& t) { std::string o; for (char c : t) { if (c == '"' || c == '\\') o += '\\'; o += c; } return o; };
-    if (ImGui::Button("Save the expression", ImVec2(lw, 0))) {
+    if (ImGui::Button(T("Save the expression"), ImVec2(lw, 0))) {
         std::string name = mixName; for (char& c : name) if (strchr("\\/:*?\"<>|", c)) c = '_';
         if (name.empty()) name = "expression";
         std::error_code ec; const fs::path dir = fs::u8path(userDataDir()) / "expressions"; fs::create_directories(dir, ec);
@@ -2730,18 +2749,18 @@ static void mixerLeft(float lw) {
         for (size_t k = 1; k < unitW.size() && k < unitNames.size(); ++k) if (unitW[k] > 0) { o << (first ? "\n" : ",\n") << "        \"" << json(unitNames[k]) << "\": " << unitW[k]; first = false; }
         o << "\n    },\n    \"author\": \"" << json(mixAuthor) << "\",\n    \"copyright\": \"" << json(mixCopyright) << "\",\n    \"license\": \"" << json(mixLicense)
           << "\",\n    \"homepage\": \"" << json(mixSite) << "\"\n}\n";
-        if (o) { expressionFile = f.u8string(); say("Saved " + f.u8string()); } else say("Couldn't write " + f.u8string());
+        if (o) { expressionFile = f.u8string(); say(T("Saved ") + f.u8string()); } else say(T("Couldn't write ") + f.u8string());
     }
-    if (ImGui::Button("Load an expression...", ImVec2(lw, 0))) {
+    if (ImGui::Button(T("Load an expression..."), ImVec2(lw, 0))) {
         const std::string p = fileDialog(false, L"MakeHuman expression\0*.mhpose\0\0", L"mhpose", (fs::u8path(userDataDir()) / "expressions").u8string() + "\\");
         if (!p.empty()) { remember("Expression"); setExpressionFile(p); snprintf(mixName, sizeof mixName, "%s", fs::u8path(p).stem().u8string().c_str()); }
     }
-    if (ImGui::Button("Neutral", ImVec2(lw, 0))) { remember("Expression"); std::fill(unitW.begin(), unitW.end(), 0.0f); expressionFile.clear(); dirty = true; }
+    if (ImGui::Button(T("Neutral"), ImVec2(lw, 0))) { remember("Expression"); std::fill(unitW.begin(), unitW.end(), 0.0f); expressionFile.clear(); dirty = true; }
     int used = 0; for (size_t k = 1; k < unitW.size(); ++k) if (unitW[k] > 0) ++used;
-    ImGui::TextDisabled("%d of %d pose units in the mix", used, (int)unitNames.size() - 1);
+    ImGui::TextDisabled(T("%d of %d pose units in the mix"), used, (int)unitNames.size() - 1);
 }
 static void shellView() {
-    groupBox("Shell");
+    groupBox(T("Shell"));
     const float inH = ImGui::GetFrameHeightWithSpacing();
     ImGui::BeginChild("sh", ImVec2(0, -inH), true);
     for (const auto& l : shellLines) {
@@ -2759,14 +2778,14 @@ static void shellView() {
         if (shellBack >= 0) d->InsertChars(0, shellHistory[(size_t)shellBack].c_str());
         return 0;
     };
-    if (ImGui::InputTextWithHint("##shin", "macro Age 0.8", shellIn, sizeof shellIn, ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CallbackHistory, cb)) {
+    if (ImGui::InputTextWithHint("##shin", T("macro Age 0.8"), shellIn, sizeof shellIn, ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CallbackHistory, cb)) {
         shellRun(shellIn); shellIn[0] = 0; shellFocus = true;
     }
 }
 static void scriptingRight() {
-    groupBox("Commands");
+    groupBox(T("Commands"));
     ImGui::TextDisabled("%s", COMMANDS);
-    if (!scriptLog.empty()) { groupBox("Output"); ImGui::BeginChild("so"); ImGui::TextUnformatted(scriptLog.c_str()); ImGui::EndChild(); }
+    if (!scriptLog.empty()) { groupBox(T("Output")); ImGui::BeginChild("so"); ImGui::TextUnformatted(scriptLog.c_str()); ImGui::EndChild(); }
 }
 
 // Download: MakeHuman's asset packs (CC0) from its mirror, into your own data folder
@@ -3002,8 +3021,8 @@ static bool installAsset(const std::string& src, std::string kind, std::string& 
 }
 static int installKind = 0;   // 0: work it out, else KINDS[k - 1]
 static void installLeft(float lw) {
-    groupBox("Install a downloaded asset");
-    notYet("Clothes, hair, skins, poses... downloaded from MakeHuman's community site (or anywhere) as a zip or a folder. They show in their tab straight away.");
+    groupBox(T("Install a downloaded asset"));
+    notYet(T("Clothes, hair, skins, poses... downloaded from MakeHuman's community site (or anywhere) as a zip or a folder. They show in their tab straight away."));
     std::vector<const char*> k = {"Work out what it is"}; for (const char* n : KINDS) k.push_back(n);
     ImGui::SetNextItemWidth(lw); ImGui::Combo("##ik", &installKind, k.data(), (int)k.size());
     auto go = [&](const std::string& p) {
@@ -3011,21 +3030,21 @@ static void installLeft(float lw) {
         std::string said, err;
         if (installAsset(p, installKind ? KINDS[installKind - 1] : "", said, err)) say(said); else say(err);
     };
-    if (ImGui::Button("Install a zip...", ImVec2(lw / 2 - 4, 0))) go(fileDialog(false, L"Downloaded asset\0*.zip\0\0", L"zip", homeDir() + "\\"));
+    if (ImGui::Button(T("Install a zip..."), ImVec2(lw / 2 - 4, 0))) go(fileDialog(false, L"Downloaded asset\0*.zip\0\0", L"zip", homeDir() + "\\"));
     ImGui::SameLine();
-    if (ImGui::Button("Install a folder...", ImVec2(lw / 2 - 4, 0))) {
+    if (ImGui::Button(T("Install a folder..."), ImVec2(lw / 2 - 4, 0))) {
 #ifdef _WIN32
         // a folder: pick any file inside it
         const std::string f = fileDialog(false, L"Any file in the asset's folder\0*.mhclo;*.mhmat;*.obj;*.bvh;*.mhpose;*.target;*.proxy;*.png\0\0", L"mhclo", homeDir() + "\\");
         if (!f.empty()) go(fs::u8path(f).parent_path().u8string());
 #endif
     }
-    if (ImGui::Button("Open your data folder", ImVec2(lw, 0))) {
+    if (ImGui::Button(T("Open your data folder"), ImVec2(lw, 0))) {
 #ifdef _WIN32
         ShellExecuteW(nullptr, L"open", fs::u8path(userDataDir()).wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 #endif
     }
-    ImGui::TextDisabled("Dropping a .zip on the window installs it too.");
+    ImGui::TextDisabled(T("Dropping a .zip on the window installs it too."));
 }
 
 static void openUrl(const char* u);
@@ -3034,26 +3053,26 @@ static void openUrl(const char* u);
 static char packFilter[64] = ""; static int packType = 0; static std::string packSel; static bool packOnlyMissing = false;
 static void downloadLeft(float lw) {
     installLeft(lw);
-    groupBox("MakeHuman's assets");
-    notYet("Clothes, hair, shoes, hats, poses, skins and more from MakeHuman's community, into your own data folder. "
-           "(MakeHuman's site with its asset database shut down in October 2026: its assets live on as these packs.)");
+    groupBox(T("MakeHuman's assets"));
+    notYet(T("Clothes, hair, shoes, hats, poses, skins and more from MakeHuman's community, into your own data folder. "
+           "(MakeHuman's site with its asset database shut down in October 2026: its assets live on as these packs.)"));
     if (dlBusy) {
         ImGui::Text("%s", dlName.empty() ? "Getting the list..." : ("Downloading " + dlName).c_str());
         ImGui::ProgressBar(dlTotal > 0 ? (float)dlDone / dlTotal : 0.0f, ImVec2(lw, 0));
-        if (ImGui::Button("Stop", ImVec2(lw, 0))) dlStop = true;
+        if (ImGui::Button(T("Stop"), ImVec2(lw, 0))) dlStop = true;
         return;
     }
-    if (packs.empty()) { if (ImGui::Button("Update list", ImVec2(lw, 30))) { loadPacksHave(); dlName.clear(); startDownload("", true); } return; }
+    if (packs.empty()) { if (ImGui::Button(T("Update list"), ImVec2(lw, 30))) { loadPacksHave(); dlName.clear(); startDownload("", true); } return; }
     std::lock_guard<std::mutex> g(dlMtx);
     // Filter assets
-    groupBox("Filter assets");
+    groupBox(T("Filter assets"));
     std::vector<std::string> types = {"All"}; for (const auto& [n, pi] : packInfo) if (!pi.type.empty() && std::find(types.begin(), types.end(), pi.type) == types.end()) types.push_back(pi.type);
     std::sort(types.begin() + 1, types.end());
     std::vector<const char*> tc; for (const auto& t : types) tc.push_back(t.c_str());
     packType = std::clamp(packType, 0, (int)tc.size() - 1);
     ImGui::SetNextItemWidth(lw); ImGui::Combo("##ptype", &packType, tc.data(), (int)tc.size());
-    ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##pfilt", "Title or description", packFilter, sizeof packFilter);
-    ImGui::Checkbox("Only the ones not installed", &packOnlyMissing);
+    ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##pfilt", T("Title or description"), packFilter, sizeof packFilter);
+    ImGui::Checkbox(T("Only the ones not installed"), &packOnlyMissing);
     std::string q = packFilter; for (auto& c : q) c = (char)tolower((unsigned char)c);
     std::vector<std::string> shown;
     for (const auto& p : packs) {
@@ -3063,13 +3082,13 @@ static void downloadLeft(float lw) {
         if (!q.empty()) { std::string t = p + " " + (pi ? pi->descr : ""); for (auto& c : t) c = (char)tolower((unsigned char)c); if (t.find(q) == std::string::npos) continue; }
         shown.push_back(p);
     }
-    if (ImGui::Button("Update list", ImVec2(lw / 2 - 4, 0))) { loadPacksHave(); dlName.clear(); startDownload("", true); }
+    if (ImGui::Button(T("Update list"), ImVec2(lw / 2 - 4, 0))) { loadPacksHave(); dlName.clear(); startDownload("", true); }
     ImGui::SameLine();
-    if (ImGui::Button("Synchronize", ImVec2(lw / 2 - 4, 0))) {   // every pack in the list that isn't installed
+    if (ImGui::Button(T("Synchronize"), ImVec2(lw / 2 - 4, 0))) {   // every pack in the list that isn't installed
         std::string names; for (const auto& p : shown) if (!packsHave.count(p)) names += p + "|";
-        if (names.empty()) say("Everything in the list is installed"); else startDownload("sync:" + names, false);
+        if (names.empty()) say(T("Everything in the list is installed")); else startDownload("sync:" + names, false);
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Download every pack in the list that isn't installed yet.");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("Download every pack in the list that isn't installed yet."));
     // the list
     ImGui::BeginChild("packs", ImVec2(lw, 300), true);
     if (ImGui::BeginTable("pk", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
@@ -3080,7 +3099,7 @@ static void downloadLeft(float lw) {
             ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::PushID(p.c_str());
             if (ImGui::Selectable(p.c_str(), packSel == p, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) packSel = p;
             ImGui::TableNextColumn(); ImGui::TextDisabled("%s", it == packInfo.end() ? "" : it->second.type.c_str());
-            ImGui::TableNextColumn(); if (it != packInfo.end()) ImGui::TextDisabled("%.1f", it->second.sizeMb);
+            ImGui::TableNextColumn(); if (it != packInfo.end()) ImGui::TextDisabled(T("%.1f"), it->second.sizeMb);
             ImGui::TableNextColumn();
             const bool have = packsHave.count(p) > 0;
             if (have) ImGui::PushStyleColor(ImGuiCol_Button, col4(C_DEEP));
@@ -3099,13 +3118,13 @@ static void downloadLeft(float lw) {
             ImGui::PushTextWrapPos(lw);
             ImGui::TextWrapped("%s", it->second.descr.c_str());
             if (!it->second.comment.empty()) ImGui::TextDisabled("%s", it->second.comment.c_str());
-            ImGui::TextDisabled("Licence: %s   Size: %.1f MB   %s", it->second.license.c_str(), it->second.sizeMb, packsHave.count(packSel) ? "Installed" : "Not installed");
+            ImGui::TextDisabled(T("Licence: %s   Size: %.1f MB   %s"), it->second.license.c_str(), it->second.sizeMb, packsHave.count(packSel) ? "Installed" : "Not installed");
             ImGui::PopTextWrapPos();
         }
-        if (ImGui::Button("Download", ImVec2(lw / 2 - 4, 0))) startDownload(packSel, false);
+        if (ImGui::Button(T("Download"), ImVec2(lw / 2 - 4, 0))) startDownload(packSel, false);
         ImGui::SameLine();
-        if (ImGui::Button("View details", ImVec2(lw / 2 - 4, 0))) openUrl((std::string(PACK_PAGES) + packSel + ".html").c_str());
-        if (ImGui::Button("Download screenshots", ImVec2(lw, 0))) startDownload("shots:" + packSel, false);
+        if (ImGui::Button(T("View details"), ImVec2(lw / 2 - 4, 0))) openUrl((std::string(PACK_PAGES) + packSel + ".html").c_str());
+        if (ImGui::Button(T("Download screenshots"), ImVec2(lw, 0))) startDownload("shots:" + packSel, false);
         // the pictures already fetched
         const fs::path dir = fs::u8path(userDataDir()) / "packs" / "screenshots" / packSel;
         std::error_code ec; int n = 0; const int cols = std::max(1, (int)(lw / 104));
@@ -3126,33 +3145,33 @@ static void packsCommand(const std::string& cmd, const std::string& rest, const 
 }
 
 static void dataView() {
-    groupBox("Data");
+    groupBox(T("Data"));
     int shown = 0; for (size_t t = 0; t + 2 < body.tri.size(); t += 3) ++shown;
-    ImGui::Text("Base mesh: %d vertices, %d triangles", (int)(body.base.size() / 3), shown);
-    ImGui::Text("Targets: %d, modifiers: %d", (int)body.targets.size(), (int)body.mods.size());
-    ImGui::Text("Proxies worn: %d", (int)body.proxies.size());
+    ImGui::Text(T("Base mesh: %d vertices, %d triangles"), (int)(body.base.size() / 3), shown);
+    ImGui::Text(T("Targets: %d, modifiers: %d"), (int)body.targets.size(), (int)body.mods.size());
+    ImGui::Text(T("Proxies worn: %d"), (int)body.proxies.size());
     for (const auto& p : body.proxies) ImGui::BulletText("%s (%s): %d vertices", p.name.c_str(), p.kind.c_str(), (int)(p.pos.size() / 3));
-    ImGui::Text("Skeleton for posing: %d bones", (int)rig.bones.size());
-    if (!chosen.empty()) ImGui::Text("Chosen skeleton: %s, %d bones", chosen.name.c_str(), (int)chosen.bones.size());
-    groupBox("Folders");
-    ImGui::TextWrapped("Program data: %s", dataDir.c_str());
-    ImGui::TextWrapped("MakeHuman assets: %s", assetsDir().empty() ? "(none)" : assetsDir().c_str());
-    ImGui::TextWrapped("Your data: %s", userDataDir().c_str());
-    ImGui::TextWrapped("MakeHuman's own data: %s", makehumanDataDir().empty() ? "(MakeHuman isn't installed)" : makehumanDataDir().c_str());
+    ImGui::Text(T("Skeleton for posing: %d bones"), (int)rig.bones.size());
+    if (!chosen.empty()) ImGui::Text(T("Chosen skeleton: %s, %d bones"), chosen.name.c_str(), (int)chosen.bones.size());
+    groupBox(T("Folders"));
+    ImGui::TextWrapped(T("Program data: %s"), dataDir.c_str());
+    ImGui::TextWrapped(T("MakeHuman assets: %s"), assetsDir().empty() ? "(none)" : assetsDir().c_str());
+    ImGui::TextWrapped(T("Your data: %s"), userDataDir().c_str());
+    ImGui::TextWrapped(T("MakeHuman's own data: %s"), makehumanDataDir().empty() ? "(MakeHuman isn't installed)" : makehumanDataDir().c_str());
 }
 // Utilities > Logs (MakeHuman's 7_logging): the level shown and up, lines picked (click; Ctrl+click for more) and copied
 static int logLevel = 0;
 static void logsView() {
-    groupBox("Level");
+    groupBox(T("Level"));
     static const char* LEVELS[] = {"Debug", "Message", "Notice", "Warning", "Error"};
     for (int k = 0; k < 5; ++k) ImGui::RadioButton(LEVELS[k], &logLevel, k);
-    if (ImGui::Button("Copy to Clipboard")) {
+    if (ImGui::Button(T("Copy to Clipboard"))) {
         std::string text;
         for (size_t i = 0; i < logs.size(); ++i) if (i < logPicked.size() && logPicked[i]) text += logs[i] + "\n";
-        if (text.empty()) say("No log items selected"); else ImGui::SetClipboardText(text.c_str());
+        if (text.empty()) say(T("No log items selected")); else ImGui::SetClipboardText(text.c_str());
     }
-    ImGui::SameLine(); if (ImGui::Button("Clear")) { logs.clear(); logLevels.clear(); logPicked.clear(); }
-    groupBox("Logs");
+    ImGui::SameLine(); if (ImGui::Button(T("Clear"))) { logs.clear(); logLevels.clear(); logPicked.clear(); }
+    groupBox(T("Logs"));
     ImGui::BeginChild("lg");
     static const ImU32 COLS[] = {IM_COL32(0x9a, 0x9a, 0x9a, 255), IM_COL32(0xe6, 0xe6, 0xe6, 255), IM_COL32(0x9c, 0xd7, 0xff, 255), IM_COL32(0xff, 0xc8, 0x5a, 255), IM_COL32(0xff, 0x6b, 0x6b, 255)};
     for (size_t i = 0; i < logs.size(); ++i) {
@@ -3172,7 +3191,7 @@ static void logsView() {
 // ---------- the categories without their own code yet show what's coming, honestly ----------
 static void notYet(const char* what) {
     ImGui::PushTextWrapPos(0);
-    ImGui::TextDisabled("%s", what);
+    ImGui::TextDisabled("%s", T(what));
     ImGui::PopTextWrapPos();
 }
 
@@ -3247,7 +3266,7 @@ static void shortcuts() {
                 key == ImGuiKey_ReservedForModCtrl || key == ImGuiKey_ReservedForModAlt || key == ImGuiKey_ReservedForModShift || key == ImGuiKey_ReservedForModSuper || (k >= ImGuiKey_MouseLeft && k <= ImGuiKey_MouseWheelY)) continue;
             if (!ImGui::IsKeyPressed(key, false)) continue;
             if (key != ImGuiKey_Escape) {
-                for (auto& o : SHORTCUTS) if (&o != capturing && o.key == key && o.mods == mods) { say("That shortcut is already " + std::string(o.label)); capturing = nullptr; return; }
+                for (auto& o : SHORTCUTS) if (&o != capturing && o.key == key && o.mods == mods) { say(T("That shortcut is already ") + std::string(o.label)); capturing = nullptr; return; }
                 capturing->key = key; capturing->mods = mods;
             }
             capturing = nullptr; return;
@@ -3272,9 +3291,9 @@ static void shortcutsLeft(float lw) {
             ImGui::EndTable();
         }
     }
-    groupBox("Restore Settings");
-    if (ImGui::Button("Restore to defaults", ImVec2(lw, 0))) for (auto& sc : SHORTCUTS) { sc.mods = sc.defMods; sc.key = sc.defKey; }
-    notYet("Click on a shortcut box and press the keys of the shortcut which you would like to assign to the given action.");
+    groupBox(T("Restore Settings"));
+    if (ImGui::Button(T("Restore to defaults"), ImVec2(lw, 0))) for (auto& sc : SHORTCUTS) { sc.mods = sc.defMods; sc.key = sc.defKey; }
+    notYet(T("Click on a shortcut box and press the keys of the shortcut which you would like to assign to the given action."));
 }
 
 // Help > Help (MakeHuman's 6_help): about, credits, links, and the version string copied
@@ -3296,28 +3315,28 @@ static std::string creditsText() {   // MakeHuman's licenses/credits.txt (rich t
 static bool showCredits = false;
 static void helpLeft(float lw) {
     const float hw = lw / 2 - 4;
-    groupBox("About Pygmalion");
-    if (ImGui::Button("About / License", ImVec2(lw, 0))) forcedTask = "About";
-    if (ImGui::Button("Credits", ImVec2(lw, 0))) showCredits = !showCredits;
-    if (ImGui::Button("Website", ImVec2(hw, 0))) openUrl("https://cursedprograms.github.io/Pygmalion/");
-    ImGui::SameLine(); if (ImGui::Button("GitHub", ImVec2(hw, 0))) openUrl("https://github.com/CursedPrograms/Pygmalion");
-    groupBox("Support");
-    if (ImGui::Button("Report bug", ImVec2(hw, 0))) openUrl("https://github.com/CursedPrograms/Pygmalion/issues/new");
-    ImGui::SameLine(); if (ImGui::Button("Request feature", ImVec2(hw, 0))) openUrl("https://github.com/CursedPrograms/Pygmalion/issues/new");
-    groupBox("MakeHuman");
-    if (ImGui::Button("Website##mh", ImVec2(hw, 0))) openUrl("http://www.makehumancommunity.org");
-    ImGui::SameLine(); if (ImGui::Button("FaceBook page", ImVec2(hw, 0))) openUrl("https://www.facebook.com/makehuman/");
-    if (ImGui::Button("FAQ", ImVec2(hw, 0))) openUrl("http://www.makehumancommunity.org/wiki/FAQ:Index");
-    ImGui::SameLine(); if (ImGui::Button("Forum", ImVec2(hw, 0))) openUrl("http://www.makehumancommunity.org/forum");
-    if (ImGui::Button("Wiki", ImVec2(hw, 0))) openUrl("http://www.makehumancommunity.org/wiki/Main_Page");
-    ImGui::SameLine(); if (ImGui::Button("Patreon", ImVec2(hw, 0))) openUrl("https://www.patreon.com/makehuman/overview");
-    groupBox("Copy to clipboard");
-    if (ImGui::Button("Version String", ImVec2(lw, 0))) {
+    groupBox(T("About Pygmalion"));
+    if (ImGui::Button(T("About / License"), ImVec2(lw, 0))) forcedTask = "About";
+    if (ImGui::Button(T("Credits"), ImVec2(lw, 0))) showCredits = !showCredits;
+    if (ImGui::Button(T("Website"), ImVec2(hw, 0))) openUrl("https://cursedprograms.github.io/Pygmalion/");
+    ImGui::SameLine(); if (ImGui::Button(T("GitHub"), ImVec2(hw, 0))) openUrl("https://github.com/CursedPrograms/Pygmalion");
+    groupBox(T("Support"));
+    if (ImGui::Button(T("Report bug"), ImVec2(hw, 0))) openUrl("https://github.com/CursedPrograms/Pygmalion/issues/new");
+    ImGui::SameLine(); if (ImGui::Button(T("Request feature"), ImVec2(hw, 0))) openUrl("https://github.com/CursedPrograms/Pygmalion/issues/new");
+    groupBox(T("MakeHuman"));
+    if (ImGui::Button(T("Website##mh"), ImVec2(hw, 0))) openUrl("http://www.makehumancommunity.org");
+    ImGui::SameLine(); if (ImGui::Button(T("FaceBook page"), ImVec2(hw, 0))) openUrl("https://www.facebook.com/makehuman/");
+    if (ImGui::Button(T("FAQ"), ImVec2(hw, 0))) openUrl("http://www.makehumancommunity.org/wiki/FAQ:Index");
+    ImGui::SameLine(); if (ImGui::Button(T("Forum"), ImVec2(hw, 0))) openUrl("http://www.makehumancommunity.org/forum");
+    if (ImGui::Button(T("Wiki"), ImVec2(hw, 0))) openUrl("http://www.makehumancommunity.org/wiki/Main_Page");
+    ImGui::SameLine(); if (ImGui::Button(T("Patreon"), ImVec2(hw, 0))) openUrl("https://www.patreon.com/makehuman/overview");
+    groupBox(T("Copy to clipboard"));
+    if (ImGui::Button(T("Version String"), ImVec2(lw, 0))) {
         ImGui::SetClipboardText("Pygmalion " PYGMALION_VERSION " (MakeHuman 1.1.1, remade in C++), " __DATE__);
         say("Copied: Pygmalion " PYGMALION_VERSION);
     }
     if (showCredits) {
-        groupBox("Credits");
+        groupBox(T("Credits"));
         ImGui::BeginChild("credits", ImVec2(lw, 360), true);
         ImGui::PushTextWrapPos(lw - 16); ImGui::TextUnformatted(creditsText().c_str()); ImGui::PopTextWrapPos();
         ImGui::EndChild();
@@ -3338,12 +3357,12 @@ static void frame() {
     ImGui::PushStyleColor(ImGuiCol_WindowBg, col4(C_BG));
     ImGui::Begin("cats", nullptr, fixed);
     if (ImGui::BeginTabBar("catbar")) {
-        for (int c = 0; c < CAT_COUNT; ++c) if (ImGui::BeginTabItem(CAT_NAMES[c], nullptr, forcedTab == c ? ImGuiTabItemFlags_SetSelected : 0)) { cat = c; ImGui::EndTabItem(); }
+        for (int c = 0; c < CAT_COUNT; ++c) if (ImGui::BeginTabItem(TID(CAT_NAMES[c]), nullptr, forcedTab == c ? ImGuiTabItemFlags_SetSelected : 0)) { cat = c; ImGui::EndTabItem(); }
         forcedTab = -1;
         ImGui::EndTabBar();
     }
     if (ImGui::BeginTabBar("taskbar")) {
-        for (const auto& t : tasksOf(cat)) if (ImGui::BeginTabItem(t.c_str(), nullptr, forcedTask == t ? ImGuiTabItemFlags_SetSelected : 0)) {
+        for (const auto& t : tasksOf(cat)) if (ImGui::BeginTabItem(TID(t.c_str()), nullptr, forcedTask == t ? ImGuiTabItemFlags_SetSelected : 0)) {
             if (task[cat] != t) { task[cat] = t; if (cat == CAT_MODELLING && t == "Face") lookFor("faceCamera"); }
             ImGui::EndTabItem();
         }
@@ -3362,99 +3381,105 @@ static void frame() {
     const std::string& t = task[cat];
     if (!loadErr.empty()) { ImGui::PushTextWrapPos(lw); ImGui::TextColored(col4(C_PINK), "%s", loadErr.c_str()); ImGui::PopTextWrapPos(); }
     else if (cat == CAT_MODELLING) {
-        if (t == "Main") { groupBox("Macros"); macroSliders(lw); }
+        if (t == "Main") { groupBox(T("Macros")); macroSliders(lw); }
         else if (t == "Random") randomLeft(lw);
         else if (t == "Custom") customLeft(lw);
         else if (const Human::Tab* tb = tabNamed(t)) modTabLeft(*tb, lw);
     } else if (cat == CAT_FILES) filesLeft(lw);
     else if (cat == CAT_SETTINGS) {
         if (t == "Sliders") {
-            groupBox("Slider behaviour");
-            ImGui::Checkbox("Update in real time", &prefs.realtime);
-            ImGui::Checkbox("Update normals real-time", &Viewer::look().normalsWhileDragging);
-            ImGui::Checkbox("Fit objects real-time", &Viewer::look().fitWhileDragging);
-            ImGui::Checkbox("Camera follows the slider", &prefs.camFollows);
-            groupBox("Slider appearance");
-            ImGui::Checkbox("Show slider values", &prefs.showValues);
-            ImGui::Checkbox("Show slider images", &prefs.sliderImages);
+            groupBox(T("Slider behaviour"));
+            ImGui::Checkbox(T("Update in real time"), &prefs.realtime);
+            ImGui::Checkbox(T("Update normals real-time"), &Viewer::look().normalsWhileDragging);
+            ImGui::Checkbox(T("Fit objects real-time"), &Viewer::look().fitWhileDragging);
+            ImGui::Checkbox(T("Camera follows the slider"), &prefs.camFollows);
+            groupBox(T("Slider appearance"));
+            ImGui::Checkbox(T("Show slider values"), &prefs.showValues);
+            ImGui::Checkbox(T("Show slider images"), &prefs.sliderImages);
         } else if (t == "General") {
-            groupBox("Units");
+            groupBox(T("Units"));
             int u = prefs.metric ? 0 : 1;
-            if (ImGui::RadioButton("Metric (cm)", &u, 0)) prefs.metric = true;
-            if (ImGui::RadioButton("Imperial (in)", &u, 1)) prefs.metric = false;
-            groupBox("Weight");
-            { int wv = prefs.realWeight ? 1 : 0; if (ImGui::RadioButton("Relative Weight", &wv, 0)) prefs.realWeight = false; if (ImGui::RadioButton("Real Weight", &wv, 1)) prefs.realWeight = true; }
+            if (ImGui::RadioButton(T("Metric (cm)"), &u, 0)) prefs.metric = true;
+            if (ImGui::RadioButton(T("Imperial (in)"), &u, 1)) prefs.metric = false;
+            groupBox(T("Weight"));
+            { int wv = prefs.realWeight ? 1 : 0; if (ImGui::RadioButton(T("Relative Weight"), &wv, 0)) prefs.realWeight = false; if (ImGui::RadioButton(T("Real Weight"), &wv, 1)) prefs.realWeight = true; }
             groupBox(("Tag Filter Mode: " + std::string(prefs.tagMode == 0 ? "OR" : prefs.tagMode == 1 ? "AND" : prefs.tagMode == 2 ? "NOT OR" : "NOT AND")).c_str());
-            ImGui::RadioButton("OR", &prefs.tagMode, 0); ImGui::SameLine(lw / 2); ImGui::RadioButton("AND", &prefs.tagMode, 1);
-            ImGui::RadioButton("NOT OR", &prefs.tagMode, 2); ImGui::SameLine(lw / 2); ImGui::RadioButton("NOT AND", &prefs.tagMode, 3);
-            groupBox("Tags Count");
-            ImGui::SetNextItemWidth(lw); ImGui::SliderInt("##tc", &prefs.tagCount, 1, 20, "%d Tags");
-            groupBox("Name Tags");
-            ImGui::Checkbox("Use Name Tags", &prefs.nameTags);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("The choosers show each file's own name (its \"name\" line) instead of its file name.");
-            groupBox("Startup");
-            ImGui::Checkbox("Preload macro targets", &prefs.preload);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Pygmalion loads every target at the start either way: there's nothing left to load later.");
-            ImGui::Checkbox("Restore window size", &prefs.restoreWindow);
-            if (ImGui::Checkbox("Use HDPI", &prefs.hdpi)) say("You need to restart for these changes to be applied.");
-            { bool noSh = !Viewer::look().mhShaders; if (ImGui::Checkbox("No shaders", &noSh)) Viewer::look().mhShaders = !noSh; }
-            ImGui::Checkbox("No sample buffers", &prefs.noSampleBuffers);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Renders without anti-aliasing (Rendering > Render).");
-            groupBox("Theme");
-            { int th = theme; bool c1 = ImGui::RadioButton("Pygmalion", &th, 0); bool c2 = ImGui::RadioButton("MakeHuman", &th, 1); bool c3 = ImGui::RadioButton("Native look", &th, 2); if (c1 || c2 || c3) { theme = th; applyStyle(); } }
-            groupBox("Slider's Edit Widget Visibility");
-            { int ev = prefs.sliderEdit ? 0 : 1; if (ImGui::RadioButton("Visible", &ev, 0)) prefs.sliderEdit = true; if (ImGui::RadioButton("Default", &ev, 1)) prefs.sliderEdit = false; }
-            groupBox("Shading");
-            ImGui::Checkbox("MakeHuman's shaders", &Viewer::look().mhShaders);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Each object drawn with its material's own shader (litsphere, phong, toon, xray...), as MakeHuman draws it.\nOff: Pygmalion's own shading, lit by every light in the scene.");
-            groupBox("Configure Home Folder");
+            ImGui::RadioButton(T("OR"), &prefs.tagMode, 0); ImGui::SameLine(lw / 2); ImGui::RadioButton(T("AND"), &prefs.tagMode, 1);
+            ImGui::RadioButton(T("NOT OR"), &prefs.tagMode, 2); ImGui::SameLine(lw / 2); ImGui::RadioButton(T("NOT AND"), &prefs.tagMode, 3);
+            groupBox(T("Tags Count"));
+            ImGui::SetNextItemWidth(lw); ImGui::SliderInt("##tc", &prefs.tagCount, 1, 20, T("%d Tags"));
+            groupBox(T("Name Tags"));
+            ImGui::Checkbox(T("Use Name Tags"), &prefs.nameTags);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("The choosers show each file's own name (its \"name\" line) instead of its file name."));
+            groupBox(T("Startup"));
+            ImGui::Checkbox(T("Preload macro targets"), &prefs.preload);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("Pygmalion loads every target at the start either way: there's nothing left to load later."));
+            ImGui::Checkbox(T("Restore window size"), &prefs.restoreWindow);
+            if (ImGui::Checkbox(T("Use HDPI"), &prefs.hdpi)) say(T("You need to restart for these changes to be applied."));
+            { bool noSh = !Viewer::look().mhShaders; if (ImGui::Checkbox(T("No shaders"), &noSh)) Viewer::look().mhShaders = !noSh; }
+            ImGui::Checkbox(T("No sample buffers"), &prefs.noSampleBuffers);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("Renders without anti-aliasing (Rendering > Render)."));
+            groupBox(T("Theme"));
+            { int th = theme; bool c1 = ImGui::RadioButton(T("Pygmalion"), &th, 0); bool c2 = ImGui::RadioButton(T("MakeHuman"), &th, 1); bool c3 = ImGui::RadioButton(T("Native look"), &th, 2); if (c1 || c2 || c3) { theme = th; applyStyle(); } }
+            groupBox(T("Slider's Edit Widget Visibility"));
+            { int ev = prefs.sliderEdit ? 0 : 1; if (ImGui::RadioButton(T("Visible"), &ev, 0)) prefs.sliderEdit = true; if (ImGui::RadioButton(T("Default"), &ev, 1)) prefs.sliderEdit = false; }
+            groupBox(T("Language"));
+            for (const auto& L : Lang::all()) {
+                const std::string label = std::string(L.native) + (strcmp(L.native, L.english) ? std::string(" (") + L.english + ")" : std::string()) + (L.full ? "" : " *");
+                if (ImGui::RadioButton(label.c_str(), prefs.language == L.code)) { prefs.language = L.code; Lang::load(dataDir, prefs.language); fontsDirty = true; }
+            }
+            ImGui::TextDisabled("%s", T("* MakeHuman's own words only; the rest in English."));
+            groupBox(T("Shading"));
+            ImGui::Checkbox(T("MakeHuman's shaders"), &Viewer::look().mhShaders);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("Each object drawn with its material's own shader (litsphere, phong, toon, xray...), as MakeHuman draws it.\nOff: Pygmalion's own shading, lit by every light in the scene."));
+            groupBox(T("Configure Home Folder"));
             {
                 std::error_code ec; const bool has = fs::exists(fs::u8path(configFile()), ec);
                 if (ImGui::Button(has ? "Delete Config File" : "Create Config File", ImVec2(lw, 0))) {
-                    if (has) { fs::remove(fs::u8path(configFile()), ec); say("Home Folder Location: Default (after a restart)"); }
+                    if (has) { fs::remove(fs::u8path(configFile()), ec); say(T("Home Folder Location: Default (after a restart)")); }
                     else {
                         const std::string d = folderDialog();
-                        if (!d.empty()) { fs::create_directories(fs::u8path(configFile()).parent_path(), ec); std::ofstream o(fs::u8path(configFile())); o << d << "\n"; say("Home Folder Location: " + d + " (after a restart)"); }
+                        if (!d.empty()) { fs::create_directories(fs::u8path(configFile()).parent_path(), ec); std::ofstream o(fs::u8path(configFile())); o << d << "\n"; say(T("Home Folder Location: ") + d + " (after a restart)"); }
                     }
                 }
             }
-            groupBox("Models folder");
+            groupBox(T("Models folder"));
             ImGui::TextWrapped("%s", homeDir().c_str());
-            groupBox("Settings");
+            groupBox(T("Settings"));
             notYet(("Kept in " + settingsFile() + " when Pygmalion closes.").c_str());
-            if (ImGui::Button("Restore the defaults", ImVec2(lw, 0))) {
+            if (ImGui::Button(T("Restore the defaults"), ImVec2(lw, 0))) {
                 prefs = Prefs(); theme = 0; applyStyle();
                 Viewer::Look& lk = Viewer::look(); lk.normalsWhileDragging = lk.fitWhileDragging = lk.mhShaders = true; lk.turnSpeed = lk.moveSpeed = lk.zoomSpeed = 1; lk.invertTurn = lk.invertZoom = false; lk.bgImage.clear(); lk.bgOpacity = 1;
-                say("Settings back to their defaults");
+                say(T("Settings back to their defaults"));
             }
         } else if (t == "Background") backgroundLeft(lw);
         else if (t == "Plugins") pluginsLeft(lw);
         else if (t == "User Plugins") userPluginsLeft(lw);
         else if (t == "Mouse") {
             Viewer::Look& lk = Viewer::look();
-            groupBox("Camera");
-            ImGui::TextWrapped("Left drag: turn. Right or middle drag: move. Wheel: zoom.");
-            ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##ts", &lk.turnSpeed, 0.1f, 5, "Turn speed: %.1f");
-            ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##ms", &lk.moveSpeed, 0.1f, 5, "Move speed: %.1f");
-            ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##zs", &lk.zoomSpeed, 0.1f, 5, "Zoom speed: %.1f");
-            ImGui::Checkbox("Invert turning", &lk.invertTurn);
-            ImGui::Checkbox("Invert the wheel", &lk.invertZoom);
-            if (ImGui::Button("Defaults", ImVec2(lw, 0))) { lk.turnSpeed = lk.moveSpeed = lk.zoomSpeed = 1; lk.invertTurn = lk.invertZoom = false; }
+            groupBox(T("Camera"));
+            ImGui::TextWrapped(T("Left drag: turn. Right or middle drag: move. Wheel: zoom."));
+            ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##ts", &lk.turnSpeed, 0.1f, 5, T("Turn speed: %.1f"));
+            ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##ms", &lk.moveSpeed, 0.1f, 5, T("Move speed: %.1f"));
+            ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##zs", &lk.zoomSpeed, 0.1f, 5, T("Zoom speed: %.1f"));
+            ImGui::Checkbox(T("Invert turning"), &lk.invertTurn);
+            ImGui::Checkbox(T("Invert the wheel"), &lk.invertZoom);
+            if (ImGui::Button(T("Defaults"), ImVec2(lw, 0))) { lk.turnSpeed = lk.moveSpeed = lk.zoomSpeed = 1; lk.invertTurn = lk.invertZoom = false; }
         } else {
             shortcutsLeft(lw);
         }
     } else if (cat == CAT_UTILITIES) {
         if (t == "Describe") {
-            groupBox("Describe the person");
+            groupBox(T("Describe the person"));
             ImGui::SetNextItemWidth(lw);
-            const bool enter = ImGui::InputTextWithHint("##prompt", "a tall, muscular old woman with a big nose", prompt, sizeof prompt, ImGuiInputTextFlags_EnterReturnsTrue);
-            if (ImGui::Button("Make them", ImVec2(lw, 0)) || enter) { remember("Describe"); redo.clear(); understood = Human::describe(body, prompt); if (understood.empty()) understood = "(no words it knows)"; dirty = true; }
+            const bool enter = ImGui::InputTextWithHint("##prompt", T("a tall, muscular old woman with a big nose"), prompt, sizeof prompt, ImGuiInputTextFlags_EnterReturnsTrue);
+            if (ImGui::Button(T("Make them"), ImVec2(lw, 0)) || enter) { remember("Describe"); redo.clear(); understood = Human::describe(body, prompt); if (understood.empty()) understood = "(no words it knows)"; dirty = true; }
             if (!understood.empty()) { ImGui::PushTextWrapPos(lw); ImGui::TextDisabled("%s", understood.c_str()); ImGui::PopTextWrapPos(); }
         } else if (t == "Symmetry") {
-            groupBox("Symmetry");
-            if (ImGui::Button("Right to left", ImVec2(lw, 0))) symmetry(true);
-            if (ImGui::Button("Left to right", ImVec2(lw, 0))) symmetry(false);
-            ImGui::Checkbox("Symmetric modelling", &body.symmetry);
+            groupBox(T("Symmetry"));
+            if (ImGui::Button(T("Right to left"), ImVec2(lw, 0))) symmetry(true);
+            if (ImGui::Button(T("Left to right"), ImVec2(lw, 0))) symmetry(false);
+            ImGui::Checkbox(T("Symmetric modelling"), &body.symmetry);
         } else if (t == "Statistics") statistics();
         else if (t == "Material Editor") materialEditor(lw);
         else if (t == "Scene Editor") sceneEditorLeft(lw);
@@ -3463,7 +3488,7 @@ static void frame() {
         else if (t == "Save targets") saveTargetsLeft(lw);
         else if (t == "Mass produce") massLeftPanel(lw);
         else if (t == "Scripting") scriptingLeft(lw);
-        else if (t == "Shell") { groupBox("Shell"); notYet("MakeHuman's shell runs Python; Pygmalion's runs its own commands, the same as Scripting. Up and down bring back what you typed; clear empties it."); }
+        else if (t == "Shell") { groupBox(T("Shell")); notYet(T("MakeHuman's shell runs Python; Pygmalion's runs its own commands, the same as Scripting. Up and down bring back what you typed; clear empties it.")); }
         else if (t == "Download") downloadLeft(lw);
 #ifdef _WIN32
         else if (t == "Socket") socketLeft(lw);
@@ -3475,39 +3500,39 @@ static void frame() {
         else logsView();
     } else if (cat == CAT_HELP) {
         if (t == "Help") helpLeft(lw);
-        else if (t == "About") { groupBox("Pygmalion " PYGMALION_VERSION); ImGui::TextWrapped("People in 3D with sliders: MakeHuman, remade in C++ by Cursed Entertainment. Farica\xe2\x98\x86Kimora \xc2\xa9 Cursed Entertainment."); }
-        else { groupBox("Licence"); ImGui::TextWrapped("The code is AGPL-3.0 (it ports MakeHuman's code). The body, its shapes and the assets are MakeHuman's, CC0."); }
+        else if (t == "About") { groupBox("Pygmalion " PYGMALION_VERSION); ImGui::TextWrapped(T("People in 3D with sliders: MakeHuman, remade in C++ by Cursed Entertainment. Farica\xe2\x98\x86Kimora \xc2\xa9 Cursed Entertainment.")); }
+        else { groupBox(T("Licence")); ImGui::TextWrapped(T("The code is AGPL-3.0 (it ports MakeHuman's code). The body, its shapes and the assets are MakeHuman's, CC0.")); }
     } else if (cat == CAT_GEOMETRIES) geometriesLeft(t, lw);
     else if (cat == CAT_MATERIALS) materialsLeft(lw);
     else if (cat == CAT_POSE) {
         std::string picked;
         if (t == "Skeleton") {
-            groupBox("Skeleton");
+            groupBox(T("Skeleton"));
             if (chooser("sk", filesIn("rigs", ".mhskel"), skeletonFile, picked, lw)) { remember("Skeleton"); setSkeletonFile(picked); say(picked.empty() ? "No skeleton" : niceName(picked) + " skeleton (exported with the model)"); }
-            if (ImGui::Checkbox("Show the bones", &showBones)) Viewer::look().bones = showBones;
-            if (!chosen.empty()) { ImGui::TextDisabled("%s: %d bones", chosen.name.c_str(), (int)chosen.bones.size()); if (!chosen.description.empty()) { ImGui::PushTextWrapPos(lw); ImGui::TextDisabled("%s", chosen.description.c_str()); ImGui::PopTextWrapPos(); } }
+            if (ImGui::Checkbox(T("Show the bones"), &showBones)) Viewer::look().bones = showBones;
+            if (!chosen.empty()) { ImGui::TextDisabled(T("%s: %d bones"), chosen.name.c_str(), (int)chosen.bones.size()); if (!chosen.description.empty()) { ImGui::PushTextWrapPos(lw); ImGui::TextDisabled("%s", chosen.description.c_str()); ImGui::PopTextWrapPos(); } }
         } else if (t == "Pose") {
-            groupBox("Pose");
+            groupBox(T("Pose"));
             if (chooser("po", filesIn("poses", ".bvh"), poseFile, picked, lw)) setPoseFile(picked);
         } else if (t == "Animations") {
-            groupBox("Animations");
+            groupBox(T("Animations"));
             if (chooser("an", filesIn("animations", ".bvh"), animFile, picked, lw)) setAnimation(picked);
             if (!animFrames.empty()) {
-                groupBox("Playback");
+                groupBox(T("Playback"));
                 if (ImGui::Button(animPlaying ? "Pause" : "Play", ImVec2(lw / 2 - 4, 0))) animPlaying = !animPlaying;
                 ImGui::SameLine();
-                if (ImGui::Button("Stop", ImVec2(lw / 2 - 4, 0))) { animPlaying = false; animFrame = 0; bodyPose = animFrames[0]; dirty = true; }
+                if (ImGui::Button(T("Stop"), ImVec2(lw / 2 - 4, 0))) { animPlaying = false; animFrame = 0; bodyPose = animFrames[0]; dirty = true; }
                 int fr = (int)animFrame;
                 ImGui::SetNextItemWidth(lw);
-                if (ImGui::SliderInt("##frame", &fr, 0, (int)animFrames.size() - 1, "Frame %d")) { animFrame = (float)fr; bodyPose = animFrames[fr]; dirty = true; }
+                if (ImGui::SliderInt("##frame", &fr, 0, (int)animFrames.size() - 1, T("Frame %d"))) { animFrame = (float)fr; bodyPose = animFrames[fr]; dirty = true; }
                 ImGui::SetNextItemWidth(lw);
-                ImGui::SliderFloat("##speed", &animSpeed, 0.1f, 3, "Speed %.2fx");
-                ImGui::TextDisabled("%d frames at %.0f a second", (int)animFrames.size(), 1 / std::max(animFrameTime, 1e-3f));
+                ImGui::SliderFloat("##speed", &animSpeed, 0.1f, 3, T("Speed %.2fx"));
+                ImGui::TextDisabled(T("%d frames at %.0f a second"), (int)animFrames.size(), 1 / std::max(animFrameTime, 1e-3f));
             }
         } else {
-            groupBox("Expression");
+            groupBox(T("Expression"));
             if (chooser("ex", filesIn("expressions", ".mhpose"), expressionFile, picked, lw)) setExpressionFile(picked);
-            if (filesIn("expressions", ".mhpose").empty()) notYet("MakeHuman's ready-made expressions come with its asset pack; the mixer on the right makes any expression now.");
+            if (filesIn("expressions", ".mhpose").empty()) notYet(T("MakeHuman's ready-made expressions come with its asset pack; the mixer on the right makes any expression now."));
         }
     }
     else if (cat == CAT_RENDERING) renderingLeft(t, lw);
@@ -3525,8 +3550,8 @@ static void frame() {
         else if (cat == CAT_UTILITIES && t == "Shell") shellView();
         else if ((cat == CAT_POSE && t == "Expression") || (cat == CAT_UTILITIES && t == "Expression mixer")) {
             // the Expression mixer: every face pose unit is a slider
-            groupBox("Expression mixer");
-            if (ImGui::Button("Neutral", ImVec2(-1, 0))) { std::fill(unitW.begin(), unitW.end(), 0.0f); expressionFile.clear(); dirty = true; }
+            groupBox(T("Expression mixer"));
+            if (ImGui::Button(T("Neutral"), ImVec2(-1, 0))) { std::fill(unitW.begin(), unitW.end(), 0.0f); expressionFile.clear(); dirty = true; }
             ImGui::BeginChild("units");
             for (size_t k = 1; k < unitNames.size(); ++k) {
                 ImGui::PushID((int)k);
@@ -3582,7 +3607,7 @@ static void frame() {
     ImGui::PushStyleColor(ImGuiCol_WindowBg, col4(C_BG));
     ImGui::Begin("status", nullptr, fixed);
     if (now() < toastUntil) ImGui::TextColored(col4(C_PINK), "%s", toast.c_str());
-    else ImGui::TextDisabled("%s, %.0f years. Drag to turn, right-drag to move, wheel to zoom; right-click a slider to reset it.", units(Human::heightCm(body)).c_str(), Human::ageYears(body));
+    else ImGui::TextDisabled(T("%s, %.0f years. Drag to turn, right-drag to move, wheel to zoom; right-click a slider to reset it."), units(Human::heightCm(body)).c_str(), Human::ageYears(body));
     ImGui::End();
     ImGui::PopStyleColor(); ImGui::PopStyleVar();
 }
@@ -3660,7 +3685,12 @@ int main(int argc, char** argv) {
             while (SDL_PollEvent(&e)) { ImGui_ImplSDL2_ProcessEvent(&e); if (e.type == SDL_QUIT) quit = true; }
             const Uint32 t = SDL_GetTicks() - start;
             if (quit || (ready && t >= 1200)) break;
-            ImGui_ImplOpenGL3_NewFrame(); ImGui_ImplSDL2_NewFrame(); ImGui::NewFrame();
+            if (fontsDirty) {   // a new language: its fonts
+            fontsDirty = false;
+            ImGui::GetIO().Fonts->Clear(); loadFont();
+            ImGui_ImplOpenGL3_DestroyFontsTexture(); ImGui_ImplOpenGL3_CreateFontsTexture();
+        }
+        ImGui_ImplOpenGL3_NewFrame(); ImGui_ImplSDL2_NewFrame(); ImGui::NewFrame();
             std::string what; { std::lock_guard<std::mutex> g(loadMtx); what = loadWhat; }
             Splash::draw(ImGui::GetBackgroundDrawList(), 0, 0, ready ? "Ready" : what.c_str(), ready ? 1.0f : (float)loadFrac);
             ImGui::Render();
@@ -3686,7 +3716,7 @@ int main(int argc, char** argv) {
     loadSettings();
     loadCustomTargets();
     Human::defaultGear(body);
-    { std::string err; if (!Skel::load(rig, (fs::u8path(dataDir) / "rigs" / "default.mhskel").u8string(), err)) say("No skeleton: " + err); }
+    { std::string err; if (!Skel::load(rig, (fs::u8path(dataDir) / "rigs" / "default.mhskel").u8string(), err)) say(T("No skeleton: ") + err); }
     loadFaceUnits();
     category.clear();
     if (!file.empty()) { std::string err; if (!loadModel(file, err)) say(err); }
@@ -3707,6 +3737,7 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     if ((sockCfg.accept || socketArg) && capture.empty()) socketOpen();   // as MakeHuman: the server comes back on if it was on
 #endif
+    Lang::load(dataDir, prefs.language); fontsDirty = !Lang::current().code || strcmp(Lang::current().code, "en") != 0;
     applyStyle();
     if (prefs.hdpi) { float dpi = 96; if (SDL_GetDisplayDPI(0, &dpi, nullptr, nullptr) == 0 && dpi > 96) ImGui::GetIO().FontGlobalScale = dpi / 96; }
     {   // 1_convert_model_tags: old "a,,b" tags in the saved models, once, the files kept as .mhm~
@@ -3736,6 +3767,11 @@ int main(int argc, char** argv) {
                 else { remember("Open"); if (loadModel(f, err)) dirty = true; else say(err); }
                 SDL_free(e.drop.file);
             }
+        }
+        if (fontsDirty) {   // a new language: its fonts
+            fontsDirty = false;
+            ImGui::GetIO().Fonts->Clear(); loadFont();
+            ImGui_ImplOpenGL3_DestroyFontsTexture(); ImGui_ImplOpenGL3_CreateFontsTexture();
         }
         ImGui_ImplOpenGL3_NewFrame(); ImGui_ImplSDL2_NewFrame(); ImGui::NewFrame();
         frame();

@@ -33,7 +33,7 @@ add_library(imgui STATIC
 target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
 target_link_libraries(imgui PUBLIC SDL2::SDL2 OpenGL::GL)
 
-set(SOURCES src/gui.cpp src/splash.cpp src/human.cpp src/skeleton.cpp src/model.cpp src/export.cpp src/material.cpp src/mhscene.cpp src/viewer.cpp src/stb.cpp)
+set(SOURCES src/gui.cpp src/splash.cpp src/human.cpp src/skeleton.cpp src/model.cpp src/export.cpp src/lang.cpp src/material.cpp src/mhscene.cpp src/viewer.cpp src/stb.cpp)
 if(WIN32)
     list(APPEND SOURCES src/app.rc src/http.cpp src/socket.cpp)
 endif()

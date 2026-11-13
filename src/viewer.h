@@ -44,6 +44,7 @@ Look& look();
 // look at a point from a direction (yaw 0: the front; pi/2: the person's left side), from dist away
 void focus(const float at[3], float dist, float yaw, float pitch);
 void focusBody(float yaw, float pitch);         // the whole person
+void viewTarget(float at[3]);                   // the point the view turns round
 float bodyHeight();
 unsigned render(int w, int h, bool hovered);
 void readPixels(std::vector<unsigned char>& rgba, int& w, int& h);

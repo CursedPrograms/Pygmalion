@@ -531,6 +531,7 @@ void focus(const float at[3], float dist, float yaw, float pitch) {
     for (int c = 0; c < 3; ++c) target[c] = at[c];
     lk.dist = dist; lk.yaw = yaw; lk.pitch = pitch;
 }
+void viewTarget(float at[3]) { for (int c = 0; c < 3; ++c) at[c] = target[c]; }
 void focusBody(float yaw, float pitch) {
     target[0] = 0; target[1] = bodyMid; target[2] = 0;
     lk.dist = height * 1.7f; lk.yaw = yaw; lk.pitch = pitch;

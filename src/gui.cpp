@@ -2151,10 +2151,21 @@ static std::string scriptLog;
 static const char* MACRO_NAMES[] = {"Gender", "Age", "Muscle", "Weight", "Height", "BodyProportions", "African", "Asian", "Caucasian", "BreastSize", "BreastFirmness"};
 static const char* COMMANDS = "reset | random 0.5 | describe words\nmacro Gender 0..1 (Age, Muscle, Weight,\n  Height, BodyProportions, African, Asian,\n  Caucasian, BreastSize, BreastFirmness)\nmodifier group/name value\nwear clothes/x/x.mhclo | takeoff hair\nskin skins/x/x.mhmat | skin default\nskeleton game_engine | none\npose standing01 | none\nanimation walk1 | none\nexpression smile01 | none\nbones on | off\nsymmetry on | off\nunits meter (decimeter, centimeter...)\nload file.mhm | save file.mhm\nexport file.fbx (.dae .glb .obj ...)\nrender file.png 1920 1080\nsmooth on | off\nscene studio (makehuman, soft,\n  dramatic, sunset) | scene file.pygscene\n  | scene save file.pygscene\ndownload hair01 (an asset pack)\ninstall file.zip | folder [clothes, hair...]\nget Gender | get group/name (a value)\nlist macros | modifiers | worn | poses\ninfo (the size of everything)";
 // one command; anything it prints goes to out
-static bool runCommand(const std::string& line, std::string& err, const std::function<void(const std::string&)>& out) {
+// MHScript's incrementingFilename: #### in a name counts up, one number per name (person0001, person0002...)
+static std::string numbered(const std::string& s) {
+    const size_t a = s.find('#'); if (a == std::string::npos) return s;
+    size_t e = a; while (e < s.size() && s[e] == '#') ++e;
+    static std::map<std::string, int> counts;
+    const std::string key = s.substr(0, a) + "|" + s.substr(e);
+    char b[16]; snprintf(b, sizeof b, "%0*d", (int)(e - a), ++counts[key]);
+    return s.substr(0, a) + b + s.substr(e);
+}
+static bool runCommand(const std::string& line0, std::string& err, const std::function<void(const std::string&)>& out) {
     PROF("script command");
-    std::istringstream ls(line); std::string cmd; ls >> cmd;
+    std::istringstream ls(line0); std::string cmd; ls >> cmd;
     if (cmd.empty() || cmd[0] == '#') return true;
+    const std::string line = (cmd == "save" || cmd == "export" || cmd == "render" || cmd == "lightmap" || cmd == "uvmap" || cmd == "savetarget") ? numbered(line0) : line0;
+    ls.clear(); ls.str(line); ls >> cmd;
     std::string rest; std::getline(ls >> std::ws, rest);
     std::string a; float v = 0;
     std::istringstream rs(rest); rs >> a >> v;
@@ -2194,7 +2205,31 @@ static bool runCommand(const std::string& line, std::string& err, const std::fun
     else if (cmd == "symmetry") body.symmetry = rest != "off";
     else if (cmd == "bones") { showBones = rest != "off"; Viewer::look().bones = showBones; }
     else if (cmd == "smooth") Viewer::look().smooth = rest != "off";
-    else if (cmd == "camera") { lookFor(rest == "face" ? "faceCamera" : rest); Viewer::update(body); }   // a MakeHuman view: faceCamera, frontView, leftView...
+    else if (cmd == "camera") {   // a MakeHuman view (face, frontView, leftView...), or MHScript's camera calls
+        Viewer::Look& lk = Viewer::look(); float at[3]; Viewer::viewTarget(at);
+        std::istringstream cs(rest); std::string sub; cs >> sub; float x = 0, y = 0, z = 0; int given = 0; if (cs >> x) { ++given; if (cs >> y) { ++given; if (cs >> z) ++given; } }
+        const float DEGS = 57.29578f, home = Viewer::bodyHeight() * 1.7f;
+        char b2[160];
+        if (sub == "rotation" && given > 0) { lk.pitch = std::clamp(x / DEGS, -1.4f, 1.4f); lk.yaw = -y / DEGS; }
+        else if (sub == "rotation") { snprintf(b2, sizeof b2, "rotation x %.2f y %.2f z 0", lk.pitch * DEGS, -lk.yaw * DEGS); out(b2); }
+        else if (sub == "turn") { lk.pitch = std::clamp(lk.pitch + x / DEGS, -1.4f, 1.4f); lk.yaw -= y / DEGS; }
+        else if (sub == "zoom" && given > 0) lk.dist = home / std::max(0.05f, x);
+        else if (sub == "zoom") { snprintf(b2, sizeof b2, "zoom %.3f", home / std::max(0.01f, lk.dist)); out(b2); }
+        else if (sub == "zoomby") lk.dist /= std::max(0.05f, x);
+        else if (sub == "position" && given > 0) { const float p[3] = {x, y, z}; Viewer::focus(p, lk.dist, lk.yaw, lk.pitch); }
+        else if (sub == "position") { snprintf(b2, sizeof b2, "position x %.3f y %.3f z %.3f", at[0], at[1], at[2]); out(b2); }
+        else if (sub == "move") { const float p[3] = {at[0] + x, at[1] + y, at[2] + z}; Viewer::focus(p, lk.dist, lk.yaw, lk.pitch); }
+        else if (sub == "info") { snprintf(b2, sizeof b2, "position %.3f %.3f %.3f  rotation %.2f %.2f 0  zoom %.3f  %s", at[0], at[1], at[2], lk.pitch * DEGS, -lk.yaw * DEGS, home / std::max(0.01f, lk.dist), lk.ortho ? "orthographic" : "perspective"); out(b2); }
+        else { lookFor(sub == "face" ? "faceCamera" : rest); Viewer::update(body); }
+    }
+    else if (cmd == "target") {   // MHScript.applyTarget(name, power)
+        std::string n = a; if (n.size() > 7 && n.compare(n.size() - 7, 7, ".target") == 0) n.resize(n.size() - 7);
+        bool known = false; for (const auto& t : body.targets) { std::string k = t.path; if (k.size() > 7) k.resize(k.size() - 7); if (k == n) known = true; }
+        if (!known) { ok = false; err = "no target " + n + " (relative to data/targets, without .target)"; }
+        else if (v == 0) body.details.erase(n); else body.details[n] = v;
+    }
+    else if (cmd == "details") { Human::apply(body); char b2[200]; for (const auto& t : body.targets) if (t.weight != 0) { snprintf(b2, sizeof b2, "%s %.4f", t.path.c_str(), t.weight); out(b2); } }
+    else if (cmd == "height") { Human::apply(body); char b2[64]; snprintf(b2, sizeof b2, "%.2f cm", Human::heightCm(body)); out(b2); }
     else if (cmd == "massproduce") {   // massproduce N [base]: Mass produce's settings, N people now
         massBuild(); std::istringstream ms(rest); int n = 5; std::string base; ms >> n >> base;
         if (!base.empty()) snprintf(mass.base, sizeof mass.base, "%s", base.c_str());
@@ -2437,18 +2472,73 @@ static void runScript(const std::string& text) {
 #include "sockops.inc"
 #endif
 
+
+// Scripting > Examples: MakeHuman's MHScript examples, as Pygmalion's commands
+static const char* SCRIPT_EXAMPLES[][2] = {
+    {"applyTarget()", "# target <name> <power>: a target on the model (relative to data/targets, without .target); 0 takes it off\ntarget breast/breast-dist-incr 1.0\n"},
+    {"incrementingFilename()", "# #### in a file name counts up each time it's used: person0001.png, person0002.png...\nrender person####.png 800 600\n"},
+    {"getHeightCm()", "# the height in cm\nheight\n"},
+    {"getPositionX()", "camera position\n"}, {"getPositionY()", "camera position\n"}, {"getPositionZ()", "camera position\n"},
+    {"getRotationX()", "camera rotation\n"}, {"getRotationY()", "camera rotation\n"}, {"getRotationZ()", "camera rotation\n"},
+    {"getZoom()", "camera zoom\n"},
+    {"loadModel()", "# load a model (.mhm)\nload models/person.mhm\n"},
+    {"modifyPositionX()", "# camera move x y z: the view's centre moved by that much\ncamera move 1 0 0\n"},
+    {"modifyPositionY()", "camera move 0 1 0\n"}, {"modifyPositionZ()", "camera move 0 0 1\n"},
+    {"modifyRotationX()", "# camera turn x y: degrees added to the view's turn\ncamera turn 10 0\n"},
+    {"modifyRotationY()", "camera turn 0 10\n"}, {"modifyRotationZ()", "# (the view has no roll: Z stays 0)\ncamera turn 0 0\n"},
+    {"modifyZoom()", "# camera zoomby f: closer by that factor\ncamera zoomby 1.2\n"},
+    {"printCameraInfo()", "camera info\n"}, {"printDetailStack()", "# every target in use, with its weight\ndetails\n"},
+    {"printPositionInfo()", "camera position\n"}, {"printRotationInfo()", "camera rotation\n"},
+    {"saveModel()", "# save the model (.mhm)\nsave models/person.mhm\n"},
+    {"screenShot()", "# a picture of the view\nrender screenshot.png\n"},
+    {"setAge()", "# macro Age 0..1 (0.5 is 25 years)\nmacro Age 0.5\n"},
+    {"setPositionX()", "# camera position x y z: the view's centre\ncamera position 0 8.5 0\n"}, {"setPositionY()", "camera position 0 8.5 0\n"}, {"setPositionZ()", "camera position 0 8.5 0\n"},
+    {"setRotationX()", "# camera rotation x y: the view's turn, in degrees\ncamera rotation 0 0\n"}, {"setRotationY()", "camera rotation 0 90\n"}, {"setRotationZ()", "camera rotation 0 0\n"},
+    {"setZoom()", "# camera zoom f: 1 frames the whole person\ncamera zoom 1\n"},
+    {"setWeight()", "macro Weight 0.5\n"},
+    {"setMaterial()", "# material <kind> <file.mhmat>: a material on what's worn (or the skin)\nmaterial skin skins/young_caucasian_female/young_caucasian_female.mhmat\n"},
+    {"setHeadSquareness()", "modifier head/head-square 0.5\n"},
+    {"getModelingParameters()", "list modifiers\n"},
+    {"updateModelingParameter()", "modifier nose/nose-scale-horiz-decr|incr 0.3\n"},
+    {"updateModelingParameters()", "modifier nose/nose-scale-horiz-decr|incr 0.3\nmodifier head/head-age-decr|incr 0.2\n"},
+    {"saveObj()", "# export with the format from the extension: .obj .dae .fbx .glb .stl .mesh.xml .bvh\nexport person.obj\n"},
+};
+static int exampleSel = 0;
+static int canvasW = 0, canvasH = 0, viewW = 0, viewH = 0;   // Fixed canvas size; the 3D view's size now
 static void scriptingLeft(float lw) {
     groupBox("Script");
     ImGui::InputTextMultiline("##sc", script, sizeof script, ImVec2(lw, 300));
     if (ImGui::Button("Run", ImVec2(lw, 30))) { remember("Script"); runScript(script); say("The script ran"); }
     if (ImGui::Button("Load...", ImVec2(lw / 2 - 4, 0))) {
-        const std::string p = fileDialog(false, L"Pygmalion script\0*.pyg;*.txt\0\0", L"pyg", homeDir() + "\\");
+        const std::string p = fileDialog(false, L"Pygmalion script\0*.pyg;*.pygscript;*.txt\0\0", L"pyg", homeDir() + "\\");
         if (!p.empty()) { std::ifstream in(fs::u8path(p)); std::ostringstream ss; ss << in.rdbuf(); snprintf(script, sizeof script, "%s", ss.str().c_str()); }
     }
     ImGui::SameLine();
     if (ImGui::Button("Save...", ImVec2(lw / 2 - 4, 0))) {
         const std::string p = fileDialog(true, L"Pygmalion script\0*.pyg\0\0", L"pyg", homeDir() + "\\script.pyg");
         if (!p.empty()) { std::ofstream o(fs::u8path(p)); o << script; }
+    }
+    groupBox("Examples");
+    ImGui::TextUnformatted("Append example to script");
+    ImGui::BeginChild("ex", ImVec2(lw, 160), true);
+    for (int k = 0; k < (int)(sizeof SCRIPT_EXAMPLES / sizeof SCRIPT_EXAMPLES[0]); ++k) if (ImGui::Selectable(SCRIPT_EXAMPLES[k][0], exampleSel == k)) exampleSel = k;
+    ImGui::EndChild();
+    if (ImGui::Button("Append", ImVec2(lw, 0))) {
+        std::string t = script; if (!t.empty() && t.back() != '\n') t += "\n";
+        t += SCRIPT_EXAMPLES[exampleSel][1];
+        snprintf(script, sizeof script, "%s", t.c_str());
+    }
+    groupBox("Fixed canvas size");
+    ImGui::SetNextItemWidth(lw); ImGui::InputInt("Width", &canvasW);
+    ImGui::SetNextItemWidth(lw); ImGui::InputInt("Height", &canvasH);
+    if (ImGui::Button("Get", ImVec2(lw / 2 - 4, 0))) { canvasW = viewW; canvasH = viewH; }
+    ImGui::SameLine();
+    if (ImGui::Button("Set", ImVec2(lw / 2 - 4, 0))) {
+        if (canvasW < 100 || canvasH < 100) say("Width and height must be at least 100 pixels each");
+        else {   // the window grows or shrinks by what the view is short of
+            SDL_Window* w = SDL_GL_GetCurrentWindow(); int ww, wh; SDL_RestoreWindow(w); SDL_GetWindowSize(w, &ww, &wh);
+            SDL_SetWindowSize(w, ww + (canvasW - viewW), wh + (canvasH - viewH));
+        }
     }
 }
 static std::vector<std::string> shellLines = {"Pygmalion's shell: a command a line (help lists them)."}, shellHistory;
@@ -2464,12 +2554,17 @@ static void shellRun(const std::string& line) {
     if (!ok) shellLines.push_back(err);
     dirty = true;
 }
-static char mixName[64] = "my expression", mixDesc[256] = "";
+static char mixName[64] = "my expression", mixDesc[256] = "No description set", mixTags[256] = "", mixAuthor[128] = "MakeHuman Team", mixCopyright[128] = "", mixLicense[128] = "CC0", mixSite[256] = "http://www.makehumancommunity.org";
 static void mixerLeft(float lw) {
     groupBox("Expression mixer");
     notYet("Every face pose unit is a slider on the right. Mix them, then save the mix: it joins Pose/Animate > Expression.");
     ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##mn", "name", mixName, sizeof mixName);
     ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##md", "description", mixDesc, sizeof mixDesc);
+    ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##mt", "Tags (separate with ;)", mixTags, sizeof mixTags);
+    ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##ma", "Author", mixAuthor, sizeof mixAuthor);
+    ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##mc", "Copyright", mixCopyright, sizeof mixCopyright);
+    ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##ml", "License", mixLicense, sizeof mixLicense);
+    ImGui::SetNextItemWidth(lw); ImGui::InputTextWithHint("##mw", "Website", mixSite, sizeof mixSite);
     auto json = [](const std::string& t) { std::string o; for (char c : t) { if (c == '"' || c == '\\') o += '\\'; o += c; } return o; };
     if (ImGui::Button("Save the expression", ImVec2(lw, 0))) {
         std::string name = mixName; for (char& c : name) if (strchr("\\/:*?\"<>|", c)) c = '_';
@@ -2477,10 +2572,12 @@ static void mixerLeft(float lw) {
         std::error_code ec; const fs::path dir = fs::u8path(userDataDir()) / "expressions"; fs::create_directories(dir, ec);
         const fs::path f = dir / fs::u8path(name + ".mhpose");
         std::ofstream o(f);
-        o << "{\n    \"name\": \"" << json(mixName) << "\",\n    \"description\": \"" << json(mixDesc) << "\",\n    \"tags\": [],\n    \"unit_poses\": {";
+        std::string tags; { std::istringstream ts(mixTags); std::string t; int k = 0; while (std::getline(ts, t, ';')) { while (!t.empty() && t.front() == ' ') t.erase(t.begin()); while (!t.empty() && t.back() == ' ') t.pop_back(); tags += (k++ ? ", \"" : "\"") + json(t) + "\""; } }
+        o << "{\n    \"name\": \"" << json(mixName) << "\",\n    \"description\": \"" << json(mixDesc) << "\",\n    \"tags\": [" << tags << "],\n    \"unit_poses\": {";
         bool first = true;
         for (size_t k = 1; k < unitW.size() && k < unitNames.size(); ++k) if (unitW[k] > 0) { o << (first ? "\n" : ",\n") << "        \"" << json(unitNames[k]) << "\": " << unitW[k]; first = false; }
-        o << "\n    }\n}\n";
+        o << "\n    },\n    \"author\": \"" << json(mixAuthor) << "\",\n    \"copyright\": \"" << json(mixCopyright) << "\",\n    \"license\": \"" << json(mixLicense)
+          << "\",\n    \"homepage\": \"" << json(mixSite) << "\"\n}\n";
         if (o) { expressionFile = f.u8string(); say("Saved " + f.u8string()); } else say("Couldn't write " + f.u8string());
     }
     if (ImGui::Button("Load an expression...", ImVec2(lw, 0))) {
@@ -3073,6 +3170,7 @@ static void frame() {
         dirty = false;
     }
     const ImVec2 a = ImGui::GetCursorScreenPos(), size = ImGui::GetContentRegionAvail();
+    viewW = (int)size.x; viewH = (int)size.y;
     ImGui::InvisibleButton("v", size, ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight | ImGuiButtonFlags_MouseButtonMiddle);
     const unsigned tex = Viewer::render((int)size.x, (int)size.y, ImGui::IsItemHovered() || ImGui::IsItemActive());
     ImGui::GetWindowDrawList()->AddImage((ImTextureID)(intptr_t)tex, a, ImVec2(a.x + size.x, a.y + size.y), ImVec2(0, 1), ImVec2(1, 0));

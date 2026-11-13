@@ -100,6 +100,7 @@ struct Body {
     std::vector<std::string> tags;
     float camera[6] = {0, 0, 0, 0, 0, 1};   // MakeHuman's: rotation x, y (degrees), translation x, y, z, zoom
     bool subdivide = false, hasCamera = false;
+    std::map<std::string, float> details;   // targets put on directly (MakeHuman's setDetail / applyTarget): "nose/nose-scale-horiz-incr" -> power
 };
 // a file's tags (MakeHuman's "tag" lines, a model's "tags a;b", a pose's .meta) and its "name" line, for the choosers
 const std::vector<std::string>& fileTags(const std::string& path);

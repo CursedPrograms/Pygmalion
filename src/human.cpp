@@ -767,6 +767,10 @@ void apply(Body& b) {
         auto it = factor.find(t.group);
         float w = it == factor.end() ? 0.0f : it->second;
         for (int v : t.vars) w *= b.val[v];
+        if (!b.details.empty()) {   // a target put on by hand, on top
+            std::string key = t.path; if (key.size() > 7 && key.compare(key.size() - 7, 7, ".target") == 0) key.resize(key.size() - 7);
+            auto d = b.details.find(key); if (d != b.details.end()) w += d->second;
+        }
         const float dw = w - t.weight;
         if (std::fabs(dw) < 1e-7f) continue;
         for (size_t k = 0; k < t.idx.size(); ++k) {

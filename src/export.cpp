@@ -619,6 +619,66 @@ bool saveOgre(const std::vector<Part>& parts, const Skel::Skeleton* s, const std
 }
 
 // ---------- the UV map ----------
+bool saveLightmap(const Human::Body& b, const std::string& path, int size, std::string& err) {
+    const std::vector<float>& pos = b.shown.empty() ? b.pos : b.shown;
+    // the faces shown (not under clothes), their vertex normals, and each vertex's light: N.L to the light, 0..255
+    const std::vector<char> hid = Human::hiddenVerts(b);
+    std::vector<int> tri, tuv;
+    for (size_t t = 0; t + 2 < b.tri.size(); t += 3) {
+        if (hid[b.tri[t]] || hid[b.tri[t + 1]] || hid[b.tri[t + 2]]) continue;
+        tri.insert(tri.end(), {b.tri[t], b.tri[t + 1], b.tri[t + 2]}); tuv.insert(tuv.end(), {b.triUv[t], b.triUv[t + 1], b.triUv[t + 2]});
+    }
+    std::vector<float> n; normalsOf(pos, b.tri, n);
+    const float L[3] = {-10.99f, 20.0f, 20.0f};
+    std::vector<float> lit(pos.size() / 3);
+    for (size_t v = 0; v < lit.size(); ++v) {
+        float d[3] = {L[0] - pos[v * 3], L[1] - pos[v * 3 + 1], L[2] - pos[v * 3 + 2]};
+        const float l = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]); if (l > 0) for (float& c : d) c /= l;
+        const float s = d[0] * n[v * 3] + d[1] * n[v * 3 + 1] + d[2] * n[v * 3 + 2];
+        lit[v] = std::max(0.0f, std::min(255.0f, std::floor(s * 256)));
+    }
+    std::vector<unsigned char> px((size_t)size * size * 4, 0);
+    // each triangle filled in uv space (x = u W, y = H - v H), its corners' light blended across it
+    for (size_t t = 0; t + 2 < tri.size(); t += 3) {
+        float x[3], y[3], c[3];
+        bool ok = true;
+        for (int k = 0; k < 3; ++k) {
+            const int u = tuv[t + k]; if (u < 0 || (size_t)u * 2 + 1 >= b.uv.size()) { ok = false; break; }
+            x[k] = b.uv[(size_t)u * 2] * size; y[k] = size - b.uv[(size_t)u * 2 + 1] * size; c[k] = lit[tri[t + k]];
+        }
+        if (!ok) continue;
+        const float area = (x[1] - x[0]) * (y[2] - y[0]) - (x[2] - x[0]) * (y[1] - y[0]);
+        if (std::fabs(area) < 1e-12f) continue;
+        const int x0 = std::max(0, (int)std::floor(std::min({x[0], x[1], x[2]}))), x1 = std::min(size - 1, (int)std::ceil(std::max({x[0], x[1], x[2]})));
+        const int y0 = std::max(0, (int)std::floor(std::min({y[0], y[1], y[2]}))), y1 = std::min(size - 1, (int)std::ceil(std::max({y[0], y[1], y[2]})));
+        for (int py = y0; py <= y1; ++py)
+            for (int pxl = x0; pxl <= x1; ++pxl) {
+                const float sx = pxl + 0.5f, sy = py + 0.5f;
+                const float w0 = ((x[1] - sx) * (y[2] - sy) - (x[2] - sx) * (y[1] - sy)) / area;
+                const float w1 = ((x[2] - sx) * (y[0] - sy) - (x[0] - sx) * (y[2] - sy)) / area;
+                const float w2 = 1 - w0 - w1;
+                if (w0 < -1e-4f || w1 < -1e-4f || w2 < -1e-4f) continue;
+                const unsigned char v = (unsigned char)std::max(0.0f, std::min(255.0f, w0 * c[0] + w1 * c[1] + w2 * c[2]));
+                unsigned char* q = &px[((size_t)py * size + pxl) * 4];
+                q[0] = q[1] = q[2] = v; q[3] = 255;
+            }
+    }
+    // fixSeams: the empty pixels next to painted ones take their neighbours' average (one pixel of border)
+    std::vector<unsigned char> out = px;
+    for (int py = 0; py < size; ++py)
+        for (int pxl = 0; pxl < size; ++pxl) {
+            if (px[((size_t)py * size + pxl) * 4 + 3]) continue;
+            int sum = 0, cnt = 0;
+            for (int dy = -1; dy <= 1; ++dy) for (int dx = -1; dx <= 1; ++dx) {
+                const int qx = pxl + dx, qy = py + dy;
+                if ((dx || dy) && qx >= 0 && qy >= 0 && qx < size && qy < size && px[((size_t)qy * size + qx) * 4 + 3]) { sum += px[((size_t)qy * size + qx) * 4]; ++cnt; }
+            }
+            if (cnt) { unsigned char* q = &out[((size_t)py * size + pxl) * 4]; q[0] = q[1] = q[2] = (unsigned char)(sum / cnt); q[3] = 255; }
+        }
+    if (!stbi_write_png(path.c_str(), size, size, 4, out.data(), size * 4)) { err = "Couldn't write " + path; return false; }
+    return true;
+}
+
 bool saveUvMap(const Human::Body& b, const std::string& path, int size, std::string& err) {
     std::vector<unsigned char> px((size_t)size * size * 4);
     for (size_t i = 0; i < px.size(); i += 4) { px[i] = px[i + 1] = px[i + 2] = 0x24; px[i + 3] = 255; }

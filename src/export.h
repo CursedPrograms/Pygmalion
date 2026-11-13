@@ -39,6 +39,9 @@ bool saveObj(const std::vector<Part>& parts, const std::string& path, const Opti
 bool saveOgre(const std::vector<Part>& parts, const Skel::Skeleton* s, const std::string& path, const Options& o, std::string& err);
 // the body's uv layout as lines on a square picture (size x size)
 bool saveUvMap(const Human::Body& b, const std::string& path, int size, std::string& err);
+// MakeHuman's Lightmap export (9_export_light, projection.mapLighting): one light at (-10.99, 20, 20) baked into the
+// body's uv layout - each vertex's N.L, filled over the faces, the seams grown by a pixel - size x size
+bool saveLightmap(const Human::Body& b, const std::string& path, int size, std::string& err);
 // the textures beside the export: copies each part's texture next to path, and returns the parts pointing there
 std::vector<Part> withTexturesBeside(const std::vector<Part>& parts, const std::string& path);
 

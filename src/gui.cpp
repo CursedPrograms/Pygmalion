@@ -827,9 +827,9 @@ static bool loadModel(const std::string& path, std::string& err) {
 }
 static char saveName[128] = "person";
 static int exportFormat = 0; static int exportUnits = 1; static bool exportFeet = true, exportPosed = true, exportAnim = false;
-enum { EX_DAE, EX_FBX, EX_GLB, EX_OBJ, EX_OGRE, EX_STL, EX_BVH, EX_UV, EX_COUNT };
-static const char* EXPORT_NAMES[] = {"Collada (dae)", "Filmbox (fbx)", "glTF binary (glb)", "Wavefront obj", "Ogre3D", "Stereolithography (stl)", "Biovision Hierarchy (bvh)", "UV map (png)"};
-static const char* EXPORT_EXT[] = {".dae", ".fbx", ".glb", ".obj", ".mesh.xml", ".stl", ".bvh", ".png"};
+enum { EX_DAE, EX_FBX, EX_GLB, EX_OBJ, EX_OGRE, EX_STL, EX_BVH, EX_UV, EX_LIGHT, EX_COUNT };
+static const char* EXPORT_NAMES[] = {"Collada (dae)", "Filmbox (fbx)", "glTF binary (glb)", "Wavefront obj", "Ogre3D", "Stereolithography (stl)", "Biovision Hierarchy (bvh)", "UV map (png)", "Lightmap (png)"};
+static const char* EXPORT_EXT[] = {".dae", ".fbx", ".glb", ".obj", ".mesh.xml", ".stl", ".bvh", ".png", ".png"};
 static const char* UNIT_NAMES[] = {"decimeter", "meter", "centimeter", "millimeter", "inch"};
 static const float UNIT_SCALE[] = {1, 0.1f, 10, 100, 3.93700787f};
 static const float UNIT_CM[] = {10, 100, 1, 0.1f, 2.54f};
@@ -845,6 +845,7 @@ static bool exportTo(const std::string& p, int fmt, std::string& err) {
         return Export::saveObj(Export::withTexturesBeside(Export::parts(body, nullptr, exportPosed), p), p, o, err);
     }
     if (fmt == EX_UV) return Export::saveUvMap(body, p, 2048, err);
+    if (fmt == EX_LIGHT) return Export::saveLightmap(body, p, 1024, err);
     if (fmt == EX_BVH) {
         const Skel::Skeleton& sk = chosen.empty() ? rig : chosen;
         if (sk.empty()) { err = "No skeleton to export"; return false; }
@@ -911,6 +912,7 @@ static void filesLeft(float w) {
             ImGui::TextDisabled(chosen.empty() ? "No skeleton is chosen (Pose/Animate > Skeleton): the mesh goes without one." : "With the %s skeleton and its weights; textures are copied beside it.", chosen.name.c_str());
         else if (exportFormat == EX_BVH) ImGui::TextDisabled("The %s skeleton and the current pose (or the animation).", chosen.empty() ? "default" : chosen.name.c_str());
         else if (exportFormat == EX_UV) ImGui::TextDisabled("The body's UV layout as a 2048 x 2048 picture, for painting skins.");
+        else if (exportFormat == EX_LIGHT) ImGui::TextDisabled("MakeHuman's lightmap: one light, from the front left and above, baked into the body's UV layout (1024 x 1024).");
         ImGui::PopTextWrapPos();
     }
 }
@@ -1685,12 +1687,13 @@ static bool runCommand(const std::string& line, std::string& err, const std::fun
     else if (cmd == "units") { ok = false; for (int k = 0; k < 5; ++k) if (rest == UNIT_NAMES[k]) { exportUnits = k; ok = true; } if (!ok) err = "units: decimeter, meter, centimeter, millimeter or inch"; }
     else if (cmd == "load") ok = loadModel(rest, err);
     else if (cmd == "save") ok = saveModel(rest, fs::u8path(rest).stem().u8string(), err);
+    else if (cmd == "lightmap" || cmd == "uvmap") { Human::apply(body); if (!rig.empty()) Skel::build(rig, body.pos); repose(); ok = exportTo(rest, cmd == "lightmap" ? EX_LIGHT : EX_UV, err); }
     else if (cmd == "export" || cmd == "render") {
         Human::apply(body); if (!rig.empty()) Skel::build(rig, body.pos); if (!chosen.empty()) Skel::build(chosen, body.pos); repose(); Viewer::update(body);
         if (cmd == "export") {
             int fmt = -1;
             for (int k = 0; k < EX_COUNT; ++k) { const std::string e = EXPORT_EXT[k]; if (rest.size() > e.size() && rest.compare(rest.size() - e.size(), e.size(), e) == 0) fmt = k; }
-            if (fmt == EX_UV) fmt = -1;
+            if (fmt == EX_UV || fmt == EX_LIGHT) fmt = -1;
             if (fmt < 0) { ok = false; err = "export: name the file with .dae .fbx .glb .obj .mesh.xml .stl or .bvh"; } else ok = exportTo(rest, fmt, err);
         } else {
             std::string path; int w = renderW, h = renderH; std::istringstream r2(rest); r2 >> path >> w >> h;

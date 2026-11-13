@@ -333,6 +333,9 @@ struct Prefs {
     int win[4] = {0, 0, 0, 0};     // the window's place and size, kept when restoreWindow is on
 };
 static Prefs prefs;
+static std::string shortcutSettings();                                   // (Settings > Shortcuts, kept with the rest)
+static void shortcutSetting(const std::string& id, const std::string& v);
+static std::string lastExport;                                           // Quick export (Alt+E): the last export, made again
 // Settings > Plugins and User Plugins: the parts left out ("Category/Task", as at the start) and the scripts run at the start
 static std::set<std::string> excludedTasks, excludedAtStart;
 static std::vector<std::string> activeUserPlugins;
@@ -352,6 +355,7 @@ static void saveSettings() {
       << "\nrestoreWindow=" << prefs.restoreWindow << "\nhdpi=" << prefs.hdpi << "\nnoSampleBuffers=" << prefs.noSampleBuffers << "\nsliderEdit=" << prefs.sliderEdit
       << "\nexcluded=" << [] { std::string s; for (const auto& e : excludedTasks) s += (s.empty() ? "" : "|") + e; return s; }()
       << "\nuserPlugins=" << [] { std::string s; for (const auto& e : activeUserPlugins) s += (s.empty() ? "" : "|") + e; return s; }()
+      << shortcutSettings()
       << "\ntheme=" << theme << "\nwindow=" << prefs.win[0] << " " << prefs.win[1] << " " << prefs.win[2] << " " << prefs.win[3] << "\n";
     o << "socketAccept=" << sockCfg.accept << "\nsocketAdvanced=" << sockCfg.advanced << "\nsocketHost=" << sockCfg.host << "\nsocketPort=" << sockCfg.port << "\n";
 }
@@ -376,6 +380,7 @@ static void loadSettings() {
         else if (k == "preload") prefs.preload = b; else if (k == "restoreWindow") prefs.restoreWindow = b; else if (k == "hdpi") prefs.hdpi = b;
         else if (k == "noSampleBuffers") prefs.noSampleBuffers = b; else if (k == "sliderEdit") prefs.sliderEdit = b;
         else if (k == "theme") theme = std::clamp(atoi(v.c_str()), 0, 2);
+        else if (k.rfind("shortcut.", 0) == 0) shortcutSetting(k.substr(9), v);
         else if (k == "excluded") { excludedTasks.clear(); std::istringstream es(v); std::string one; while (std::getline(es, one, '|')) if (!one.empty()) excludedTasks.insert(one); excludedAtStart = excludedTasks; }
         else if (k == "userPlugins") { activeUserPlugins.clear(); std::istringstream es(v); std::string one; while (std::getline(es, one, '|')) if (!one.empty()) activeUserPlugins.push_back(one); }
         else if (k == "window") { std::istringstream ws(v); for (int& c : prefs.win) ws >> c; }
@@ -1029,6 +1034,7 @@ static std::string findData(const std::string& rel, const char* sub) {
     return f;
 }
 static const char* SIDE_NAMES_M[] = {"front", "back", "left", "right", "top", "bottom", "other"};   // MakeHuman's background sides
+static bool wantShot = false;   // a picture of the view asked for (F12, Alt+G)
 static char saveName[128] = "person";   // the file name (and the model's name when it has none of its own)
 static bool saveModel(const std::string& path, const std::string& name, std::string& err) {
     {   // MakeHuman's camera line: rotation x, y in degrees, translation, zoom
@@ -1196,7 +1202,7 @@ static void filesLeft(float w) {
             filter += L"\0\0";
             for (char c : dot.substr(dot.rfind('.') + 1)) ext += (wchar_t)c;
             const std::string p = fileDialog(true, filter.c_str(), ext.c_str(), homeDir() + "\\" + saveName + dot);
-            if (!p.empty()) { std::string err; say(exportTo(p, exportFormat, err) ? "Exported " + fs::u8path(p).filename().u8string() : err); }
+            if (!p.empty()) { std::string err; const bool done = exportTo(p, exportFormat, err); if (done) lastExport = p; say(done ? "Exported " + fs::u8path(p).filename().u8string() : err); }
         }
         ImGui::PushTextWrapPos(w);
         if (exportFormat == EX_DAE || exportFormat == EX_FBX || exportFormat == EX_OGRE)
@@ -1286,7 +1292,8 @@ static void toolbar(float x, float y, float w) {
     if (btn("Face", "The face, close")) lookFor("faceCamera");
     if (btn("Home", "The whole person, from the front")) Viewer::focusBody(0, 0.05f);
     gap();
-    if (btn("Shot", "Save a picture of the view (F12)") || (!ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_F12, false))) {
+    if (btn("Shot", "Save a picture of the view (F12)") || wantShot) {
+        wantShot = false;
         const std::string p = fileDialog(true, L"PNG\0*.png\0\0", L"png", homeDir() + "\\screenshot.png");
         if (!p.empty()) { wantThumb = true; thumbPath = p; }
     }
@@ -3045,35 +3052,105 @@ static void notYet(const char* what) {
     ImGui::PopTextWrapPos();
 }
 
-static const char* SHORTCUTS[][2] = {
-    {"Ctrl+Z", "Undo"}, {"Ctrl+Y", "Redo"}, {"Ctrl+M", "Modelling"}, {"Ctrl+S", "Save"}, {"Ctrl+L", "Load"}, {"Ctrl+E", "Export"},
-    {"Ctrl+R", "Rendering"}, {"Ctrl+H", "Help"}, {"Ctrl+W", "Wireframe"}, {"Ctrl+Alt+S", "Smooth"}, {"Ctrl+B", "Show the bones"},
-    {"Ctrl+Q", "Quit"}, {"1 / Ctrl+1", "Front / back view"}, {"3 / Ctrl+3", "Right / left side"}, {"7 / Ctrl+7", "Top / bottom view"},
-    {"Home", "The whole person, from the front"}, {"F12", "A picture of the view"}};
+// ---------- Settings > Shortcuts: MakeHuman's (5_settings_shortcuts and mhmain's defaults), each one changeable ----------
+enum { M_CTRL = 1, M_ALT = 2, M_SHIFT = 4 };
+struct Shortcut { const char* id; const char* label; const char* group; int mods; ImGuiKey key; int defMods; ImGuiKey defKey; };
+static Shortcut SHORTCUTS[] = {
+    {"rotateU", "Rotate up", "Camera", 0, ImGuiKey_Keypad8, 0, ImGuiKey_Keypad8}, {"rotateD", "Rotate down", "Camera", 0, ImGuiKey_Keypad2, 0, ImGuiKey_Keypad2},
+    {"rotateL", "Rotate left", "Camera", 0, ImGuiKey_Keypad4, 0, ImGuiKey_Keypad4}, {"rotateR", "Rotate right", "Camera", 0, ImGuiKey_Keypad6, 0, ImGuiKey_Keypad6},
+    {"panU", "Pan up", "Camera", 0, ImGuiKey_UpArrow, 0, ImGuiKey_UpArrow}, {"panD", "Pan down", "Camera", 0, ImGuiKey_DownArrow, 0, ImGuiKey_DownArrow},
+    {"panL", "Pan left", "Camera", 0, ImGuiKey_LeftArrow, 0, ImGuiKey_LeftArrow}, {"panR", "Pan right", "Camera", 0, ImGuiKey_RightArrow, 0, ImGuiKey_RightArrow},
+    {"zoomIn", "Zoom in", "Camera", 0, ImGuiKey_KeypadAdd, 0, ImGuiKey_KeypadAdd}, {"zoomOut", "Zoom out", "Camera", 0, ImGuiKey_KeypadSubtract, 0, ImGuiKey_KeypadSubtract},
+    {"front", "Front view", "Camera", 0, ImGuiKey_1, 0, ImGuiKey_1}, {"right", "Right view", "Camera", 0, ImGuiKey_3, 0, ImGuiKey_3},
+    {"top", "Top view", "Camera", 0, ImGuiKey_7, 0, ImGuiKey_7}, {"back", "Back view", "Camera", M_CTRL, ImGuiKey_1, M_CTRL, ImGuiKey_1},
+    {"left", "Left view", "Camera", M_CTRL, ImGuiKey_3, M_CTRL, ImGuiKey_3}, {"bottom", "Bottom view", "Camera", M_CTRL, ImGuiKey_7, M_CTRL, ImGuiKey_7},
+    {"resetCam", "Reset camera", "Camera", 0, ImGuiKey_Period, 0, ImGuiKey_Period},
+    {"undo", "Undo", "Actions", M_CTRL, ImGuiKey_Z, M_CTRL, ImGuiKey_Z}, {"redo", "Redo", "Actions", M_CTRL, ImGuiKey_Y, M_CTRL, ImGuiKey_Y},
+    {"wireframe", "Wireframe", "Actions", M_CTRL, ImGuiKey_F, M_CTRL, ImGuiKey_F}, {"smooth", "Smooth", "Actions", M_ALT, ImGuiKey_S, M_ALT, ImGuiKey_S},
+    {"qexport", "Quick export", "Actions", M_ALT, ImGuiKey_E, M_ALT, ImGuiKey_E}, {"grab", "Grab screen", "Actions", M_ALT, ImGuiKey_G, M_ALT, ImGuiKey_G},
+    {"profiling", "Profiling", "Actions", M_ALT, ImGuiKey_P, M_ALT, ImGuiKey_P}, {"savetgt", "Save Targets", "Actions", M_ALT, ImGuiKey_T, M_ALT, ImGuiKey_T},
+    {"bones", "Show the bones", "Actions", M_CTRL, ImGuiKey_B, M_CTRL, ImGuiKey_B}, {"shot", "A picture of the view", "Actions", 0, ImGuiKey_F12, 0, ImGuiKey_F12},
+    {"modelling", "Modelling", "Navigation", M_CTRL, ImGuiKey_M, M_CTRL, ImGuiKey_M}, {"save", "Save", "Navigation", M_CTRL, ImGuiKey_S, M_CTRL, ImGuiKey_S},
+    {"load", "Load", "Navigation", M_CTRL, ImGuiKey_L, M_CTRL, ImGuiKey_L}, {"export", "Export", "Navigation", M_CTRL, ImGuiKey_E, M_CTRL, ImGuiKey_E},
+    {"rendering", "Rendering", "Navigation", M_CTRL, ImGuiKey_R, M_CTRL, ImGuiKey_R}, {"help", "Help", "Navigation", M_CTRL, ImGuiKey_H, M_CTRL, ImGuiKey_H},
+    {"exit", "Exit", "Navigation", M_CTRL, ImGuiKey_Q, M_CTRL, ImGuiKey_Q},
+};
+static std::string shortcutText(int mods, ImGuiKey k) {
+    if (k == ImGuiKey_None) return "(none)";
+    std::string t; if (mods & M_CTRL) t += "Ctrl+"; if (mods & M_ALT) t += "Alt+"; if (mods & M_SHIFT) t += "Shift+";
+    return t + ImGui::GetKeyName(k);
+}
+static std::string shortcutSettings() { std::string t; for (const auto& sc : SHORTCUTS) t += "\nshortcut." + std::string(sc.id) + "=" + std::to_string(sc.mods) + " " + std::to_string((int)sc.key); return t; }
+static void shortcutSetting(const std::string& id, const std::string& v) { for (auto& sc : SHORTCUTS) if (id == sc.id) { std::istringstream ks(v); int m = 0, key = 0; if (ks >> m >> key) { sc.mods = m; sc.key = (ImGuiKey)key; } } }
+static Shortcut* capturing = nullptr;   // the shortcut waiting for its new keys
 static void goTo(int c, const char* t) { forcedTab = c; forcedTask = t; }
+static void runShortcut(const std::string& id) {
+    Viewer::Look& lk = Viewer::look();
+    const float PI = 3.14159265f, step = 5 * PI / 180;
+    float at[3]; Viewer::viewTarget(at);
+    if (id == "rotateU") lk.pitch = std::clamp(lk.pitch + step, -1.5f, 1.5f); else if (id == "rotateD") lk.pitch = std::clamp(lk.pitch - step, -1.5f, 1.5f);
+    else if (id == "rotateL") lk.yaw += step; else if (id == "rotateR") lk.yaw -= step;
+    else if (id == "panU" || id == "panD" || id == "panL" || id == "panR") {
+        const float k = lk.dist * 0.03f, cy = std::cos(lk.yaw), sy = std::sin(lk.yaw);
+        if (id == "panU") at[1] += k; else if (id == "panD") at[1] -= k; else if (id == "panL") { at[0] -= k * cy; at[2] += k * sy; } else { at[0] += k * cy; at[2] -= k * sy; }
+        Viewer::focus(at, lk.dist, lk.yaw, lk.pitch);
+    }
+    else if (id == "zoomIn") lk.dist *= 0.9f; else if (id == "zoomOut") lk.dist /= 0.9f;
+    else if (id == "front") Viewer::focusBody(0, 0.05f); else if (id == "back") Viewer::focusBody(PI, 0.05f);
+    else if (id == "right") Viewer::focusBody(-PI / 2, 0.05f); else if (id == "left") Viewer::focusBody(PI / 2, 0.05f);
+    else if (id == "top") Viewer::focusBody(0, 1.5f); else if (id == "bottom") Viewer::focusBody(0, -1.5f);
+    else if (id == "resetCam") Viewer::focusBody(0, 0.05f);
+    else if (id == "undo") { if (!undo.empty()) { redo.push_back({snapshot(), undo.back().second}); restore(undo.back().first); undo.pop_back(); dirty = true; } }
+    else if (id == "redo") { if (!redo.empty()) { undo.push_back({snapshot(), redo.back().second}); restore(redo.back().first); redo.pop_back(); dirty = true; } }
+    else if (id == "wireframe") lk.wire = !lk.wire;
+    else if (id == "smooth") { lk.smooth = !lk.smooth; dirty = true; }
+    else if (id == "qexport") { if (lastExport.empty()) goTo(CAT_FILES, "Export"); else { std::string err; int fmt = -1; for (int k = 0; k < EX_COUNT; ++k) { const std::string e = EXPORT_EXT[k]; if (lastExport.size() > e.size() && lastExport.compare(lastExport.size() - e.size(), e.size(), e) == 0) fmt = k; } say(fmt >= 0 && exportTo(lastExport, fmt, err) ? "Exported " + lastExport : err); } }
+    else if (id == "grab" || id == "shot") wantShot = true;
+    else if (id == "profiling") goTo(CAT_UTILITIES, "Profile");
+    else if (id == "savetgt") { std::string err; std::string n = targetName; if (fs::u8path(n).extension() != ".target") n += ".target"; saveFullTarget((fs::u8path(targetsDir()) / n).u8string()); }
+    else if (id == "bones") { showBones = !showBones; lk.bones = showBones; }
+    else if (id == "modelling") goTo(CAT_MODELLING, "Main"); else if (id == "save") goTo(CAT_FILES, "Save"); else if (id == "load") goTo(CAT_FILES, "Load");
+    else if (id == "export") goTo(CAT_FILES, "Export"); else if (id == "rendering") goTo(CAT_RENDERING, "Render"); else if (id == "help") goTo(CAT_HELP, "Help");
+    else if (id == "exit") quit = true;
+}
 static void shortcuts() {
     ImGuiIO& io = ImGui::GetIO();
+    const int mods = (io.KeyCtrl ? M_CTRL : 0) | (io.KeyAlt ? M_ALT : 0) | (io.KeyShift ? M_SHIFT : 0);
+    if (capturing) {   // the next key (with its modifiers) becomes the shortcut; Escape leaves it as it was
+        for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; ++k) {
+            const ImGuiKey key = (ImGuiKey)k;
+            if (key == ImGuiKey_LeftCtrl || key == ImGuiKey_RightCtrl || key == ImGuiKey_LeftAlt || key == ImGuiKey_RightAlt || key == ImGuiKey_LeftShift || key == ImGuiKey_RightShift ||
+                key == ImGuiKey_ReservedForModCtrl || key == ImGuiKey_ReservedForModAlt || key == ImGuiKey_ReservedForModShift || key == ImGuiKey_ReservedForModSuper || (k >= ImGuiKey_MouseLeft && k <= ImGuiKey_MouseWheelY)) continue;
+            if (!ImGui::IsKeyPressed(key, false)) continue;
+            if (key != ImGuiKey_Escape) {
+                for (auto& o : SHORTCUTS) if (&o != capturing && o.key == key && o.mods == mods) { say("That shortcut is already " + std::string(o.label)); capturing = nullptr; return; }
+                capturing->key = key; capturing->mods = mods;
+            }
+            capturing = nullptr; return;
+        }
+        return;
+    }
     if (io.WantTextInput) return;
-    auto key = [&](ImGuiKey k) { return ImGui::IsKeyPressed(k, false); };
-    if (io.KeyCtrl && !io.KeyAlt) {
-        if (key(ImGuiKey_M)) goTo(CAT_MODELLING, "Main");
-        if (key(ImGuiKey_S)) goTo(CAT_FILES, "Save");
-        if (key(ImGuiKey_L)) goTo(CAT_FILES, "Load");
-        if (key(ImGuiKey_E)) goTo(CAT_FILES, "Export");
-        if (key(ImGuiKey_R)) goTo(CAT_RENDERING, "Render");
-        if (key(ImGuiKey_H)) goTo(CAT_HELP, "About");
-        if (key(ImGuiKey_W)) Viewer::look().wire = !Viewer::look().wire;
-        if (key(ImGuiKey_B)) { showBones = !showBones; Viewer::look().bones = showBones; }
-        if (key(ImGuiKey_Q)) quit = true;
+    for (const auto& sc : SHORTCUTS) if (sc.key != ImGuiKey_None && sc.mods == mods && ImGui::IsKeyPressed(sc.key, sc.group[0] == 'C')) { runShortcut(sc.id); break; }
+}
+static void shortcutsLeft(float lw) {
+    for (const char* g : {"Camera", "Actions", "Navigation"}) {
+        groupBox(g);
+        if (ImGui::BeginTable(g, 2, ImGuiTableFlags_RowBg)) {
+            ImGui::TableSetupColumn("a", ImGuiTableColumnFlags_WidthStretch); ImGui::TableSetupColumn("b", ImGuiTableColumnFlags_WidthFixed, lw * 0.48f);
+            for (auto& sc : SHORTCUTS) {
+                if (strcmp(sc.group, g)) continue;
+                ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::TextUnformatted(sc.label); ImGui::TableNextColumn();
+                ImGui::PushID(sc.id);
+                if (ImGui::Button(capturing == &sc ? "Press keys..." : shortcutText(sc.mods, sc.key).c_str(), ImVec2(-1, 0))) capturing = &sc;
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
     }
-    if (io.KeyCtrl && io.KeyAlt && key(ImGuiKey_S)) Viewer::look().smooth = !Viewer::look().smooth;
-    if (!io.KeyAlt) {
-        const bool back = io.KeyCtrl;
-        if (key(ImGuiKey_1) || key(ImGuiKey_Keypad1)) Viewer::focusBody(back ? 3.14159265f : 0, 0.05f);
-        if (key(ImGuiKey_3) || key(ImGuiKey_Keypad3)) Viewer::focusBody(back ? -1.5707963f : 1.5707963f, 0.05f);
-        if (key(ImGuiKey_7) || key(ImGuiKey_Keypad7)) Viewer::focusBody(0, back ? -1.4f : 1.4f);
-        if (key(ImGuiKey_Home)) Viewer::focusBody(0, 0.05f);
-    }
+    groupBox("Restore Settings");
+    if (ImGui::Button("Restore to defaults", ImVec2(lw, 0))) for (auto& sc : SHORTCUTS) { sc.mods = sc.defMods; sc.key = sc.defKey; }
+    notYet("Click on a shortcut box and press the keys of the shortcut which you would like to assign to the given action.");
 }
 
 // Help > Help (MakeHuman's 6_help): about, credits, links, and the version string copied
@@ -3130,10 +3207,6 @@ static void frame() {
     shortcuts();
     { std::lock_guard<std::mutex> g(dlMtx); if (dlFinished) { dlFinished = false; say(dlResult); loadPacksHave(); libCache.clear(); } }
     const float W = io.DisplaySize.x, H = io.DisplaySize.y;
-    if (!io.WantTextInput) {
-        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z) && !undo.empty()) { redo.push_back({snapshot(), undo.back().second}); restore(undo.back().first); undo.pop_back(); }
-        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y) && !redo.empty()) { undo.push_back({snapshot(), redo.back().second}); restore(redo.back().first); redo.pop_back(); }
-    }
     // the category tabs along the top, then the category's own tabs
     const ImGuiWindowFlags fixed = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus;
     ImGui::SetNextWindowPos(ImVec2(0, 0)); ImGui::SetNextWindowSize(ImVec2(W, 66));
@@ -3244,11 +3317,7 @@ static void frame() {
             ImGui::Checkbox("Invert the wheel", &lk.invertZoom);
             if (ImGui::Button("Defaults", ImVec2(lw, 0))) { lk.turnSpeed = lk.moveSpeed = lk.zoomSpeed = 1; lk.invertTurn = lk.invertZoom = false; }
         } else {
-            groupBox("Shortcuts");
-            if (ImGui::BeginTable("keys", 2, ImGuiTableFlags_RowBg)) {
-                for (const auto& k : SHORTCUTS) { ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::TextUnformatted(k[0]); ImGui::TableNextColumn(); ImGui::TextDisabled("%s", k[1]); }
-                ImGui::EndTable();
-            }
+            shortcutsLeft(lw);
         }
     } else if (cat == CAT_UTILITIES) {
         if (t == "Describe") {

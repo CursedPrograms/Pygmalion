@@ -63,6 +63,20 @@ static bool loadBase(Body& b, const fs::path& obj, std::string& err) {
             group = line.substr(2); while (!group.empty() && (group.back() == '\r' || group.back() == ' ')) group.pop_back();
             // the helpers (tights, skirt, hair and joint markers) are there for fitting clothes and bones: not shown
             visible = group.rfind("helper-", 0) != 0 && group.rfind("joint-", 0) != 0;
+        } else if (line[0] == 'f' && line[1] == ' ' && [&] {
+            // MakeHuman's own record of the face, whatever group it's in (kept, then read on below)
+            int a[4] = {0, 0, 0, 0}, u[4] = {0, 0, 0, 0}, n = 0;
+            std::istringstream ls(line.substr(2)); std::string c;
+            while (n < 4 && ls >> c) { if (sscanf(c.c_str(), "%d/%d", &a[n], &u[n]) >= 1) ++n; }
+            if (n >= 3) {
+                const int f = (int)(b.faces4.size() / 4);
+                for (int k = 0; k < 4; ++k) { b.faces4.push_back(a[k < n ? k : n - 1] - 1); b.faces4Uv.push_back(u[k < n ? k : n - 1] - 1); }
+                auto it = std::find_if(b.faceGroups.begin(), b.faceGroups.end(), [&](const auto& g) { return g.first == group; });
+                if (it == b.faceGroups.end()) { b.faceGroups.push_back({group, {}}); it = b.faceGroups.end() - 1; }
+                auto& runs = it->second;
+                if (!runs.empty() && runs.back().second == f) runs.back().second = f + 1; else runs.push_back({f, f + 1});
+            }
+            return false; }()) {
         } else if (line[0] == 'f' && line[1] == ' ' && group.rfind("joint-", 0) == 0) {
             std::istringstream ls(line.substr(2)); std::string c;
             while (ls >> c) { const int a = atoi(c.c_str()) - 1; if (a >= 0) b.joints[group].push_back(a); }

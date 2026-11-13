@@ -13,6 +13,7 @@
 #include "export.h"
 #ifdef _WIN32
 #include "http.h"
+#include "socket.h"
 #endif
 
 #include <SDL.h>
@@ -249,6 +250,11 @@ static Mesh toMesh() {
 }
 
 // ---------- settings (Settings > Sliders and General, as MakeHuman has them) ----------
+// the socket server's settings (Utilities > Socket), kept with the rest
+struct SockCfg { bool accept = false, advanced = false; std::string host = "127.0.0.1"; int port = 12345; };
+static SockCfg sockCfg;
+static char sockHost[64] = "127.0.0.1", sockPort[16] = "12345";
+static bool socketArg = false;
 struct Prefs {
     bool sliderImages = true;      // the shape's picture beside each slider
     bool showValues = true;        // the number on the slider
@@ -268,6 +274,7 @@ static void saveSettings() {
       << "\nturnSpeed=" << lk.turnSpeed << "\nmoveSpeed=" << lk.moveSpeed << "\nzoomSpeed=" << lk.zoomSpeed
       << "\ninvertTurn=" << lk.invertTurn << "\ninvertZoom=" << lk.invertZoom
       << "\nbgImage=" << lk.bgImage << "\nbgOpacity=" << lk.bgOpacity << "\n";
+    o << "socketAccept=" << sockCfg.accept << "\nsocketAdvanced=" << sockCfg.advanced << "\nsocketHost=" << sockCfg.host << "\nsocketPort=" << sockCfg.port << "\n";
 }
 static void loadSettings() {
     std::ifstream in(fs::u8path(settingsFile())); std::string l;
@@ -283,6 +290,9 @@ static void loadSettings() {
         else if (k == "invertTurn") lk.invertTurn = b; else if (k == "invertZoom") lk.invertZoom = b;
         else if (k == "bgImage") { std::error_code ec; if (!v.empty() && fs::exists(fs::u8path(v), ec)) lk.bgImage = v; }
         else if (k == "bgOpacity") lk.bgOpacity = std::clamp(f, 0.0f, 1.0f);
+        else if (k == "socketAccept") sockCfg.accept = b; else if (k == "socketAdvanced") sockCfg.advanced = b;
+        else if (k == "socketHost" && !v.empty()) { sockCfg.host = v; snprintf(sockHost, sizeof sockHost, "%s", v.c_str()); }
+        else if (k == "socketPort") { sockCfg.port = std::clamp(atoi(v.c_str()), 1, 65535); snprintf(sockPort, sizeof sockPort, "%d", sockCfg.port); }
     }
 }
 static std::vector<std::pair<State, std::string>> redo;
@@ -647,7 +657,7 @@ static std::vector<std::string> tasksOf(int c) {
     case CAT_POSE: return {"Skeleton", "Pose", "Expression", "Animations"};
     case CAT_RENDERING: return {"Render", "Scene", "Viewer"};
     case CAT_SETTINGS: return {"Sliders", "General", "Background", "Mouse", "Shortcuts"};
-    case CAT_UTILITIES: return {"Describe", "Symmetry", "Statistics", "Material Editor", "Expression mixer", "Targets", "Save targets", "Mass produce", "Shell", "Scripting", "Download", "Data", "Logs"};
+    case CAT_UTILITIES: return {"Describe", "Symmetry", "Statistics", "Material Editor", "Expression mixer", "Targets", "Save targets", "Mass produce", "Shell", "Scripting", "Download", "Socket", "Data", "Logs"};
     default: return {"About", "Licence"};
     }
 }
@@ -1391,6 +1401,10 @@ static void runScript(const std::string& text) {
     }
     dirty = true;
 }
+#ifdef _WIN32
+#include "sockops.inc"
+#endif
+
 static void scriptingLeft(float lw) {
     groupBox("Script");
     ImGui::InputTextMultiline("##sc", script, sizeof script, ImVec2(lw, 300));
@@ -1877,6 +1891,9 @@ static void frame() {
         else if (t == "Scripting") scriptingLeft(lw);
         else if (t == "Shell") { groupBox("Shell"); notYet("MakeHuman's shell runs Python; Pygmalion's runs its own commands, the same as Scripting. Up and down bring back what you typed; clear empties it."); }
         else if (t == "Download") downloadLeft(lw);
+#ifdef _WIN32
+        else if (t == "Socket") socketLeft(lw);
+#endif
         else if (t == "Data") dataView();
         else logsView();
     } else if (cat == CAT_HELP) {
@@ -2014,6 +2031,7 @@ int main(int argc, char** argv) {
         else if (args[i] == "--yaw" && i + 1 < args.size()) startYaw = (float)atof(args[++i].c_str());
         else if (args[i] == "--unit" && i + 1 < args.size()) startUnits.push_back(args[++i]);
         else if (args[i] == "--script" && i + 1 < args.size()) startScript = args[++i];
+        else if (args[i] == "--socket") socketArg = true;   // the socket server on for this run (Utilities > Socket)
         else file = args[i];
     }
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) return 1;
@@ -2100,9 +2118,15 @@ int main(int argc, char** argv) {
         std::ofstream lo(fs::u8path(startScript).replace_extension(".log")); lo << scriptLog;
     }
     dirty = true;
+#ifdef _WIN32
+    if ((sockCfg.accept || socketArg) && capture.empty()) socketOpen();   // as MakeHuman: the server comes back on if it was on
+#endif
     if (capture.empty()) { SDL_ShowWindow(window); SDL_MaximizeWindow(window); SDL_RaiseWindow(window); }
     int frames = 0;
     while (!quit) {
+#ifdef _WIN32
+        socketPoll();
+#endif
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             ImGui_ImplSDL2_ProcessEvent(&e);
@@ -2134,6 +2158,9 @@ int main(int argc, char** argv) {
         }
         SDL_GL_SwapWindow(window);
     }
+#ifdef _WIN32
+    Sock::stop();
+#endif
     if (capture.empty()) saveSettings();
     ImGui_ImplOpenGL3_Shutdown(); ImGui_ImplSDL2_Shutdown(); ImGui::DestroyContext();
     SDL_GL_DeleteContext(gl); SDL_DestroyWindow(window); SDL_Quit();

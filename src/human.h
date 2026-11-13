@@ -64,6 +64,10 @@ struct Body {
     std::vector<float> uv;               // 2 floats a uv
     std::vector<int> tri, triUv;         // the visible body's triangles (helpers left out), and their uvs
     std::map<std::string, std::vector<int>> joints;   // the joint markers ("joint-l-hand"...): their vertices
+    // every face of base.obj as MakeHuman holds it (fvert/fuvs: 4 a face, a triangle repeats its last corner), and
+    // its face groups as runs of faces [start, stop) - for the socket (Blender's MPFB reads the whole seed mesh)
+    std::vector<int> faces4, faces4Uv;
+    std::vector<std::pair<std::string, std::vector<std::pair<int, int>>>> faceGroups;
     // targets and modifiers
     std::vector<Target> targets;
     std::map<std::string, std::vector<int>> groupTargets;

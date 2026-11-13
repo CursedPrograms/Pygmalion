@@ -1752,46 +1752,232 @@ static void customLeft(float lw) {
 }
 
 // Mass produce: many random people, saved (and exported) one after another
-static int massCount = 10, massLeft = 0, massDone = 0, massFormat = -1; static float massAmount = 0.5f; static bool massRandGear = true;
+// ---------- Utilities > Mass produce: MakeHuman's (plugins/9_massproduce) ----------
+// Each person: the macros at random within their ranges (gender and ethnicity whole or mixed), the chosen modifier
+// groups varied round their values now (a normal spread, at most "max deviation"), then a skin, hair, eyebrows,
+// eyelashes and clothes from the allowed tables for that gender (and ethnicity, for skins); saved as .mhm in the models
+// folder and exported, named <base><4 digits>. When it's done the person goes back to how they were.
+struct MassSettings {
+    bool randAge = true, randWeight = true, randHeight = true, randMuscle = true, gender = true, genderAbs = true, ethnicity = true, ethnicityAbs = true;
+    float ageMin = 0.45f, ageMax = 0.95f, weightMin = 0.1f, weightMax = 0.9f, heightMin = 0.2f, heightMax = 0.9f, muscleMin = 0.3f, muscleMax = 0.8f;
+    std::map<std::string, bool> groups;   // modifier group -> randomize
+    float maxdev = 0.3f;
+    bool hair = true, eyelashes = true, eyebrows = true, fullClothes = true, upperClothes = false, lowerClothes = false, shoes = true, skins = true;
+    // allowed: name -> {mixed, female, male} (skins: female/male tables of {mixed, african, asian, caucasian})
+    std::map<std::string, std::array<bool, 3>> hairT, browsT, lashesT, fullT, upperT, lowerT, shoesT;
+    std::map<std::string, std::array<bool, 4>> femaleSkins, maleSkins;
+    std::map<std::string, std::string> path;   // name -> file
+    char base[260] = "mass"; int format = -1; int count = 5;
+    bool built = false;
+};
+static MassSettings mass;
+static int massLeft = 0, massDone = 0, massTotal = 0;
+static State massStart;
+static std::string massName(const std::string& f) {   // MakeHuman's: the file name, lower case, _ as spaces
+    std::string n = fs::u8path(f).stem().u8string(); for (auto& c : n) c = c == '_' ? ' ' : (char)tolower((unsigned char)c); return n;
+}
+// MakeHuman's modifier groups for detail: every group but the macros, the genitals and armslegs (that one split into
+// arms, hands, legs and feet by name), right-hand ones left out (they follow the left)
+static std::map<std::string, std::vector<int>> massGroups() {
+    std::map<std::string, std::vector<int>> g;
+    for (int i = 0; i < (int)body.mods.size(); ++i) {
+        const auto& m = body.mods[i];
+        if (m.macro || m.group.find("macro") != std::string::npos || m.group.find("genitals") != std::string::npos || m.name.rfind("r-", 0) == 0) continue;
+        if (m.group == "armslegs") {
+            if (m.name.find("hand") != std::string::npos) g["hands"].push_back(i);
+            if (m.name.find("foot") != std::string::npos || m.name.find("feet") != std::string::npos) g["feet"].push_back(i);
+            if (m.name.find("arm") != std::string::npos) g["arms"].push_back(i);
+            if (m.name.find("leg") != std::string::npos) g["legs"].push_back(i);
+        } else g[m.group].push_back(i);
+    }
+    for (const char* k : {"arms", "hands", "legs", "feet"}) g[k];
+    return g;
+}
+static void massBuild() {
+    if (mass.built) return;
+    mass.built = true;
+    for (const auto& [n, v] : massGroups()) { const std::string k = n; mass.groups[k] = !(k == "arms" || k == "hands" || k == "legs" || k == "feet"); }
+    auto has = [](const std::string& n, const char* w) { return n.find(w) != std::string::npos; };
+    for (const auto& f : filesIn("hair", ".mhclo")) {
+        const std::string n = massName(f); mass.path["hair:" + n] = f;
+        const bool femaleOnly = n == "bob01" || n == "bob02" || n == "long01" || n == "braid01" || n == "ponytail01", maleOnly = n == "short02" || n == "short04";
+        mass.hairT[n] = {true, !maleOnly, !femaleOnly};
+    }
+    for (const auto& f : filesIn("eyebrows", ".mhclo")) { const std::string n = massName(f); mass.path["brows:" + n] = f; mass.browsT[n] = {true, true, true}; }
+    for (const auto& f : filesIn("eyelashes", ".mhclo")) { const std::string n = massName(f); mass.path["lashes:" + n] = f; mass.lashesT[n] = {true, true, true}; }
+    static const std::set<std::string> femaleFullExplicit = {"female elegantsuit01", "female casualsuit02", "female casualsuit01", "female sportsuit01"};
+    static const std::set<std::string> maleFullExplicit = {"male worksuit01", "male elegantsuit01", "male casualsuit06", "male casualsuit05", "male casualsuit04", "male casualsuit02", "male casualsuit01", "male casualsuit03"};
+    for (const auto& f : filesIn("clothes", ".mhclo")) {
+        const std::string n = massName(f); mass.path["clothes:" + n] = f;
+        auto any = [&](std::initializer_list<const char*> ws) { for (const char* w : ws) if (has(n, w)) return true; return false; };
+        const bool notFemale = !has(n, "female");
+        const bool mFull = notFemale && (maleFullExplicit.count(n) || any({"wetsuit"})), fFull = femaleFullExplicit.count(n) || any({"gown", "dress", "swimsuit"});
+        const bool mUp = notFemale && any({"top", "shirt", "sweater"}), fUp = any({"bra", "top", "shirt", "sweater"});
+        const bool mLow = notFemale && any({"jeans", "shorts", "pants", "trunk"}), fLow = any({"skirt", "jeans", "string", "shorts", "pants"});
+        const bool mSh = notFemale && any({"boot", "shoe", "sneaker", "sock"}), fSh = any({"boot", "shoe", "sneaker", "sock"});
+        mass.fullT[n] = {fFull || mFull, fFull, mFull}; mass.upperT[n] = {fUp || mUp, fUp, mUp};
+        mass.lowerT[n] = {fLow || mLow, fLow, mLow}; mass.shoesT[n] = {fSh || mSh, fSh, mSh};
+    }
+    for (const auto& f : filesIn("skins", ".mhmat")) {
+        const std::string n = massName(f); mass.path["skin:" + n] = f;
+        std::array<bool, 4> fe{}, ma{};
+        if (has(n, "female") && !has(n, "special")) fe = {true, has(n, "african"), has(n, "asian") && !has(n, "caucasian"), has(n, "caucasian")};
+        if (has(n, "male") && !has(n, "female") && !has(n, "special")) ma = {true, has(n, "african"), has(n, "asian") && !has(n, "caucasian"), has(n, "caucasian")};
+        mass.femaleSkins[n] = fe; mass.maleSkins[n] = ma;
+    }
+}
+static void massOne(std::mt19937& rng) {
+    auto uni = [&](float a, float b) { if (a > b) std::swap(a, b); return a + std::uniform_real_distribution<float>(0, 1)(rng) * (b - a); };
+    auto gauss = [&](float lo, float hi, float mid) {   // getNormalRandomValue: reflected back inside the range
+        const float sigma = 0.2f * std::fabs(hi - lo);
+        float v = sigma > 0 ? std::normal_distribution<float>(mid, sigma)(rng) : mid;
+        if (v < lo) v = lo + std::fabs(v - lo); else if (v > hi) v = hi - std::fabs(v - hi);
+        return std::clamp(v, lo, hi);
+    };
+    // the macros
+    if (mass.randAge) Human::setMacro(body, "Age", uni(mass.ageMin, mass.ageMax));
+    if (mass.randWeight) Human::setMacro(body, "Weight", uni(mass.weightMin, mass.weightMax));
+    if (mass.randHeight) Human::setMacro(body, "Height", uni(mass.heightMin, mass.heightMax));
+    if (mass.randMuscle) Human::setMacro(body, "Muscle", uni(mass.muscleMin, mass.muscleMax));
+    if (mass.ethnicity) {
+        if (mass.ethnicityAbs) { const int k = (int)(rng() % 3); Human::setMacro(body, "African", k == 0 ? 1.0f : 0.0f); Human::setMacro(body, "Asian", k == 1 ? 1.0f : 0.0f); Human::setMacro(body, "Caucasian", k == 2 ? 1.0f : 0.0f); }
+        else { Human::setMacro(body, "African", uni(0, 1)); Human::setMacro(body, "Asian", uni(0, 1)); Human::setMacro(body, "Caucasian", uni(0, 1)); }
+    }
+    if (mass.gender) Human::setMacro(body, "Gender", mass.genderAbs ? (float)(rng() % 2) : uni(0, 1));
+    const std::string gender = body.gender < 0.3f ? "female" : body.gender > 0.7f ? "male" : "mixed";
+    const int gcol = gender == "mixed" ? 0 : gender == "female" ? 1 : 2;
+    std::string ethn = "mixed";
+    if (body.african > 0.9f) ethn = "african"; else if (body.asian > 0.9f) ethn = "asian"; else if (body.caucasian > 0.9f) ethn = "caucasian";
+    // the details: each chosen group's modifiers round their values at the start
+    const auto groups = massGroups();
+    for (const auto& [g, mods] : groups) {
+        auto it = mass.groups.find(g); if (it == mass.groups.end() || !it->second) continue;
+        if (g == "breast" && gender != "female") continue;
+        for (int i : mods) {
+            const auto& m = body.mods[i];
+            const float def = i < (int)massStart.mods.size() ? massStart.mods[i] : m.defaultValue;
+            float v = gauss(def - mass.maxdev, def + mass.maxdev, def);
+            v = std::clamp(v, m.min() < -0.05f ? -1.0f : 0.0f, 1.0f);
+            Human::setModifier(body, i, v);   // (with symmetry on, the right side follows the left, as MakeHuman sets both)
+        }
+    }
+    // the skin, for the gender and ethnicity
+    std::string err;
+    if (mass.skins) {
+        auto& table = gender == "female" ? mass.femaleSkins : mass.maleSkins;
+        const int col = ethn == "mixed" ? 0 : ethn == "african" ? 1 : ethn == "asian" ? 2 : 3;
+        std::vector<std::string> ok; for (const auto& [n, a] : table) if (a[col]) ok.push_back(n);
+        if (!ok.empty()) Human::setSkin(body, mass.path["skin:" + ok[rng() % ok.size()]]);
+    }
+    auto pick = [&](const std::map<std::string, std::array<bool, 3>>& t, const std::string& kind) -> std::string {
+        std::vector<std::string> ok; for (const auto& [n, a] : t) if (a[gcol]) ok.push_back(n);
+        return ok.empty() ? std::string() : mass.path[kind + ":" + ok[rng() % ok.size()]];
+    };
+    auto put = [&](const std::string& kind, const std::string& f) { if (f.empty()) return; Human::takeOff(body, kind); Human::wear(body, f, err); };
+    if (mass.hair) put("hair", pick(mass.hairT, "hair"));
+    if (mass.eyebrows) put("eyebrows", pick(mass.browsT, "brows"));
+    if (mass.eyelashes) put("eyelashes", pick(mass.lashesT, "lashes"));
+    if (mass.fullClothes || mass.upperClothes || mass.lowerClothes || mass.shoes) {
+        Human::takeOff(body, "clothes");
+        if (mass.fullClothes) { const std::string f = pick(mass.fullT, "clothes"); if (!f.empty()) Human::wear(body, f, err); }
+        if (mass.upperClothes) { const std::string f = pick(mass.upperT, "clothes"); if (!f.empty() && !Human::isWorn(body, f)) Human::wear(body, f, err); }
+        if (mass.lowerClothes) { const std::string f = pick(mass.lowerT, "clothes"); if (!f.empty() && !Human::isWorn(body, f)) Human::wear(body, f, err); }
+        if (mass.shoes) { const std::string f = pick(mass.shoesT, "clothes"); if (!f.empty() && !Human::isWorn(body, f)) Human::wear(body, f, err); }
+    }
+}
 static void massStep() {
     if (massLeft <= 0) return;
-    std::random_device rd;
-    Human::randomize(body, massAmount, true, true, true, rd());
-    if (massRandGear) {   // clothes, hair, skin at random too
-        auto pick = [&](const std::vector<std::string>& v) { return v.empty() ? std::string() : v[rd() % v.size()]; };
-        std::string err;
-        Human::takeOff(body, "hair"); Human::takeOff(body, "clothes");
-        const std::string h = pick(filesIn("hair", ".mhclo")); if (!h.empty()) Human::wear(body, h, err);
-        const std::string c = pick(filesIn("clothes", ".mhclo")); if (!c.empty()) Human::wear(body, c, err);
-        Human::setSkin(body, pick(filesIn("skins", ".mhmat")));
-    }
+    static std::mt19937 rng{std::random_device{}()};
+    massOne(rng);
     Human::apply(body);
     if (!rig.empty()) Skel::build(rig, body.pos);
     if (!chosen.empty()) Skel::build(chosen, body.pos);
     repose();
-    std::string dir = (fs::u8path(homeDir()) / "massproduce").u8string();
-    std::error_code ec; fs::create_directories(fs::u8path(dir), ec);
-    char name[32]; snprintf(name, sizeof name, "person%03d", massDone + 1);
+    char nb[96]; snprintf(nb, sizeof nb, "%s%04d", mass.base, massLeft);   // MakeHuman counts down
     std::string err;
-    saveModel((fs::u8path(dir) / (std::string(name) + ".mhm")).u8string(), name, err);
-    if (massFormat >= 0) exportTo((fs::u8path(dir) / (std::string(name) + EXPORT_EXT[massFormat])).u8string(), massFormat, err);
+    if (mass.format < 0) saveModel((fs::u8path(homeDir()) / (std::string(nb) + ".mhm")).u8string(), nb, err);
+    else exportTo((fs::u8path(homeDir()) / (std::string(nb) + EXPORT_EXT[mass.format])).u8string(), mass.format, err);
+    if (!err.empty()) say(err);
     ++massDone; --massLeft;
+    if (!massLeft) { restore(massStart); say("Done! Made " + std::to_string(massDone) + " in " + homeDir()); }
     dirty = true;
-    if (!massLeft) say("Made " + std::to_string(massDone) + " people in " + dir);
+}
+static void massTable3(const char* title, const char* first, std::map<std::string, std::array<bool, 3>>& t, float lw) {
+    if (!ImGui::TreeNode(title)) return;
+    if (ImGui::BeginTable(title, 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerV, ImVec2(lw, std::min(250.0f, 30.0f + 24.0f * (float)t.size())))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn(first); for (const char* c : {"Mixed", "Female", "Male"}) ImGui::TableSetupColumn(c, ImGuiTableColumnFlags_WidthFixed, 46);
+        ImGui::TableHeadersRow();
+        for (auto& [n, a] : t) {
+            ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::TextUnformatted(n.c_str());
+            for (int k = 0; k < 3; ++k) { ImGui::TableNextColumn(); ImGui::PushID((n + std::to_string(k)).c_str()); ImGui::Checkbox("##c", &a[k]); ImGui::PopID(); }
+        }
+        ImGui::EndTable();
+    }
+    ImGui::TreePop();
+}
+static void massSkinTable(const char* title, std::map<std::string, std::array<bool, 4>>& t, float lw) {
+    if (!ImGui::TreeNode(title)) return;
+    if (ImGui::BeginTable(title, 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerV, ImVec2(lw, std::min(250.0f, 30.0f + 24.0f * (float)t.size())))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Skin"); for (const char* c : {"Mixed", "African", "Asian", "Caucasian"}) ImGui::TableSetupColumn(c, ImGuiTableColumnFlags_WidthFixed, 40);
+        ImGui::TableHeadersRow();
+        for (auto& [n, a] : t) {
+            ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::TextUnformatted(n.c_str());
+            for (int k = 0; k < 4; ++k) { ImGui::TableNextColumn(); ImGui::PushID((n + std::to_string(k)).c_str()); ImGui::Checkbox("##c", &a[k]); ImGui::PopID(); }
+        }
+        ImGui::EndTable();
+    }
+    ImGui::TreePop();
 }
 static void massLeftPanel(float lw) {
-    groupBox("Mass produce");
-    ImGui::SetNextItemWidth(lw); ImGui::SliderInt("##mc", &massCount, 1, 500, "%d people");
-    ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##ma", &massAmount, 0.05f, 1, "Variation %.2f");
-    ImGui::Checkbox("Random hair, clothes and skin", &massRandGear);
-    std::vector<const char*> f = {"Models only (.mhm)"}; for (int k = 0; k < EX_COUNT; ++k) f.push_back(EXPORT_NAMES[k]);
-    int sel = massFormat + 1;
-    ImGui::SetNextItemWidth(lw); if (ImGui::Combo("##mf", &sel, f.data(), (int)f.size())) massFormat = sel - 1;
+    massBuild();
+    auto range = [&](const char* label, bool* on, float* lo, float* hi) {
+        ImGui::Checkbox((std::string("Randomize ") + label).c_str(), on);
+        ImGui::BeginDisabled(!*on);
+        ImGui::PushID(label);
+        ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##lo", lo, 0, 1, (std::string("Minimum ") + label + " %.2f").c_str());
+        ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##hi", hi, 0, 1, (std::string("Maximum ") + label + " %.2f").c_str());
+        ImGui::PopID(); ImGui::EndDisabled();
+    };
+    groupBox("Macro settings");
+    range("age", &mass.randAge, &mass.ageMin, &mass.ageMax);
+    range("weight", &mass.randWeight, &mass.weightMin, &mass.weightMax);
+    range("height", &mass.randHeight, &mass.heightMin, &mass.heightMax);
+    range("muscle", &mass.randMuscle, &mass.muscleMin, &mass.muscleMax);
+    ImGui::Checkbox("Randomize gender", &mass.gender); ImGui::Checkbox("Absolute gender", &mass.genderAbs);
+    ImGui::Checkbox("Randomize ethnicity", &mass.ethnicity); ImGui::Checkbox("Absolute ethnicity", &mass.ethnicityAbs);
+    groupBox("Modeling settings");
+    for (auto& [g, on] : mass.groups) ImGui::Checkbox(("Randomize " + (g == "breast" ? std::string("breasts (if fem)") : g)).c_str(), &on);
+    ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##md", &mass.maxdev, 0, 1, "Max deviation from default %.2f");
+    groupBox("Randomize clothes and body parts");
+    ImGui::Checkbox("Randomize hair", &mass.hair); ImGui::Checkbox("Randomize eyelashes", &mass.eyelashes); ImGui::Checkbox("Randomize eyebrows", &mass.eyebrows);
+    ImGui::Checkbox("Randomize full body clothes", &mass.fullClothes); ImGui::Checkbox("Randomize upper body clothes", &mass.upperClothes);
+    ImGui::Checkbox("Randomize lower body clothes", &mass.lowerClothes); ImGui::Checkbox("Randomize shoes", &mass.shoes);
+    groupBox("Randomize materials");
+    ImGui::Checkbox("Randomize skins", &mass.skins);
+    groupBox("Allowed");
+    massSkinTable("Allowed female skins", mass.femaleSkins, lw);
+    massSkinTable("Allowed male skins", mass.maleSkins, lw);
+    massTable3("Allowed hair", "Hair", mass.hairT, lw);
+    massTable3("Allowed eyebrows", "Eyebrows", mass.browsT, lw);
+    massTable3("Allowed eyelashes", "Eyelashes", mass.lashesT, lw);
+    massTable3("Allowed full body clothes", "Clothes", mass.fullT, lw);
+    massTable3("Allowed upper body clothes", "Clothes", mass.upperT, lw);
+    massTable3("Allowed lower body clothes", "Clothes", mass.lowerT, lw);
+    massTable3("Allowed shoes", "Clothes", mass.shoesT, lw);
+    groupBox("Export settings");
+    ImGui::TextUnformatted("File name base"); ImGui::SetNextItemWidth(lw); ImGui::InputText("##fnb", mass.base, sizeof mass.base);
+    ImGui::TextUnformatted("File format");
+    std::vector<const char*> f = {"MHM"}; for (int k = 0; k < EX_COUNT; ++k) f.push_back(EXPORT_NAMES[k]);
+    int sel = mass.format + 1; ImGui::SetNextItemWidth(lw); if (ImGui::Combo("##mf", &sel, f.data(), (int)f.size())) mass.format = sel - 1;
+    ImGui::TextDisabled("Files end up in %s, named with the file name base plus four digits plus file extension.", homeDir().c_str());
+    groupBox("Produce");
+    ImGui::SetNextItemWidth(lw); ImGui::SliderInt("##mc", &mass.count, 1, 500, "Number of characters: %d");
     if (massLeft > 0) {
-        ImGui::ProgressBar((float)massDone / std::max(1, massDone + massLeft), ImVec2(lw, 0));
-        if (ImGui::Button("Stop", ImVec2(lw, 0))) massLeft = 0;
-    } else if (ImGui::Button("Make them", ImVec2(lw, 34))) { remember("Mass produce"); massLeft = massCount; massDone = 0; }
-    notYet(("They're saved in " + (fs::u8path(homeDir()) / "massproduce").u8string() + ".").c_str());
+        ImGui::ProgressBar((float)massDone / std::max(1, massTotal), ImVec2(lw, 0), (std::to_string(massDone) + " / " + std::to_string(massTotal)).c_str());
+        if (ImGui::Button("Stop", ImVec2(lw, 0))) { massLeft = 0; restore(massStart); dirty = true; }
+    } else if (ImGui::Button("Produce", ImVec2(lw, 34))) { remember("Mass produce"); massStart = snapshot(); massLeft = massTotal = mass.count; massDone = 0; }
 }
 
 static bool installPack(const std::string& pack, std::string& err);
@@ -1848,6 +2034,13 @@ static bool runCommand(const std::string& line, std::string& err, const std::fun
     else if (cmd == "bones") { showBones = rest != "off"; Viewer::look().bones = showBones; }
     else if (cmd == "smooth") Viewer::look().smooth = rest != "off";
     else if (cmd == "camera") { lookFor(rest == "face" ? "faceCamera" : rest); Viewer::update(body); }   // a MakeHuman view: faceCamera, frontView, leftView...
+    else if (cmd == "massproduce") {   // massproduce N [base]: Mass produce's settings, N people now
+        massBuild(); std::istringstream ms(rest); int n = 5; std::string base; ms >> n >> base;
+        if (!base.empty()) snprintf(mass.base, sizeof mass.base, "%s", base.c_str());
+        massStart = snapshot(); massLeft = massTotal = std::max(1, n); massDone = 0;
+        while (massLeft > 0) massStep();
+        out("made " + std::to_string(massDone));
+    }
     else if (cmd == "shaders") Viewer::look().mhShaders = rest != "off";   // MakeHuman's own shaders (on) or Pygmalion's
     else if (cmd == "download") ok = installPack(rest, err);
     else if (cmd == "kindof") out(kindOfProxy(rest));   // what Install would call a .mhclo

@@ -390,6 +390,7 @@ bool loadProxyFile(const std::string& path, Proxy& p, std::string& err) {
         else if (k == "uuid") ls >> p.uuid;
         else if (k == "tag") { std::string t; std::getline(ls >> std::ws, t); while (!t.empty() && (t.back() == '' || t.back() == ' ')) t.pop_back(); for (char& c : t) c = (char)tolower((unsigned char)c); if (!t.empty()) p.tags.push_back(t); }
         else if (k == "obj_file") ls >> objFile;
+        else if (k == "special_pose") { std::string type, name; ls >> type >> name; if (!type.empty() && !name.empty()) p.specialPose[type] = name; }
         else if (k == "material") { std::getline(ls >> std::ws, material); }
         else if (k == "z_depth") ls >> p.zDepth;
         else if (k == "x_scale" || k == "y_scale" || k == "z_scale") {

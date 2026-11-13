@@ -433,6 +433,35 @@ static void loadFaceUnits() {
 // the pose: the body's pose, the face's expression over it (mixPoses: the expression's bones win)
 static Skel::Skeleton chosen;                   // the chosen skeleton: exported, and shown with Show the bones
 static Skel::Pose currentPose;                  // what the body is posed with now (empty: the rest)
+// MakeHuman's foot posing (plugins/2_foot_posing.py): clothes with "special_pose foot <name>" (shoes with heels) put
+// that BVH's foot and toe bones over whatever pose is on; taking them off takes it away
+static const char* FOOT_BONES[] = {"foot", "toe1-1", "toe1-2", "toe2-1", "toe2-2", "toe2-3", "toe3-1", "toe3-2", "toe3-3", "toe4-1", "toe4-2", "toe4-3", "toe5-1", "toe5-2", "toe5-3"};
+static std::string footPoseFile;   // the foot pose in use ("" none), for the Pose tab
+static const Skel::Pose* footPose() {
+    static std::map<std::string, Skel::Pose> cache;
+    std::string want;
+    for (const auto& p : body.proxies) {
+        if (p.kind != "clothes") continue;
+        auto it = p.specialPose.find("foot"); if (it == p.specialPose.end()) continue;
+        // thoroughFindFile over the user's and the system's special_poses/foot, and beside the clothes
+        const std::string folder = fs::u8path(p.file).parent_path().u8string();
+        for (const std::string& n : {it->second, it->second + ".bvh"}) {
+            for (const std::string& sub : {std::string("special_poses/foot/") + n, n}) { want = Human::resolveAsset(sub, folder); if (!want.empty()) break; }
+            if (!want.empty()) break;
+        }
+        static std::string told; if (want.empty() && told != p.file) { told = p.file; say("No foot pose " + it->second + " for " + p.name); }
+    }
+    footPoseFile = want;
+    if (want.empty()) return nullptr;
+    auto c = cache.find(want);
+    if (c == cache.end()) {
+        std::vector<Skel::Pose> frames; std::string err;
+        if (!Skel::loadBvh(want, frames, err, nullptr, &rig) || frames.empty()) { say("Foot pose: " + err); cache[want] = Skel::Pose(); }
+        else cache[want] = frames[0];
+        c = cache.find(want);
+    }
+    return c->second.empty() ? nullptr : &c->second;
+}
 static void repose() {
     if (rig.empty()) { body.shown.clear(); return; }
     bool anyUnit = false;
@@ -448,6 +477,8 @@ static void repose() {
             if (moved) p.bones[kv.first] = m;
         }
     }
+    if (const Skel::Pose* foot = footPose())   // animation.mixPoses: the foot pose's foot and toe bones replace the pose's
+        for (const char* side : {".L", ".R"}) for (const char* b : FOOT_BONES) { auto it = foot->bones.find(std::string(b) + side); if (it != foot->bones.end()) p.bones[it->first] = it->second; }
     currentPose = p;
     const bool posed = !p.empty();
     Skel::setPose(rig, posed ? &p : nullptr);

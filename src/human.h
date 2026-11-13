@@ -57,6 +57,7 @@ struct Proxy {                           // something fitted to the body (MakeHu
     Mat::Material mat;                   // its whole material (MakeHuman's Material Editor), read from material
     std::string author = "MakeHuman Team", license = "CC0", homepage, copyright;   // "# author: ..." comments (MakeHuman's LicenseInfo)
     int vertsPerFace = 4;                // its obj's faces (MakeHuman's vertsPerFaceForExport)
+    std::map<std::string, std::string> specialPose;   // "special_pose foot high_heels": poses it wants on the person
 };
 bool loadProxyFile(const std::string& mhclo, Proxy& p, std::string& err);
 // a material: its diffuse texture (absolute path) and whether it's see-through

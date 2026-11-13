@@ -444,12 +444,16 @@ static void lookFor(const std::string& cam) {
         float p[3];
         if (Human::jointPos(body, joint, p)) Viewer::focus(p, dist, yaw, pitch);
     };
-    if (cam == "frontView" || cam == "globalCamera") Viewer::focusBody(0, 0.05f);
-    else if (cam == "backView") Viewer::focusBody(PI, 0.05f);
-    else if (cam == "leftView") Viewer::focusBody(PI / 2, 0.05f);
-    else if (cam == "rightView") Viewer::focusBody(-PI / 2, 0.05f);
-    else if (cam == "topView") Viewer::focusBody(0, 1.5f);
-    else if (cam == "bottomView") Viewer::focusBody(0, -1.5f);
+    // MakeHuman's side views only turn the view: what it looks at and how close stay (zoomed in on the face, a face
+    // slider turns the face to its side instead of jumping back to the whole person). globalCamera is the whole person.
+    auto turn = [](float yaw, float pitch) { Viewer::look().yaw = yaw; Viewer::look().pitch = pitch; };
+    if (cam == "globalCamera") Viewer::focusBody(0, 0.05f);
+    else if (cam == "frontView") turn(0, 0.05f);
+    else if (cam == "backView") turn(PI, 0.05f);
+    else if (cam == "leftView") turn(PI / 2, 0.05f);
+    else if (cam == "rightView") turn(-PI / 2, 0.05f);
+    else if (cam == "topView") turn(0, 1.5f);
+    else if (cam == "bottomView") turn(0, -1.5f);
     else if (cam == "faceCamera") at("joint-head", H * 0.22f, 0, 0.02f);
     else {
         // e.g. leftArmTopCamera, rightFootRightCamera: the part, then the side

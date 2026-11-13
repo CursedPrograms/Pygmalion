@@ -42,6 +42,7 @@
 #include <sstream>
 #include "json.h"
 #include <random>
+#include <regex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -813,7 +814,7 @@ static void materialsLeft(float lw) {
 enum Cat { CAT_FILES, CAT_MODELLING, CAT_GEOMETRIES, CAT_MATERIALS, CAT_POSE, CAT_RENDERING, CAT_SETTINGS, CAT_UTILITIES, CAT_HELP, CAT_COUNT };
 static const char* CAT_NAMES[] = {"Files", "Modelling", "Geometries", "Materials", "Pose/Animate", "Rendering", "Settings", "Utilities", "Help"};
 static int cat = CAT_MODELLING;
-static std::string task[CAT_COUNT] = {"Load", "Main", "Clothes", "Skin/Material", "Skeleton", "Render", "Sliders", "Describe", "About"};
+static std::string task[CAT_COUNT] = {"Load", "Main", "Clothes", "Skin/Material", "Skeleton", "Render", "Sliders", "Describe", "Help"};
 static std::map<std::string, int> category;   // a modelling tab's chosen Category (the slider group shown)
 
 static std::vector<std::string> tasksOfAll(int c);
@@ -840,7 +841,7 @@ static std::vector<std::string> tasksOfAll(int c) {
     case CAT_RENDERING: return {"Render", "Scene", "Viewer"};
     case CAT_SETTINGS: return {"Sliders", "General", "Background", "Mouse", "Shortcuts", "Plugins", "User Plugins"};
     case CAT_UTILITIES: return {"Describe", "Symmetry", "Statistics", "Material Editor", "Scene Editor", "Expression mixer", "Targets", "Save targets", "Mass produce", "Shell", "Scripting", "Download", "Socket", "Profile", "Example", "Data", "Logs"};
-    default: return {"About", "Licence"};
+    default: return {"Help", "About", "Licence"};
     }
 }
 
@@ -2932,6 +2933,54 @@ static void shortcuts() {
         if (key(ImGuiKey_Home)) Viewer::focusBody(0, 0.05f);
     }
 }
+
+// Help > Help (MakeHuman's 6_help): about, credits, links, and the version string copied
+static void openUrl(const char* u) {
+#ifdef _WIN32
+    ShellExecuteA(nullptr, "open", u, nullptr, nullptr, SW_SHOWNORMAL);
+#endif
+}
+static std::string creditsText() {   // MakeHuman's licenses/credits.txt (rich text: the tags taken out)
+    static std::string t;
+    if (!t.empty()) return t;
+    std::ifstream in(fs::u8path(dataDir) / "licenses" / "credits.txt"); std::ostringstream ss; ss << in.rdbuf();
+    std::string raw = ss.str();
+    raw = std::regex_replace(raw, std::regex("<h[12]>"), "\n"); raw = std::regex_replace(raw, std::regex("</h[12]>"), "\n");
+    raw = std::regex_replace(raw, std::regex("<[^>]+>"), "");
+    t = "Pygmalion: MakeHuman remade in C++ by Cursed Entertainment.\nFarica\xe2\x98\x86Kimora \xc2\xa9 Cursed Entertainment\n\nMakeHuman's credits:\n" + raw;
+    return t;
+}
+static bool showCredits = false;
+static void helpLeft(float lw) {
+    const float hw = lw / 2 - 4;
+    groupBox("About Pygmalion");
+    if (ImGui::Button("About / License", ImVec2(lw, 0))) forcedTask = "About";
+    if (ImGui::Button("Credits", ImVec2(lw, 0))) showCredits = !showCredits;
+    if (ImGui::Button("Website", ImVec2(hw, 0))) openUrl("https://cursedprograms.github.io/Pygmalion/");
+    ImGui::SameLine(); if (ImGui::Button("GitHub", ImVec2(hw, 0))) openUrl("https://github.com/CursedPrograms/Pygmalion");
+    groupBox("Support");
+    if (ImGui::Button("Report bug", ImVec2(hw, 0))) openUrl("https://github.com/CursedPrograms/Pygmalion/issues/new");
+    ImGui::SameLine(); if (ImGui::Button("Request feature", ImVec2(hw, 0))) openUrl("https://github.com/CursedPrograms/Pygmalion/issues/new");
+    groupBox("MakeHuman");
+    if (ImGui::Button("Website##mh", ImVec2(hw, 0))) openUrl("http://www.makehumancommunity.org");
+    ImGui::SameLine(); if (ImGui::Button("FaceBook page", ImVec2(hw, 0))) openUrl("https://www.facebook.com/makehuman/");
+    if (ImGui::Button("FAQ", ImVec2(hw, 0))) openUrl("http://www.makehumancommunity.org/wiki/FAQ:Index");
+    ImGui::SameLine(); if (ImGui::Button("Forum", ImVec2(hw, 0))) openUrl("http://www.makehumancommunity.org/forum");
+    if (ImGui::Button("Wiki", ImVec2(hw, 0))) openUrl("http://www.makehumancommunity.org/wiki/Main_Page");
+    ImGui::SameLine(); if (ImGui::Button("Patreon", ImVec2(hw, 0))) openUrl("https://www.patreon.com/makehuman/overview");
+    groupBox("Copy to clipboard");
+    if (ImGui::Button("Version String", ImVec2(lw, 0))) {
+        ImGui::SetClipboardText("Pygmalion " PYGMALION_VERSION " (MakeHuman 1.1.1, remade in C++), " __DATE__);
+        say("Copied: Pygmalion " PYGMALION_VERSION);
+    }
+    if (showCredits) {
+        groupBox("Credits");
+        ImGui::BeginChild("credits", ImVec2(lw, 360), true);
+        ImGui::PushTextWrapPos(lw - 16); ImGui::TextUnformatted(creditsText().c_str()); ImGui::PopTextWrapPos();
+        ImGui::EndChild();
+    }
+}
+
 static void frame() {
     ImGuiIO& io = ImGui::GetIO();
     animate(io.DeltaTime);
@@ -3089,7 +3138,8 @@ static void frame() {
         else if (t == "Example") exampleLeft(lw);
         else logsView();
     } else if (cat == CAT_HELP) {
-        if (t == "About") { groupBox("Pygmalion " PYGMALION_VERSION); ImGui::TextWrapped("People in 3D with sliders: MakeHuman, remade in C++ by Cursed Entertainment. Farica\xe2\x98\x86Kimora \xc2\xa9 Cursed Entertainment."); }
+        if (t == "Help") helpLeft(lw);
+        else if (t == "About") { groupBox("Pygmalion " PYGMALION_VERSION); ImGui::TextWrapped("People in 3D with sliders: MakeHuman, remade in C++ by Cursed Entertainment. Farica\xe2\x98\x86Kimora \xc2\xa9 Cursed Entertainment."); }
         else { groupBox("Licence"); ImGui::TextWrapped("The code is AGPL-3.0 (it ports MakeHuman's code). The body, its shapes and the assets are MakeHuman's, CC0."); }
     } else if (cat == CAT_GEOMETRIES) geometriesLeft(t, lw);
     else if (cat == CAT_MATERIALS) materialsLeft(lw);

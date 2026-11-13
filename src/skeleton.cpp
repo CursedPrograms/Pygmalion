@@ -493,7 +493,7 @@ static void zxy(const Mat4& m, float& z, float& x, float& y) {
     x *= D; y *= D; z *= D;
 }
 
-bool saveBvh(const Skeleton& s0, const std::vector<Pose>& frames, const std::string& path, float scale, float frameTime, std::string& err, const Skeleton* through) {
+bool saveBvh(const Skeleton& s0, const std::vector<Pose>& frames, const std::string& path, float scale, float frameTime, std::string& err, const Skeleton* through, float yOff) {
     Skeleton s = s0;
     Skeleton src; if (through) src = *through;
     std::ofstream o(fs::u8path(path));
@@ -505,7 +505,7 @@ bool saveBvh(const Skeleton& s0, const std::vector<Pose>& frames, const std::str
         const Bone& b = s.bones[i];
         const std::string pad(depth * 2, ' ');
         float off[3];
-        for (int c = 0; c < 3; ++c) off[c] = (b.parent >= 0 ? b.head[c] - s.bones[b.parent].head[c] : b.head[c]) * scale;
+        for (int c = 0; c < 3; ++c) off[c] = (b.parent >= 0 ? b.head[c] - s.bones[b.parent].head[c] : b.head[c] + (c == 1 ? yOff : 0)) * scale;
         o << pad << (b.parent < 0 ? "ROOT " : "JOINT ") << b.name << "\n" << pad << "{\n";
         snprintf(buf, sizeof buf, "%s  OFFSET %.6f %.6f %.6f\n", pad.c_str(), off[0], off[1], off[2]); o << buf;
         o << pad << (b.parent < 0 ? "  CHANNELS 6 Xposition Yposition Zposition Zrotation Xrotation Yrotation\n" : "  CHANNELS 3 Zrotation Xrotation Yrotation\n");

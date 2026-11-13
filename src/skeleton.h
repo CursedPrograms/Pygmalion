@@ -55,7 +55,7 @@ bool usesReferences(const Skeleton& s);
 void boneLines(const Skeleton& s, std::vector<float>& lines);
 // a .bvh of the skeleton (Y up, as MakeHuman exports it): its rest pose, then a frame per pose given (none: the rest)
 bool saveBvh(const Skeleton& s, const std::vector<Pose>& frames, const std::string& path, float scale, float frameTime, std::string& err,
-             const Skeleton* posedThrough = nullptr);   // frames posed on this one (the default) and retargeted to s
+             const Skeleton* posedThrough = nullptr, float yOff = 0);   // yOff: added to the root's height (MakeHuman's "Feet on ground")   // frames posed on this one (the default) and retargeted to s
 // the global pose matrix's rotation per bone, from a pose applied to s (for exports of the posed skeleton)
 Mat4 identity();
 Mat4 multiply(const Mat4& a, const Mat4& b);

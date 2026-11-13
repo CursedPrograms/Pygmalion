@@ -26,11 +26,20 @@ struct Options {
     float cmPerUnit = 10;                       // what one unit is, in cm (for FBX's UnitScaleFactor)
     bool feetOnGround = true;                   // the lowest point at 0
     bool posed = true;                          // the joints in the current pose (else the rest pose)
+    // MakeHuman's exporter options
+    int orient = 0;                             // Collada's orientation: Y up face Z, Y up face X, Z up face -Y, Z up face X
+    int boneAxis = 0;                           // Collada's bone orientation: along local Y, along local X, local = global
+    bool binary = true;                         // FBX and STL: binary (else ASCII)
+    bool normals = true;                        // OBJ: the normals written
+    const std::vector<Skel::Pose>* poseUnits = nullptr;   // Collada's "Facial pose-units": the face's units as an animation
 };
 
 // the person as parts, for the skeleton s (built on b.pos; s's pose is the one written when posed)
 // posedMesh: the vertices as posed now (Collada and Ogre bind the skeleton in the pose; FBX binds the rest)
-std::vector<Part> parts(const Human::Body& b, const Skel::Skeleton* s, bool posedMesh = false);
+// helpers: MakeHuman's "Helper geometry" - every face of the base mesh (helpers, joint markers, under clothes) kept
+std::vector<Part> parts(const Human::Body& b, const Skel::Skeleton* s, bool posedMesh = false, bool helpers = false);
+// STL as MakeHuman writes it (binary or ASCII), the parts in the file's units
+bool saveStl(const std::vector<Part>& parts, const std::string& path, const Options& o, std::string& err);
 
 bool saveCollada(const std::vector<Part>& parts, const Skel::Skeleton* s, const std::string& path, const Options& o, std::string& err);
 bool saveFbx(const std::vector<Part>& parts, const Skel::Skeleton* s, const std::string& path, const Options& o, std::string& err);

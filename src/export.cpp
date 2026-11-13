@@ -46,7 +46,7 @@ static std::vector<std::pair<int, float>> topFour(std::map<int, float>& acc) {
     return v;
 }
 
-std::vector<Part> parts(const Human::Body& b, const Skel::Skeleton* s, bool posedMesh) {
+std::vector<Part> parts(const Human::Body& b, const Skel::Skeleton* s, bool posedMesh, bool helpers) {
     PROF("Export::parts");
     std::vector<Part> out;
     // the skeleton's weights per body vertex
@@ -97,9 +97,18 @@ std::vector<Part> parts(const Human::Body& b, const Skel::Skeleton* s, bool pose
     };
     const std::vector<char> hid = Human::hiddenVerts(b);
     const std::vector<float>& bodyPos = posedMesh && !b.shown.empty() ? b.shown : b.pos;
-    build("body", b.skinTexture, bodyPos, b.tri,
-          [&](size_t c, float* uv) { const int u = b.triUv[c]; if (u >= 0 && (size_t)u * 2 + 1 < b.uv.size()) { uv[0] = b.uv[(size_t)u * 2]; uv[1] = b.uv[(size_t)u * 2 + 1]; } else uv[0] = uv[1] = 0; },
-          [&](int v) { return bw[v]; }, &hid);
+    // MakeHuman's "Helper geometry": every face of base.obj (as fans, as loadBase cuts them), nothing hidden
+    std::vector<int> allTri, allTriUv;
+    if (helpers)
+        for (size_t f = 0; f + 3 < b.faces4.size(); f += 4) {
+            const int n = b.faces4[f + 3] == b.faces4[f + 2] ? 3 : 4;
+            for (int k = 1; k + 1 < n; ++k) { allTri.insert(allTri.end(), {b.faces4[f], b.faces4[f + k], b.faces4[f + k + 1]}); allTriUv.insert(allTriUv.end(), {b.faces4Uv[f], b.faces4Uv[f + k], b.faces4Uv[f + k + 1]}); }
+        }
+    const std::vector<int>& bodyTri = helpers ? allTri : b.tri;
+    const std::vector<int>& bodyTriUv = helpers ? allTriUv : b.triUv;
+    build("body", b.skinTexture, bodyPos, bodyTri,
+          [&](size_t c, float* uv) { const int u = bodyTriUv[c]; if (u >= 0 && (size_t)u * 2 + 1 < b.uv.size()) { uv[0] = b.uv[(size_t)u * 2]; uv[1] = b.uv[(size_t)u * 2 + 1]; } else uv[0] = uv[1] = 0; },
+          [&](int v) { return bw[v]; }, helpers ? nullptr : &hid);
     for (const auto& px : b.proxies) {
         std::vector<float> fit; Human::fitProxy(b, px, fit, !posedMesh);
         std::vector<int> corners(px.tri.begin(), px.tri.end());
@@ -136,11 +145,24 @@ std::vector<Part> withTexturesBeside(const std::vector<Part>& in, const std::str
 // ---------- shared: the transform to the file's units ----------
 struct Xf {
     float scale = 1, yOff = 0;
-    void pt(const float* p, float* o) const { o[0] = p[0] * scale; o[1] = (p[1] + yOff) * scale; o[2] = p[2] * scale; }
-    Mat4 m(const Mat4& a) const { Mat4 r = a; r[12] = a[12] * scale; r[13] = (a[13] + yOff) * scale; r[14] = a[14] * scale; return r; }
+    int orient = 0, boneAxis = 0;
+    // skeleton.py's rotateCoord: Y up face X (z, y, -x), Z up face -Y (x, -z, y), Z up face X (z, x, y)
+    void rot(const float* v, float* o) const {
+        const float x = v[0], y = v[1], z = v[2];
+        if (orient == 1) { o[0] = z; o[1] = y; o[2] = -x; } else if (orient == 2) { o[0] = x; o[1] = -z; o[2] = y; } else if (orient == 3) { o[0] = z; o[1] = x; o[2] = y; } else { o[0] = x; o[1] = y; o[2] = z; }
+    }
+    void pt(const float* p, float* o) const { const float q[3] = {p[0] * scale, (p[1] + yOff) * scale, p[2] * scale}; rot(q, o); }
+    void dir(const float* n, float* o) const { rot(n, o); }
+    Mat4 m(const Mat4& a) const {   // R * (the matrix in the file's units)
+        Mat4 r = a; r[12] = a[12] * scale; r[13] = (a[13] + yOff) * scale; r[14] = a[14] * scale;
+        if (!orient) return r;
+        Mat4 out = r;
+        for (int c = 0; c < 4; ++c) { const float v[3] = {r[c * 4], r[c * 4 + 1], r[c * 4 + 2]}; float w[3]; rot(v, w); out[c * 4] = w[0]; out[c * 4 + 1] = w[1]; out[c * 4 + 2] = w[2]; }
+        return out;
+    }
 };
 static Xf xfOf(const std::vector<Part>& parts, const Options& o) {
-    Xf x; x.scale = o.scale;
+    Xf x; x.scale = o.scale; x.orient = o.orient; x.boneAxis = o.boneAxis;
     if (o.feetOnGround) {
         float lo = 1e30f;
         for (const auto& p : parts) for (size_t i = 1; i < p.pos.size(); i += 3) lo = std::min(lo, p.pos[i]);
@@ -151,7 +173,14 @@ static Xf xfOf(const std::vector<Part>& parts, const Options& o) {
 // each bone's global transform in the file (bind: the rest; scene: posed or rest)
 static void boneMats(const Skel::Skeleton& s, const Xf& x, bool posed, std::vector<Mat4>& bind, std::vector<Mat4>& scene, std::vector<Mat4>& local) {
     bind.clear(); scene.clear(); local.clear();
-    for (const auto& b : s.bones) { bind.push_back(x.m(b.restGlobal)); scene.push_back(x.m(posed ? b.poseGlobal : b.restGlobal)); }
+    for (const auto& b : s.bones) {
+        Mat4 rb = x.m(b.restGlobal), sc = x.m(posed ? b.poseGlobal : b.restGlobal);
+        // the bone's own axes (transformBoneMatrix): Y along it (as made), X along it (times RotXY), or the global axes
+        Mat4 A = Skel::identity();
+        if (x.boneAxis == 1) { A = Skel::identity(); A[0] = 0; A[1] = -1; A[2] = 0; A[4] = 0; A[5] = 0; A[6] = -1; A[8] = 1; A[9] = 0; A[10] = 0; }
+        else if (x.boneAxis == 2) { A = rb; A[12] = A[13] = A[14] = 0; A = Skel::inverseRigid(A); }
+        bind.push_back(Skel::multiply(rb, A)); scene.push_back(Skel::multiply(sc, A));
+    }
     for (size_t i = 0; i < s.bones.size(); ++i) {
         const int p = s.bones[i].parent;
         local.push_back(p >= 0 ? Skel::multiply(Skel::inverseRigid(scene[p]), scene[i]) : scene[i]);
@@ -190,12 +219,12 @@ bool saveObj(const std::vector<Part>& parts, const std::string& path, const Opti
         o << "o " << q.name << "\n";
         for (size_t v = 0; v < n; ++v) { float w[3]; x.pt(&q.pos[v * 3], w); snprintf(b, sizeof b, "v %.6f %.6f %.6f\n", w[0], w[1], w[2]); o << b; }
         for (size_t v = 0; v < n; ++v) { snprintf(b, sizeof b, "vt %.6f %.6f\n", q.uv[v * 2], q.uv[v * 2 + 1]); o << b; }
-        for (size_t v = 0; v < n; ++v) { snprintf(b, sizeof b, "vn %.4f %.4f %.4f\n", q.nrm[v * 3], q.nrm[v * 3 + 1], q.nrm[v * 3 + 2]); o << b; }
+        if (op.normals) for (size_t v = 0; v < n; ++v) { float w[3]; x.dir(&q.nrm[v * 3], w); snprintf(b, sizeof b, "vn %.4f %.4f %.4f\n", w[0], w[1], w[2]); o << b; }
         o << "usemtl mat" << i << "\ns 1\n";
         size_t at = 0;
         for (int k : q.faceSize) {
             o << 'f';
-            for (int c = 0; c < k; ++c) { const size_t v = base + (size_t)q.faces[at + (size_t)c]; o << ' ' << v << '/' << v << '/' << v; }
+            for (int c = 0; c < k; ++c) { const size_t v = base + (size_t)q.faces[at + (size_t)c]; o << ' ' << v << '/' << v; if (op.normals) o << '/' << v; }
             o << '\n';
             at += (size_t)k;
         }
@@ -218,7 +247,7 @@ bool saveCollada(const std::vector<Part>& parts, const Skel::Skeleton* s, const 
     char ts[32]; { std::time_t t = std::time(nullptr); std::strftime(ts, sizeof ts, "%Y-%m-%dT%H:%M:%S", std::gmtime(&t)); }
     o << "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<COLLADA xmlns=\"http://www.collada.org/2005/11/COLLADASchema\" version=\"1.4.1\">\n";
     o << "  <asset><contributor><authoring_tool>Pygmalion</authoring_tool></contributor><created>" << ts << "</created><modified>" << ts
-      << "</modified><unit name=\"unit\" meter=\"" << op.cmPerUnit / 100 << "\"/><up_axis>Y_UP</up_axis></asset>\n";
+      << "</modified><unit name=\"unit\" meter=\"" << op.cmPerUnit / 100 << "\"/><up_axis>" << (op.orient >= 2 ? "Z_UP" : "Y_UP") << "</up_axis></asset>\n";
     o << "  <library_images>\n";
     for (size_t i = 0; i < parts.size(); ++i) if (!parts[i].texture.empty()) o << "    <image id=\"img" << i << "\" name=\"img" << i << "\"><init_from>" << xmlEsc(parts[i].texture) << "</init_from></image>\n";
     o << "  </library_images>\n  <library_effects>\n";
@@ -244,7 +273,7 @@ bool saveCollada(const std::vector<Part>& parts, const Skel::Skeleton* s, const 
         for (size_t v = 0; v < n; ++v) { float q[3]; x.pt(&p.pos[v * 3], q); snprintf(b, sizeof b, "%g %g %g ", q[0], q[1], q[2]); o << b; }
         o << "</float_array><technique_common><accessor source=\"#" << g << "-pos-a\" count=\"" << n << "\" stride=\"3\"><param name=\"X\" type=\"float\"/><param name=\"Y\" type=\"float\"/><param name=\"Z\" type=\"float\"/></accessor></technique_common></source>\n";
         o << "      <source id=\"" << g << "-nrm\"><float_array id=\"" << g << "-nrm-a\" count=\"" << n * 3 << "\">";
-        for (size_t v = 0; v < n; ++v) { snprintf(b, sizeof b, "%.4f %.4f %.4f ", p.nrm[v * 3], p.nrm[v * 3 + 1], p.nrm[v * 3 + 2]); o << b; }
+        for (size_t v = 0; v < n; ++v) { float w[3]; x.dir(&p.nrm[v * 3], w); snprintf(b, sizeof b, "%.4f %.4f %.4f ", w[0], w[1], w[2]); o << b; }
         o << "</float_array><technique_common><accessor source=\"#" << g << "-nrm-a\" count=\"" << n << "\" stride=\"3\"><param name=\"X\" type=\"float\"/><param name=\"Y\" type=\"float\"/><param name=\"Z\" type=\"float\"/></accessor></technique_common></source>\n";
         o << "      <source id=\"" << g << "-uv\"><float_array id=\"" << g << "-uv-a\" count=\"" << n * 2 << "\">";
         for (size_t v = 0; v < n; ++v) { snprintf(b, sizeof b, "%.5f %.5f ", p.uv[v * 2], p.uv[v * 2 + 1]); o << b; }
@@ -285,6 +314,31 @@ bool saveCollada(const std::vector<Part>& parts, const Skel::Skeleton* s, const 
             o << "    </skin></controller>\n";
         }
         o << "  </library_controllers>\n";
+        if (op.poseUnits && !op.poseUnits->empty()) {
+            // each unit a frame (1/24 s apart), each bone's local matrix through them
+            Skel::Skeleton sk = *s;
+            std::vector<std::vector<Mat4>> frames;
+            for (const auto& f : *op.poseUnits) { Skel::setPose(sk, &f); std::vector<Mat4> bb, ss, ll; boneMats(sk, x, true, bb, ss, ll); frames.push_back(ll); }
+            const size_t nf = frames.size();
+            o << "  <library_animations>\n";
+            for (size_t bi = 0; bi < s->bones.size(); ++bi) {
+                const std::string id = safeId(s->bones[bi].name), a = "anim-" + id;
+                o << "    <animation id=\"" << a << "\"><source id=\"" << a << "-in\"><float_array id=\"" << a << "-in-a\" count=\"" << nf << "\">";
+                for (size_t f = 0; f < nf; ++f) { snprintf(b, sizeof b, "%.6f ", f / 24.0); o << b; }
+                o << "</float_array><technique_common><accessor source=\"#" << a << "-in-a\" count=\"" << nf << "\"><param name=\"TIME\" type=\"float\"/></accessor></technique_common></source>";
+                o << "<source id=\"" << a << "-out\"><float_array id=\"" << a << "-out-a\" count=\"" << nf * 16 << "\">";
+                for (size_t f = 0; f < nf; ++f) rowMajor(o, frames[f][bi]);
+                o << "</float_array><technique_common><accessor source=\"#" << a << "-out-a\" count=\"" << nf << "\" stride=\"16\"><param name=\"TRANSFORM\" type=\"float4x4\"/></accessor></technique_common></source>";
+                o << "<source id=\"" << a << "-interp\"><Name_array id=\"" << a << "-interp-a\" count=\"" << nf << "\">";
+                for (size_t f = 0; f < nf; ++f) o << "LINEAR ";
+                o << "</Name_array><technique_common><accessor source=\"#" << a << "-interp-a\" count=\"" << nf << "\"><param name=\"INTERPOLATION\" type=\"name\"/></accessor></technique_common></source>";
+                o << "<sampler id=\"" << a << "-s\"><input semantic=\"INPUT\" source=\"#" << a << "-in\"/><input semantic=\"OUTPUT\" source=\"#" << a << "-out\"/><input semantic=\"INTERPOLATION\" source=\"#" << a
+                  << "-interp\"/></sampler><channel source=\"#" << a << "-s\" target=\"" << id << "/transform\"/></animation>\n";
+            }
+            o << "  </library_animations>\n  <library_animation_clips>\n    <animation_clip id=\"Expression-Face-PoseUnits\" start=\"0\" end=\"" << (nf ? (nf - 1) / 24.0 : 0) << "\">";
+            for (const auto& bn : s->bones) o << "<instance_animation url=\"#anim-" << safeId(bn.name) << "\"/>";
+            o << "</animation_clip>\n  </library_animation_clips>\n";
+        }
     }
     o << "  <library_visual_scenes><visual_scene id=\"Scene\" name=\"Scene\">\n";
     std::string root;
@@ -523,6 +577,50 @@ bool saveFbx(const std::vector<Part>& parts, const Skel::Skeleton* s, const std:
     root.kids.push_back(conns);
     Node& takes = root.add("Takes"); takes.add("Current").S("");
 
+    if (!op.binary) {   // FBX 7.4 ASCII: the same nodes as text
+        std::ofstream f(fs::u8path(path), std::ios::binary);
+        if (!f) { err = "Couldn't write " + path; return false; }
+        f << "; FBX 7.4.0 project file\n; Created by Pygmalion (MakeHuman, remade in C++)\n; ----------------------------------------------------\n\n";
+        std::function<void(const Node&, int)> text = [&](const Node& n, int d) {
+            const std::string pad((size_t)d, '\t');
+            f << pad << n.name << ": ";
+            bool firstProp = true; bool arrayKid = false;
+            for (const auto& p : n.props) {
+                if (!firstProp) f << ", ";
+                firstProp = false;
+                char b[64];
+                switch (p.type) {
+                case 'I': { int32_t v; memcpy(&v, p.data.data(), 4); f << v; break; }
+                case 'L': { int64_t v; memcpy(&v, p.data.data(), 8); f << v; break; }
+                case 'D': { double v; memcpy(&v, p.data.data(), 8); snprintf(b, sizeof b, "%.15g", v); f << b; break; }
+                case 'C': f << (p.data[0] == 'T' ? "Y" : "N"); break;
+                case 'S': {   // "Name\x00\x01Class" is written Class::Name
+                    const size_t sep = p.data.find(std::string("\x00\x01", 2));
+                    f << '"' << (sep == std::string::npos ? p.data : p.data.substr(sep + 2) + "::" + p.data.substr(0, sep)) << '"'; break;
+                }
+                case 'R': f << "\"\""; break;
+                case 'd': case 'i': f << '*' << p.count; arrayKid = true; break;
+                }
+            }
+            if (arrayKid) {   // an array: its values in a block of its own
+                const Prop& p = n.props.back();
+                f << " {\n" << pad << "\ta: ";
+                for (uint32_t k = 0; k < p.count; ++k) {
+                    if (k) f << ',';
+                    if (p.type == 'd') { double v; memcpy(&v, p.data.data() + k * 8, 8); char b[64]; snprintf(b, sizeof b, "%.15g", v); f << b; }
+                    else { int32_t v; memcpy(&v, p.data.data() + k * 4, 4); f << v; }
+                }
+                f << "\n" << pad << "}\n";
+                return;
+            }
+            if (!n.kids.empty()) { f << " {\n"; for (const auto& k : n.kids) text(k, d + 1); f << pad << "}\n"; }
+            else if (n.props.empty()) f << " {\n" << pad << "}\n";
+            else f << "\n";
+        };
+        for (const auto& k : root.kids) text(k, 0);
+        if (!f) { err = "Couldn't write " + path; return false; }
+        return true;
+    }
     std::string o = std::string("Kaydara FBX Binary  \x00\x1a\x00", 23);
     put32(o, 7400);
     for (const auto& k : root.kids) writeNode(o, k);
@@ -537,6 +635,42 @@ bool saveFbx(const std::vector<Part>& parts, const Skel::Skeleton* s, const std:
     o += std::string("\xf8\x5a\x8c\x6a\xde\xf5\xd9\x7e\xec\xe9\x0c\xe3\x75\x8f\x29\x0b", 16);
     std::ofstream f(fs::u8path(path), std::ios::binary);
     if (!f || !f.write(o.data(), (std::streamsize)o.size())) { err = "Couldn't write " + path; return false; }
+    return true;
+}
+
+// ---------- STL (MakeHuman's 9_export_stl: binary or ASCII) ----------
+bool saveStl(const std::vector<Part>& parts, const std::string& path, const Options& op, std::string& err) {
+    const Xf x = xfOf(parts, op);
+    std::vector<std::array<float, 12>> tris;   // normal, then the three corners
+    for (const auto& p : parts)
+        for (size_t t = 0; t + 2 < p.tri.size(); t += 3) {
+            std::array<float, 12> r{};
+            for (int k = 0; k < 3; ++k) x.pt(&p.pos[(size_t)p.tri[t + k] * 3], &r[3 + k * 3]);
+            const float u[3] = {r[6] - r[3], r[7] - r[4], r[8] - r[5]}, v[3] = {r[9] - r[3], r[10] - r[4], r[11] - r[5]};
+            float n[3] = {u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]};
+            const float l = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]); if (l > 0) for (float& c : n) c /= l;
+            r[0] = n[0]; r[1] = n[1]; r[2] = n[2];
+            tris.push_back(r);
+        }
+    std::ofstream f(fs::u8path(path), std::ios::binary);
+    if (!f) { err = "Couldn't write " + path; return false; }
+    if (op.binary) {
+        char head[80] = {}; snprintf(head, sizeof head, "Pygmalion (MakeHuman, remade in C++)");
+        f.write(head, 80);
+        const uint32_t n = (uint32_t)tris.size(); f.write((const char*)&n, 4);
+        const uint16_t attr = 0;
+        for (const auto& r : tris) { f.write((const char*)r.data(), 48); f.write((const char*)&attr, 2); }
+    } else {
+        f << "solid " << fs::u8path(path).stem().u8string() << "\n";
+        char b[200];
+        for (const auto& r : tris) {
+            snprintf(b, sizeof b, "facet normal %f %f %f\n\touter loop\n", r[0], r[1], r[2]); f << b;
+            for (int k = 0; k < 3; ++k) { snprintf(b, sizeof b, "\t\tvertex %f %f %f\n", r[3 + k * 3], r[4 + k * 3], r[5 + k * 3]); f << b; }
+            f << "\tendloop\nendfacet\n";
+        }
+        f << "endsolid " << fs::u8path(path).stem().u8string() << "\n";
+    }
+    if (!f) { err = "Couldn't write " + path; return false; }
     return true;
 }
 

@@ -978,6 +978,8 @@ static bool loadModel(const std::string& path, std::string& err) {
     return true;
 }
 static int exportFormat = 0; static int exportUnits = 1; static bool exportFeet = true, exportPosed = true, exportAnim = false;
+// MakeHuman's exporter options: Collada's orientation and bone axes, helper geometry, facial pose units, FBX/STL binary, OBJ normals
+static int exportOrient = 0, exportBoneAxis = 0; static bool exportHelpers = false, exportFaceUnits = false, exportFbxBinary = true, exportStlBinary = false, exportObjNormals = false;
 enum { EX_DAE, EX_FBX, EX_GLB, EX_OBJ, EX_OGRE, EX_STL, EX_BVH, EX_UV, EX_LIGHT, EX_COUNT };
 static const char* EXPORT_NAMES[] = {"Collada (dae)", "Filmbox (fbx)", "glTF binary (glb)", "Wavefront obj", "Ogre3D", "Stereolithography (stl)", "Biovision Hierarchy (bvh)", "UV map (png)", "Lightmap (png)"};
 static const char* EXPORT_EXT[] = {".dae", ".fbx", ".glb", ".obj", ".mesh.xml", ".stl", ".bvh", ".png", ".png"};
@@ -988,13 +990,14 @@ static Mesh toMesh();
 static bool exportTo(const std::string& p, int fmt, std::string& err) {
     PROF("export");
     const float sc = UNIT_SCALE[exportUnits];
-    if (fmt == EX_GLB || fmt == EX_STL) {
-        const Mesh m = toMesh();
-        return fmt == EX_GLB ? saveGlb(m, p, sc, false, err) : saveStl(m, p, sc, false, err);
+    if (fmt == EX_GLB) { const Mesh m = toMesh(); return saveGlb(m, p, sc, false, err); }
+    if (fmt == EX_STL) {   // MakeHuman's STL: binary or ASCII, feet on ground
+        Export::Options o; o.scale = sc; o.feetOnGround = exportFeet; o.binary = exportStlBinary;
+        return Export::saveStl(Export::parts(body, nullptr, exportPosed, exportHelpers), p, o, err);
     }
     if (fmt == EX_OBJ) {   // MakeHuman's OBJ: shared vertices and its quads, as posed now
-        Export::Options o; o.scale = sc; o.cmPerUnit = UNIT_CM[exportUnits]; o.feetOnGround = exportFeet; o.posed = exportPosed;
-        return Export::saveObj(Export::withTexturesBeside(Export::parts(body, nullptr, exportPosed), p), p, o, err);
+        Export::Options o; o.scale = sc; o.cmPerUnit = UNIT_CM[exportUnits]; o.feetOnGround = exportFeet; o.posed = exportPosed; o.normals = exportObjNormals;
+        return Export::saveObj(Export::withTexturesBeside(Export::parts(body, nullptr, exportPosed, exportHelpers), p), p, o, err);
     }
     if (fmt == EX_UV) return Export::saveUvMap(body, p, 2048, err);
     if (fmt == EX_LIGHT) return Export::saveLightmap(body, p, 1024, err);
@@ -1004,13 +1007,16 @@ static bool exportTo(const std::string& p, int fmt, std::string& err) {
         std::vector<Skel::Pose> frames;
         if (exportAnim && !animFrames.empty()) frames = animFrames;
         else if (!currentPose.empty()) frames.push_back(currentPose);
-        const bool ok = Skel::saveBvh(sk, frames, p, sc, animFrameTime, err, &sk != &rig && Skel::usesReferences(sk) ? &rig : nullptr);
+        float ground = 0; { float g[3]; if (exportFeet && Human::jointPos(body, "joint-ground", g)) ground = -g[1]; }
+        const bool ok = Skel::saveBvh(sk, frames, p, sc, animFrameTime, err, &sk != &rig && Skel::usesReferences(sk) ? &rig : nullptr, ground);
         repose();   // (saving walked the skeleton through the frames)
         return ok;
     }
     Export::Options o; o.scale = sc; o.cmPerUnit = UNIT_CM[exportUnits]; o.feetOnGround = exportFeet; o.posed = exportPosed;
+    o.binary = exportFbxBinary;
+    if (fmt == EX_DAE) { o.orient = exportOrient; o.boneAxis = exportBoneAxis; if (exportFaceUnits) o.poseUnits = &faceUnits; }
     const Skel::Skeleton* sk = chosen.empty() ? nullptr : &chosen;
-    const auto parts = Export::withTexturesBeside(Export::parts(body, sk, exportPosed && fmt != EX_FBX), p);
+    const auto parts = Export::withTexturesBeside(Export::parts(body, sk, exportPosed && fmt != EX_FBX, exportHelpers), p);
     return fmt == EX_DAE ? Export::saveCollada(parts, sk, p, o, err) : fmt == EX_FBX ? Export::saveFbx(parts, sk, p, o, err) : Export::saveOgre(parts, sk, p, o, err);
 }
 static bool wantThumb = false; static std::string thumbPath;
@@ -1098,9 +1104,19 @@ static void filesRight() {
     groupBox("Options");
     ImGui::TextUnformatted("Scale units");
     ImGui::SetNextItemWidth(-1); ImGui::Combo("##units", &exportUnits, UNIT_NAMES, 5);
-    if (exportFormat == EX_DAE || exportFormat == EX_FBX || exportFormat == EX_OGRE) {
-        ImGui::Checkbox("Feet on ground", &exportFeet);
-        ImGui::Checkbox("In the current pose", &exportPosed);
+    if (exportFormat != EX_UV && exportFormat != EX_LIGHT && exportFormat != EX_GLB) ImGui::Checkbox("Feet on ground", &exportFeet);
+    if (exportFormat == EX_DAE || exportFormat == EX_FBX || exportFormat == EX_OGRE || exportFormat == EX_OBJ || exportFormat == EX_STL) ImGui::Checkbox("In the current pose", &exportPosed);
+    if (exportFormat == EX_DAE || exportFormat == EX_FBX || exportFormat == EX_OBJ || exportFormat == EX_STL) ImGui::Checkbox("Helper geometry", &exportHelpers);
+    if (exportFormat == EX_OBJ) ImGui::Checkbox("Normals", &exportObjNormals);
+    if (exportFormat == EX_FBX) ImGui::Checkbox("Binary FBX", &exportFbxBinary);
+    if (exportFormat == EX_STL) ImGui::Checkbox("Binary STL", &exportStlBinary);
+    if (exportFormat == EX_DAE) {
+        ImGui::Checkbox("Facial pose-units", &exportFaceUnits);
+        ImGui::TextUnformatted("Orientation");
+        ImGui::RadioButton("Y up, face Z", &exportOrient, 0); ImGui::RadioButton("Y up, face X", &exportOrient, 1);
+        ImGui::RadioButton("Z up, face -Y", &exportOrient, 2); ImGui::RadioButton("Z up, face X", &exportOrient, 3);
+        ImGui::TextUnformatted("Bone orientation");
+        ImGui::RadioButton("Along local Y", &exportBoneAxis, 0); ImGui::RadioButton("Along local X", &exportBoneAxis, 1); ImGui::RadioButton("Local = Global", &exportBoneAxis, 2);
     }
     if (exportFormat == EX_BVH) ImGui::Checkbox("The whole animation", &exportAnim);
 }
@@ -2040,6 +2056,13 @@ static bool runCommand(const std::string& line, std::string& err, const std::fun
         massStart = snapshot(); massLeft = massTotal = std::max(1, n); massDone = 0;
         while (massLeft > 0) massStep();
         out("made " + std::to_string(massDone));
+    }
+    else if (cmd == "exportopt") {   // exportopt orient 0..3 | bones 0..2 | helpers | faceunits | fbxbinary | stlbinary | normals | feet | posed  (0/1)
+        const int iv = (int)v; const bool bv = v != 0;
+        if (a == "orient") exportOrient = std::clamp(iv, 0, 3); else if (a == "bones") exportBoneAxis = std::clamp(iv, 0, 2);
+        else if (a == "helpers") exportHelpers = bv; else if (a == "faceunits") exportFaceUnits = bv; else if (a == "fbxbinary") exportFbxBinary = bv;
+        else if (a == "stlbinary") exportStlBinary = bv; else if (a == "normals") exportObjNormals = bv; else if (a == "feet") exportFeet = bv; else if (a == "posed") exportPosed = bv;
+        else { ok = false; err = "exportopt: orient, bones, helpers, faceunits, fbxbinary, stlbinary, normals, feet, posed"; }
     }
     else if (cmd == "shaders") Viewer::look().mhShaders = rest != "off";   // MakeHuman's own shaders (on) or Pygmalion's
     else if (cmd == "download") ok = installPack(rest, err);

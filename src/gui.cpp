@@ -69,8 +69,8 @@ namespace fs = std::filesystem;
 
 static ImU32 C_BG = IM_COL32(0x1a, 0x1a, 0x1a, 255), C_PANEL = IM_COL32(0x24, 0x24, 0x24, 255),
                    C_LINE = IM_COL32(0x3a, 0x3a, 0x3a, 255), C_TEXT = IM_COL32(0xe6, 0xe6, 0xe6, 255),
-                   C_DIM = IM_COL32(0x9a, 0x9a, 0x9a, 255), C_PINK = IM_COL32(0xe0, 0x40, 0x8a, 255),
-                   C_DEEP = IM_COL32(0xc2, 0x18, 0x6b, 255), C_WELL = IM_COL32(0x14, 0x14, 0x14, 255);
+                   C_DIM = IM_COL32(0x9a, 0x9a, 0x9a, 255), C_PINK = IM_COL32(0x00, 0x7b, 0xb7, 255),
+                   C_DEEP = IM_COL32(0x00, 0x51, 0x84, 255), C_WELL = IM_COL32(0x14, 0x14, 0x14, 255);
 static ImVec4 col4(ImU32 c) { return ImGui::ColorConvertU32ToFloat4(c); }
 
 // the themes (Settings > General > Theme): Pygmalion's own, MakeHuman's (data/themes/makehuman.qss, its gradients
@@ -83,8 +83,8 @@ static void themeColours(int t) {
         C_DEEP = IM_COL32(0xd7, 0x80, 0x1a, 255); C_WELL = IM_COL32(0x21, 0x21, 0x21, 255);
     } else {        // Pygmalion (and the native look's accents)
         C_BG = IM_COL32(0x1a, 0x1a, 0x1a, 255); C_PANEL = IM_COL32(0x24, 0x24, 0x24, 255); C_LINE = IM_COL32(0x3a, 0x3a, 0x3a, 255);
-        C_TEXT = IM_COL32(0xe6, 0xe6, 0xe6, 255); C_DIM = IM_COL32(0x9a, 0x9a, 0x9a, 255); C_PINK = IM_COL32(0xe0, 0x40, 0x8a, 255);
-        C_DEEP = IM_COL32(0xc2, 0x18, 0x6b, 255); C_WELL = IM_COL32(0x14, 0x14, 0x14, 255);
+        C_TEXT = IM_COL32(0xe6, 0xe6, 0xe6, 255); C_DIM = IM_COL32(0x9a, 0x9a, 0x9a, 255); C_PINK = IM_COL32(0x00, 0x7b, 0xb7, 255);
+        C_DEEP = IM_COL32(0x00, 0x51, 0x84, 255); C_WELL = IM_COL32(0x14, 0x14, 0x14, 255);
     }
 }
 static void applyStyle() {
@@ -2366,6 +2366,14 @@ static bool runCommand(const std::string& line0, std::string& err, const std::fu
     else if (cmd == "renderopt") { if (a == "sss") { renderMethod = v != 0 ? 1 : 0; renderSSS = v != 0; } else if (a == "aa") renderSS = std::clamp((int)v, 1, 4); else { ok = false; err = "renderopt sss 0/1 | aa 1..4"; } }
     else if (cmd == "packs" || cmd == "packshots") packsCommand(cmd, rest, out);   // packs: the asset list | packshots <pack>: its pictures
     else if (cmd == "language") { prefs.language = rest.empty() ? "en" : rest; Lang::load(dataDir, prefs.language); fontsDirty = true; }   // language de (en, ja, zh, es, ko, fr, de, ru, sr, af, yua, pdc...)
+    else if (cmd == "dumplabels") {   // every MakeHuman word the window shows: categories, tasks, slider groups, modifier labels (for the language packs)
+        std::ofstream o(fs::u8path(rest)); std::set<std::string> w;
+        for (int c = 0; c < CAT_COUNT; ++c) { w.insert(CAT_NAMES[c]); for (const auto& t : tasksOfAll(c)) w.insert(t); }
+        for (const auto& t : body.tabs) { w.insert(t.name); for (const auto& g : t.groups) w.insert(g.name); }
+        for (const auto& m : body.mods) { w.insert(m.label); }
+        for (const auto& x : w) o << x << "\n";
+        out(std::to_string(w.size()) + " words");
+    }
     else if (cmd == "shaders") Viewer::look().mhShaders = rest != "off";   // MakeHuman's own shaders (on) or Pygmalion's
     else if (cmd == "download") ok = installPack(rest, err);
     else if (cmd == "kindof") out(kindOfProxy(rest));   // what Install would call a .mhclo
@@ -2764,7 +2772,7 @@ static void shellView() {
     const float inH = ImGui::GetFrameHeightWithSpacing();
     ImGui::BeginChild("sh", ImVec2(0, -inH), true);
     for (const auto& l : shellLines) {
-        if (l.rfind("> ", 0) == 0) ImGui::TextColored(ImVec4(0.88f, 0.25f, 0.54f, 1), "%s", l.c_str()); else ImGui::TextUnformatted(l.c_str());
+        if (l.rfind("> ", 0) == 0) ImGui::TextColored(ImVec4(0.0f, 0.482f, 0.718f, 1), "%s", l.c_str()); else ImGui::TextUnformatted(l.c_str());
     }
     if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) ImGui::SetScrollHereY(1);
     ImGui::EndChild();

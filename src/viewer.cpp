@@ -818,7 +818,7 @@ unsigned render(int w, int h, bool hovered) {
             if (lines) {
                 glUseProgram_(progLine);
                 glUniformMatrix4fv_(glGetUniformLocation_(progLine, "mvp"), 1, GL_FALSE, mvp);
-                glUniform3f_(glGetUniformLocation_(progLine, "col"), 0.88f, 0.25f, 0.54f);
+                glUniform3f_(glGetUniformLocation_(progLine, "col"), 0.0f, 0.482f, 0.718f);
                 glPolygonMode(GL_FRONT_AND_BACK, GL_LINE); glEnable(GL_POLYGON_OFFSET_LINE); glPolygonOffset(-1, -1);
                 glDrawArrays(GL_TRIANGLES, 0, pt.count);
                 glPolygonMode(GL_FRONT_AND_BACK, GL_FILL); glDisable(GL_POLYGON_OFFSET_LINE);
@@ -838,7 +838,7 @@ unsigned render(int w, int h, bool hovered) {
         if (lines) {
             glUseProgram_(progLine);
             glUniformMatrix4fv_(glGetUniformLocation_(progLine, "mvp"), 1, GL_FALSE, mvp);
-            glUniform3f_(glGetUniformLocation_(progLine, "col"), 0.88f, 0.25f, 0.54f);
+            glUniform3f_(glGetUniformLocation_(progLine, "col"), 0.0f, 0.482f, 0.718f);
             glPolygonMode(GL_FRONT_AND_BACK, GL_LINE); glEnable(GL_POLYGON_OFFSET_LINE); glPolygonOffset(-1, -1);
             glDrawArrays(GL_TRIANGLES, 0, pt.count);
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL); glDisable(GL_POLYGON_OFFSET_LINE);
@@ -854,7 +854,7 @@ unsigned render(int w, int h, bool hovered) {
         glEnableVertexAttribArray_(0); glVertexAttribPointer_(0, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
         glUseProgram_(progLine);
         glUniformMatrix4fv_(glGetUniformLocation_(progLine, "mvp"), 1, GL_FALSE, mvp);
-        glUniform3f_(glGetUniformLocation_(progLine, "col"), 0.88f, 0.25f, 0.54f);
+        glUniform3f_(glGetUniformLocation_(progLine, "col"), 0.0f, 0.482f, 0.718f);
         glLineWidth(2);
         glDrawArrays(GL_LINES, 0, (GLsizei)(boneSegs.size() / 3));
         glUniform3f_(glGetUniformLocation_(progLine, "col"), 1.0f, 1.0f, 1.0f);

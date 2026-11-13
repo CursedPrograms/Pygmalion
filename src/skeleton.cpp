@@ -1,6 +1,7 @@
 // Pygmalion - the skeleton and posing (see skeleton.h). The maths follows MakeHuman's shared/skeleton.py (getMatrix,
 // Bone.build, Skeleton.setPose, skinMesh), shared/bvh.py (BVHJoint.calculateFrames) and shared/animation.py
 // (PoseUnit.getBlendedPose).
+#include "profile.h"
 #include "skeleton.h"
 #include "json.h"
 
@@ -114,6 +115,7 @@ static bool jointPos(const Skeleton& s, const std::vector<float>& pos, const std
 }
 
 void build(Skeleton& s, const std::vector<float>& pos) {
+    PROF("Skel::build");
     for (auto& b : s.bones) {
         jointPos(s, pos, b.headJoint, b.head);
         jointPos(s, pos, b.tailJoint, b.tail);
@@ -136,6 +138,7 @@ void build(Skeleton& s, const std::vector<float>& pos) {
 }
 
 void setPose(Skeleton& s, const Pose* p) {
+    PROF("Skel::setPose");
     for (auto& b : s.bones) {
         b.pose = ident();
         if (p) {
@@ -159,6 +162,7 @@ void setPose(Skeleton& s, const Pose* p) {
 }
 
 void skin(const Skeleton& s, const std::vector<float>& rest, std::vector<float>& out) {
+    PROF("Skel::skin");
     out.assign(rest.size(), 0.0f);
     std::vector<float> wsum(rest.size() / 3, 0.0f);
     for (size_t bi = 0; bi < s.bones.size(); ++bi) {

@@ -1,4 +1,5 @@
 // Pygmalion - the exports with the skeleton (see export.h).
+#include "profile.h"
 #include "export.h"
 
 #include <stb_image_write.h>
@@ -46,6 +47,7 @@ static std::vector<std::pair<int, float>> topFour(std::map<int, float>& acc) {
 }
 
 std::vector<Part> parts(const Human::Body& b, const Skel::Skeleton* s, bool posedMesh) {
+    PROF("Export::parts");
     std::vector<Part> out;
     // the skeleton's weights per body vertex
     std::vector<std::map<int, float>> bw;
@@ -620,6 +622,7 @@ bool saveOgre(const std::vector<Part>& parts, const Skel::Skeleton* s, const std
 
 // ---------- the UV map ----------
 bool saveLightmap(const Human::Body& b, const std::string& path, int size, std::string& err) {
+    PROF("Export::saveLightmap");
     const std::vector<float>& pos = b.shown.empty() ? b.pos : b.shown;
     // the faces shown (not under clothes), their vertex normals, and each vertex's light: N.L to the light, 0..255
     const std::vector<char> hid = Human::hiddenVerts(b);

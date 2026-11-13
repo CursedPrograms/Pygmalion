@@ -5,6 +5,7 @@
 //
 //   Pygmalion [model.mhm]
 //   Pygmalion --capture out.bmp [--describe "words"] [--tab N]      a screenshot, then quit
+#include "profile.h"
 #include "human.h"
 #include "skeleton.h"
 #include "model.h"
@@ -12,6 +13,7 @@
 #include "viewer.h"
 #include "export.h"
 #include "mhscene.h"
+#include "profile.h"
 #ifdef _WIN32
 #include "http.h"
 #include "socket.h"
@@ -124,6 +126,17 @@ static void loadFont() {
 }
 
 #ifdef _WIN32
+static std::string folderDialog() {
+    std::string out;
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);   // (once is enough; again is harmless)
+    IFileOpenDialog* d = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d)))) {
+        DWORD o = 0; d->GetOptions(&o); d->SetOptions(o | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+        if (SUCCEEDED(d->Show(nullptr))) { IShellItem* it = nullptr; if (SUCCEEDED(d->GetResult(&it))) { PWSTR p = nullptr; if (SUCCEEDED(it->GetDisplayName(SIGDN_FILESYSPATH, &p))) { out = fs::path(p).u8string(); CoTaskMemFree(p); } it->Release(); } }
+        d->Release();
+    }
+    return out;
+}
 static std::string fileDialog(bool save, const wchar_t* filter, const wchar_t* ext, const std::string& start) {
     std::vector<wchar_t> buf(4096, 0);
     const std::wstring s = fs::u8path(start).wstring();
@@ -134,7 +147,17 @@ static std::string fileDialog(bool save, const wchar_t* filter, const wchar_t* e
     if (!(save ? GetSaveFileNameW(&o) : GetOpenFileNameW(&o))) return "";
     return fs::path(buf.data()).u8string();
 }
+static std::string configFile() {   // %APPDATA%\Pygmalion\pygmalion.conf: one line, the home folder (MakeHuman's makehuman.conf)
+    PWSTR p = nullptr; std::string f;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &p))) { f = (fs::path(p) / "Pygmalion" / "pygmalion.conf").u8string(); CoTaskMemFree(p); }
+    return f;
+}
 static std::string homeDir() {
+    {   // a home folder of the user's own choosing
+        static std::string chosen; static bool read = false;
+        if (!read) { read = true; std::ifstream in(fs::u8path(configFile())); std::string l; if (std::getline(in, l)) { while (!l.empty() && (l.back() == '\r' || l.back() == ' ')) l.pop_back(); std::error_code ec; if (!l.empty() && fs::is_directory(fs::u8path(l), ec)) chosen = l; } }
+        if (!chosen.empty()) return chosen;
+    }
     // Documents\Pygmalion unless Windows guards Documents: then Pygmalion in the user's own folder
     for (const KNOWNFOLDERID& id : {FOLDERID_Documents, FOLDERID_Profile}) {
         PWSTR p = nullptr;
@@ -298,6 +321,10 @@ struct Prefs {
     int win[4] = {0, 0, 0, 0};     // the window's place and size, kept when restoreWindow is on
 };
 static Prefs prefs;
+// Settings > Plugins and User Plugins: the parts left out ("Category/Task", as at the start) and the scripts run at the start
+static std::set<std::string> excludedTasks, excludedAtStart;
+static std::vector<std::string> activeUserPlugins;
+static std::set<std::string>& startExclusions() { return excludedAtStart; }
 static std::string settingsFile() { return (fs::u8path(homeDir()) / "settings.ini").u8string(); }
 static void saveSettings() {
     std::ofstream o(fs::u8path(settingsFile()));
@@ -311,6 +338,8 @@ static void saveSettings() {
     o << "realtimeNormals=" << lk.normalsWhileDragging << "\nrealtimeFitting=" << lk.fitWhileDragging << "\nrealWeight=" << prefs.realWeight
       << "\ntagMode=" << prefs.tagMode << "\ntagCount=" << prefs.tagCount << "\nnameTags=" << prefs.nameTags << "\npreload=" << prefs.preload
       << "\nrestoreWindow=" << prefs.restoreWindow << "\nhdpi=" << prefs.hdpi << "\nnoSampleBuffers=" << prefs.noSampleBuffers << "\nsliderEdit=" << prefs.sliderEdit
+      << "\nexcluded=" << [] { std::string s; for (const auto& e : excludedTasks) s += (s.empty() ? "" : "|") + e; return s; }()
+      << "\nuserPlugins=" << [] { std::string s; for (const auto& e : activeUserPlugins) s += (s.empty() ? "" : "|") + e; return s; }()
       << "\ntheme=" << theme << "\nwindow=" << prefs.win[0] << " " << prefs.win[1] << " " << prefs.win[2] << " " << prefs.win[3] << "\n";
     o << "socketAccept=" << sockCfg.accept << "\nsocketAdvanced=" << sockCfg.advanced << "\nsocketHost=" << sockCfg.host << "\nsocketPort=" << sockCfg.port << "\n";
 }
@@ -335,6 +364,8 @@ static void loadSettings() {
         else if (k == "preload") prefs.preload = b; else if (k == "restoreWindow") prefs.restoreWindow = b; else if (k == "hdpi") prefs.hdpi = b;
         else if (k == "noSampleBuffers") prefs.noSampleBuffers = b; else if (k == "sliderEdit") prefs.sliderEdit = b;
         else if (k == "theme") theme = std::clamp(atoi(v.c_str()), 0, 2);
+        else if (k == "excluded") { excludedTasks.clear(); std::istringstream es(v); std::string one; while (std::getline(es, one, '|')) if (!one.empty()) excludedTasks.insert(one); excludedAtStart = excludedTasks; }
+        else if (k == "userPlugins") { activeUserPlugins.clear(); std::istringstream es(v); std::string one; while (std::getline(es, one, '|')) if (!one.empty()) activeUserPlugins.push_back(one); }
         else if (k == "window") { std::istringstream ws(v); for (int& c : prefs.win) ws >> c; }
         else if (k == "socketAccept") sockCfg.accept = b; else if (k == "socketAdvanced") sockCfg.advanced = b;
         else if (k == "socketHost" && !v.empty()) { sockCfg.host = v; snprintf(sockHost, sizeof sockHost, "%s", v.c_str()); }
@@ -512,6 +543,7 @@ static const Skel::Pose* footPose() {
     return c->second.empty() ? nullptr : &c->second;
 }
 static void repose() {
+    PROF("repose (pose + expression)");
     if (rig.empty()) { body.shown.clear(); return; }
     bool anyUnit = false;
     for (size_t k = 1; k < unitW.size(); ++k) if (unitW[k] > 0) anyUnit = true;
@@ -773,7 +805,14 @@ static int cat = CAT_MODELLING;
 static std::string task[CAT_COUNT] = {"Load", "Main", "Clothes", "Skin/Material", "Skeleton", "Render", "Sliders", "Describe", "About"};
 static std::map<std::string, int> category;   // a modelling tab's chosen Category (the slider group shown)
 
+static std::vector<std::string> tasksOfAll(int c);
+static std::set<std::string>& startExclusions();   // (with the settings)
 static std::vector<std::string> tasksOf(int c) {
+    std::vector<std::string> v = tasksOfAll(c);
+    v.erase(std::remove_if(v.begin(), v.end(), [&](const std::string& t) { return startExclusions().count(std::string(CAT_NAMES[c]) + "/" + t) > 0; }), v.end());
+    return v;
+}
+static std::vector<std::string> tasksOfAll(int c) {
     switch (c) {
     case CAT_FILES: return {"Load", "Save", "Export"};
     case CAT_MODELLING: {
@@ -788,8 +827,8 @@ static std::vector<std::string> tasksOf(int c) {
     case CAT_MATERIALS: return {"Skin/Material"};
     case CAT_POSE: return {"Skeleton", "Pose", "Expression", "Animations"};
     case CAT_RENDERING: return {"Render", "Scene", "Viewer"};
-    case CAT_SETTINGS: return {"Sliders", "General", "Background", "Mouse", "Shortcuts"};
-    case CAT_UTILITIES: return {"Describe", "Symmetry", "Statistics", "Material Editor", "Scene Editor", "Expression mixer", "Targets", "Save targets", "Mass produce", "Shell", "Scripting", "Download", "Socket", "Data", "Logs"};
+    case CAT_SETTINGS: return {"Sliders", "General", "Background", "Mouse", "Shortcuts", "Plugins", "User Plugins"};
+    case CAT_UTILITIES: return {"Describe", "Symmetry", "Statistics", "Material Editor", "Scene Editor", "Expression mixer", "Targets", "Save targets", "Mass produce", "Shell", "Scripting", "Download", "Socket", "Profile", "Example", "Data", "Logs"};
     default: return {"About", "Licence"};
     }
 }
@@ -947,6 +986,7 @@ static const float UNIT_SCALE[] = {1, 0.1f, 10, 100, 3.93700787f};
 static const float UNIT_CM[] = {10, 100, 1, 0.1f, 2.54f};
 static Mesh toMesh();
 static bool exportTo(const std::string& p, int fmt, std::string& err) {
+    PROF("export");
     const float sc = UNIT_SCALE[exportUnits];
     if (fmt == EX_GLB || fmt == EX_STL) {
         const Mesh m = toMesh();
@@ -1765,6 +1805,7 @@ static const char* MACRO_NAMES[] = {"Gender", "Age", "Muscle", "Weight", "Height
 static const char* COMMANDS = "reset | random 0.5 | describe words\nmacro Gender 0..1 (Age, Muscle, Weight,\n  Height, BodyProportions, African, Asian,\n  Caucasian, BreastSize, BreastFirmness)\nmodifier group/name value\nwear clothes/x/x.mhclo | takeoff hair\nskin skins/x/x.mhmat | skin default\nskeleton game_engine | none\npose standing01 | none\nanimation walk1 | none\nexpression smile01 | none\nbones on | off\nsymmetry on | off\nunits meter (decimeter, centimeter...)\nload file.mhm | save file.mhm\nexport file.fbx (.dae .glb .obj ...)\nrender file.png 1920 1080\nsmooth on | off\nscene studio (makehuman, soft,\n  dramatic, sunset) | scene file.pygscene\n  | scene save file.pygscene\ndownload hair01 (an asset pack)\ninstall file.zip | folder [clothes, hair...]\nget Gender | get group/name (a value)\nlist macros | modifiers | worn | poses\ninfo (the size of everything)";
 // one command; anything it prints goes to out
 static bool runCommand(const std::string& line, std::string& err, const std::function<void(const std::string&)>& out) {
+    PROF("script command");
     std::istringstream ls(line); std::string cmd; ls >> cmd;
     if (cmd.empty() || cmd[0] == '#') return true;
     std::string rest; std::getline(ls >> std::ws, rest);
@@ -1868,6 +1909,153 @@ static bool runCommand(const std::string& line, std::string& err, const std::fun
     else { ok = false; err = "unknown command " + cmd + " (help lists them)"; }
     return ok;
 }
+static void runScript(const std::string& text);
+#ifdef _WIN32
+static bool runQuiet(const std::wstring& cmd);
+#endif
+
+// ---------- Settings > Plugins and User Plugins (MakeHuman's plugin list, and 5_settings_userplugins) ----------
+// Pygmalion's own parts stand where MakeHuman's plugins do: one off is gone after a restart. User plugins are Pygmalion
+// scripts (.pygscript, the Scripting tab's commands) in the plugins folder; the checked ones run at the start.
+static std::string pluginsDir() { const fs::path d = fs::u8path(homeDir()) / "plugins"; std::error_code ec; fs::create_directories(d, ec); return d.u8string(); }
+static std::vector<std::string> userPlugins() {
+    std::vector<std::string> v; std::error_code ec;
+    for (const auto& e : fs::directory_iterator(fs::u8path(pluginsDir()), ec)) {
+        const std::string n = e.path().filename().u8string();
+        if (n.empty() || n[0] == '_') continue;
+        if (e.is_directory(ec) && fs::exists(e.path() / "main.pygscript", ec)) v.push_back(n);
+        else if (e.path().extension() == ".pygscript") v.push_back(e.path().stem().u8string());
+    }
+    std::sort(v.begin(), v.end());
+    return v;
+}
+static std::string pluginFile(const std::string& name) {
+    const fs::path d = fs::u8path(pluginsDir()); std::error_code ec;
+    if (fs::exists(d / name / "main.pygscript", ec)) return (d / name / "main.pygscript").u8string();
+    return (d / (name + ".pygscript")).u8string();
+}
+static void runPlugin(const std::string& name) {
+    std::ifstream in(fs::u8path(pluginFile(name))); std::ostringstream ss; ss << in.rdbuf();
+    runScript(ss.str()); say("Plugin " + name + " ran");
+}
+static void pluginsLeft(float lw) {
+    groupBox("Plugins");
+    ImGui::TextWrapped("Untick a part to leave it out; it's gone after a restart (MakeHuman's plugins work the same way).");
+    for (int c = 0; c < CAT_COUNT; ++c) {
+        if (!ImGui::TreeNode(CAT_NAMES[c])) continue;
+        for (const auto& t : tasksOfAll(c)) {
+            const std::string key = std::string(CAT_NAMES[c]) + "/" + t;
+            if (key == "Settings/Plugins") continue;
+            bool on = !excludedTasks.count(key);
+            if (ImGui::Checkbox(t.c_str(), &on)) { if (on) excludedTasks.erase(key); else excludedTasks.insert(key); }
+        }
+        ImGui::TreePop();
+    }
+}
+static void userPluginsLeft(float lw) {
+    groupBox("User Plugins");
+    const auto list = userPlugins();
+    if (list.empty()) ImGui::TextDisabled("None in %s", pluginsDir().c_str());
+    for (const auto& n : list) {
+        bool on = std::find(activeUserPlugins.begin(), activeUserPlugins.end(), n) != activeUserPlugins.end();
+        if (ImGui::Checkbox(n.c_str(), &on)) { if (on) activeUserPlugins.push_back(n); else activeUserPlugins.erase(std::remove(activeUserPlugins.begin(), activeUserPlugins.end(), n), activeUserPlugins.end()); }
+    }
+    ImGui::Spacing();
+    if (ImGui::Button("Install Plugin File", ImVec2(lw, 0))) {
+        const std::string f = fileDialog(false, L"Pygmalion script (*.pygscript)\0*.pygscript\0All files\0*.*\0\0", L"pygscript", homeDir() + "\\");
+        if (!f.empty()) {
+            std::error_code ec; fs::copy_file(fs::u8path(f), fs::u8path(pluginsDir()) / fs::u8path(f).filename(), fs::copy_options::overwrite_existing, ec);
+            say(ec ? "Failed to copy " + f + " to the user plugins folder" : "The plugin copied successfully. To activate, check the plugin in the list and press \"Activate Plugins\" or restart Pygmalion.");
+        }
+    }
+    if (ImGui::Button("Install Zipped Plugin", ImVec2(lw, 0))) {
+        const std::string f = fileDialog(false, L"Zip files\0*.zip\0All files\0*.*\0\0", L"zip", homeDir() + "\\");
+        if (!f.empty()) say(runQuiet(L"tar.exe -xf \"" + fs::u8path(f).wstring() + L"\" -C \"" + fs::u8path(pluginsDir()).wstring() + L"\"")
+                            ? "The plugin copied successfully. To activate, check the plugin in the list and press \"Activate Plugins\" or restart Pygmalion." : "Not a zip file " + f);
+    }
+    if (ImGui::Button("Reload Plugins Folder", ImVec2(lw, 0))) say("Plugins folder read again");
+    if (ImGui::Button("Activate Plugins", ImVec2(lw, 0))) for (const auto& n : activeUserPlugins) runPlugin(n);
+    if (ImGui::Button("Open the plugins folder", ImVec2(lw, 0))) ShellExecuteW(nullptr, L"open", fs::u8path(pluginsDir()).wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    groupBox("Info");
+    ImGui::TextWrapped("Install new plugins by either copying to the user plugins folder or using the built in installer. A plugin is a Pygmalion script "
+                       "(.pygscript: the Scripting tab's commands, one a line), or a folder with a main.pygscript in it.\n\nTo activate a plugin it must be "
+                       "checked in the list. Then click the \"Activate Plugins\" button or restart Pygmalion. MakeHuman's own Python plugins can't run here.");
+}
+
+// ---------- Utilities > Profile (MakeHuman's 7_profile): the main steps' timings, sortable, saved as text ----------
+static int profKey = 0, profDir = 0;
+static void profileLeft(float lw) {
+    static const char* KEYS[] = {"Total calls", "Total time", "Total per call", "Cumulative time", "Cumulative per call", "Function"};
+    groupBox("Sort");
+    for (int k = 0; k < 6; ++k) ImGui::RadioButton(KEYS[k], &profKey, k);
+    groupBox("Sort ");
+    ImGui::RadioButton("Descending", &profDir, 0); ImGui::RadioButton("Ascending", &profDir, 1);
+    groupBox("Profile");
+    ImGui::Checkbox("Timing on", &Prof::on);
+    if (ImGui::Button("Clear", ImVec2(lw, 0))) Prof::reset();
+    groupBox("Save");
+    if (ImGui::Button("Save...", ImVec2(lw, 0))) {
+        const std::string f = fileDialog(true, L"Text\0*.txt\0\0", L"txt", homeDir() + "\\profile.txt");
+        if (!f.empty()) {
+            std::ofstream o(fs::u8path(f));
+            o << "Calls\tTotal\tTotal/Call\tCumul.\tCumul/Call\tFunction\n";
+            for (const auto& [n, s] : Prof::stats()) o << s.calls << "\t" << s.total << "\t" << (s.calls ? s.total / s.calls : 0) << "\t" << s.cumul << "\t" << (s.calls ? s.cumul / s.calls : 0) << "\t" << n << "\n";
+            say("Saved " + f);
+        }
+    }
+    groupBox("Statistics");
+    void profileTable(float w, float h);
+    profileTable(lw, 420);
+}
+void profileTable(float w, float h) {
+    std::vector<std::pair<std::string, Prof::Stat>> rows(Prof::stats().begin(), Prof::stats().end());
+    auto val = [&](const std::pair<std::string, Prof::Stat>& r) -> double {
+        const auto& s = r.second;
+        switch (profKey) { case 0: return (double)s.calls; case 1: return s.total; case 2: return s.calls ? s.total / s.calls : 0; case 3: return s.cumul; case 4: return s.calls ? s.cumul / s.calls : 0; default: return 0; }
+    };
+    std::sort(rows.begin(), rows.end(), [&](const auto& a, const auto& b) {
+        const bool less = profKey == 5 ? a.first < b.first : val(a) < val(b);
+        const bool more = profKey == 5 ? b.first < a.first : val(b) < val(a);
+        return profDir == 1 ? less : more;
+    });
+    if (ImGui::BeginTable("prof", 6, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_SizingFixedFit, ImVec2(w, h))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        for (const char* c : {"Calls", "Total", "Total/Call", "Cumul.", "Cumul/Call"}) ImGui::TableSetupColumn(c, ImGuiTableColumnFlags_WidthFixed, 62);
+        ImGui::TableSetupColumn("Function", ImGuiTableColumnFlags_WidthFixed, 200);
+        ImGui::TableHeadersRow();
+        for (const auto& [n, s] : rows) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); ImGui::Text("%lld", s.calls);
+            ImGui::TableNextColumn(); ImGui::Text("%.3f", s.total);
+            ImGui::TableNextColumn(); ImGui::Text("%.3f", s.calls ? s.total / s.calls : 0);
+            ImGui::TableNextColumn(); ImGui::Text("%.3f", s.cumul);
+            ImGui::TableNextColumn(); ImGui::Text("%.3f", s.calls ? s.cumul / s.calls : 0);
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(n.c_str());
+        }
+        ImGui::EndTable();
+    }
+}
+
+// ---------- Utilities > Example (MakeHuman's 7_example): every kind of widget, and a slider that pushes the mesh ----------
+static int exPushed = 0, exRadio = 0; static bool exToggle = false; static float exSlider = 0.5f; static char exText[128] = "Some text";
+static void exampleLeft(float lw) {
+    groupBox("Example");
+    if (ImGui::Button("Button", ImVec2(lw, 0))) ++exPushed;
+    ImGui::Text("Pushed %d times", exPushed);
+    ImGui::Checkbox("ToggleButton", &exToggle);
+    ImGui::TextUnformatted(exToggle ? "Selected" : "Not selected");
+    ImGui::RadioButton("RadioButton1", &exRadio, 0); ImGui::RadioButton("RadioButton2", &exRadio, 1);
+    ImGui::TextUnformatted(exRadio == 0 ? "Button 1 is selected" : "Button 2 is selected");
+    ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##exs", &exSlider, 0, 1, "Slider %.2f");
+    ImGui::Text("Value is %f", exSlider);
+    ImGui::ProgressBar(exSlider, ImVec2(lw, 0));
+    ImGui::SetNextItemWidth(lw); ImGui::InputText("##ext", exText, sizeof exText);
+    // MakeHuman's "Mesh distort": the body pushed out along its normals (in the view only: the shape itself is untouched)
+    ImGui::SetNextItemWidth(lw);
+    if (ImGui::SliderFloat("##exm", &Viewer::look().distort, -0.5f, 0.5f, "Mesh distort %0.2f")) dirty = true;
+    ImGui::TextDisabled("This is an example plugin; see plugins/7_example.py in MakeHuman.");
+}
+
 static void runScript(const std::string& text) {
     scriptLog.clear();
     std::istringstream in(text); std::string line; int n = 0;
@@ -2351,6 +2539,17 @@ static void frame() {
             groupBox("Shading");
             ImGui::Checkbox("MakeHuman's shaders", &Viewer::look().mhShaders);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("Each object drawn with its material's own shader (litsphere, phong, toon, xray...), as MakeHuman draws it.\nOff: Pygmalion's own shading, lit by every light in the scene.");
+            groupBox("Configure Home Folder");
+            {
+                std::error_code ec; const bool has = fs::exists(fs::u8path(configFile()), ec);
+                if (ImGui::Button(has ? "Delete Config File" : "Create Config File", ImVec2(lw, 0))) {
+                    if (has) { fs::remove(fs::u8path(configFile()), ec); say("Home Folder Location: Default (after a restart)"); }
+                    else {
+                        const std::string d = folderDialog();
+                        if (!d.empty()) { fs::create_directories(fs::u8path(configFile()).parent_path(), ec); std::ofstream o(fs::u8path(configFile())); o << d << "\n"; say("Home Folder Location: " + d + " (after a restart)"); }
+                    }
+                }
+            }
             groupBox("Models folder");
             ImGui::TextWrapped("%s", homeDir().c_str());
             groupBox("Settings");
@@ -2361,6 +2560,8 @@ static void frame() {
                 say("Settings back to their defaults");
             }
         } else if (t == "Background") backgroundLeft(lw);
+        else if (t == "Plugins") pluginsLeft(lw);
+        else if (t == "User Plugins") userPluginsLeft(lw);
         else if (t == "Mouse") {
             Viewer::Look& lk = Viewer::look();
             groupBox("Camera");
@@ -2404,6 +2605,8 @@ static void frame() {
         else if (t == "Socket") socketLeft(lw);
 #endif
         else if (t == "Data") dataView();
+        else if (t == "Profile") profileLeft(lw);
+        else if (t == "Example") exampleLeft(lw);
         else logsView();
     } else if (cat == CAT_HELP) {
         if (t == "About") { groupBox("Pygmalion " PYGMALION_VERSION); ImGui::TextWrapped("People in 3D with sliders: MakeHuman, remade in C++ by Cursed Entertainment. Farica\xe2\x98\x86Kimora \xc2\xa9 Cursed Entertainment."); }
@@ -2625,6 +2828,7 @@ int main(int argc, char** argv) {
         const size_t eq = u.find('=');
         for (size_t k = 0; k < unitNames.size(); ++k) if (unitNames[k] == u.substr(0, eq)) unitW[k] = eq == std::string::npos ? 1.0f : (float)atof(u.c_str() + eq + 1);
     }
+    for (const auto& n : activeUserPlugins) if (fs::exists(fs::u8path(pluginFile(n)))) runPlugin(n);   // Settings > User Plugins
     if (!startScript.empty()) {   // a script file run at the start (and its output in script-log.txt beside it)
         std::ifstream in(fs::u8path(startScript)); std::ostringstream ss; ss << in.rdbuf();
         runScript(ss.str());

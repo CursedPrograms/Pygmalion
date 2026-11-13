@@ -1,6 +1,7 @@
 // Pygmalion - the human (see human.h). The weighting follows MakeHuman's own code line for line: the macro values
 // (human.py's _set*Vals), the targets' groups and variables (targets.py) and the modifiers' factors
 // (humanmodifier.py).
+#include "profile.h"
 #include "human.h"
 #include "json.h"
 
@@ -348,6 +349,7 @@ std::string fileTitle(const std::string& path) {
     return Peek::get(path);
 }
 float weightKg(const Body& b) {
+    PROF("Human::weightKg");
     // calculateSurface(meshData, vertGroups=['body']) / 100: the body group's face areas, dm2 to m2
     double area = 0;
     for (const auto& g : b.faceGroups) {
@@ -551,6 +553,7 @@ void takeOff(Body& b, const std::string& k) {
     b.proxies.erase(std::remove_if(b.proxies.begin(), b.proxies.end(), [&](const Proxy& p) { return p.kind == k || fs::u8path(p.file).lexically_normal() == f; }), b.proxies.end());
 }
 bool wear(Body& b, const std::string& file, std::string& err) {
+    PROF("Human::wear");
     if (isWorn(b, file)) {   // clothes come off with a second click; the rest stay
         for (const auto& p : b.proxies) if (p.kind == "clothes" && fs::u8path(p.file).lexically_normal() == fs::u8path(file).lexically_normal()) { takeOff(b, file); break; }
         return true;
@@ -737,6 +740,7 @@ void resetAll(Body& b) {
 }
 
 void apply(Body& b) {
+    PROF("Human::apply (targets)");
     macroVals(b);
     // each group's factor from its modifier (macro groups: 1)
     std::map<std::string, float> factor;
@@ -762,6 +766,7 @@ void apply(Body& b) {
 }
 
 void fitProxy(const Body& b, const Proxy& p, std::vector<float>& out, bool rest) {
+    PROF("Human::fitProxy");
     out.resize(p.pos.size());
     const std::vector<float>& pos = rest || b.shown.empty() ? b.pos : b.shown;
     float scale[3];
@@ -838,6 +843,7 @@ float heightCm(const Body& b) {
 
 // ---------- MakeHuman's .mhm ----------
 bool saveMhm(const Body& b, const std::string& path, const std::string& name, std::string& err) {
+    PROF("Human::saveMhm");
     std::ofstream o(fs::u8path(path));
     if (!o) { err = "Couldn't write " + path; return false; }
     o << "# Written by Pygmalion\nversion v1.1.1\n";
@@ -864,6 +870,7 @@ bool saveMhm(const Body& b, const std::string& path, const std::string& name, st
 }
 
 bool loadMhm(Body& b, const std::string& path, std::string& err) {
+    PROF("Human::loadMhm");
     std::ifstream in(fs::u8path(path));
     if (!in) { err = "Couldn't read " + path; return false; }
     resetAll(b);

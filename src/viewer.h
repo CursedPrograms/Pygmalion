@@ -18,6 +18,7 @@ struct Look {
     bool smooth = false;                            // MakeHuman's Smooth: one Catmull-Clark subdivision
     bool mhShaders = true;                          // each object drawn with its material's own MakeHuman shader
     // MakeHuman's slider behaviour: while a slider is dragged, refit the clothes / redo the normals (else when let go)
+    float distort = 0;                              // Utilities > Example: the body pushed along its normals (view only)
     bool dragging = false, fitWhileDragging = true, normalsWhileDragging = true;
     std::string bgImage;                            // a picture behind the person (Settings > Background)
     float bgOpacity = 1;

@@ -1,5 +1,6 @@
 // Pygmalion - the 3D view (see viewer.h). MakeHuman's litsphere shading: the normal in view space picks a colour from
 // a lit sphere picture; the three skin tones' spheres are blended by the ethnicity sliders. OpenGL 3.3 core.
+#include "profile.h"
 #include "viewer.h"
 #include "material.h"
 
@@ -470,6 +471,7 @@ static void matGL(const Mat::Material& m, MatGL& g) {
 }
 
 void update(const Human::Body& b) {
+    PROF("Viewer::update");
     keepNormals = lk.dragging && !lk.normalsWhileDragging;
     const bool keepFit = lk.dragging && !lk.fitWhileDragging;
     eth[0] = b.african; eth[1] = b.asian; eth[2] = b.caucasian;
@@ -487,6 +489,11 @@ void update(const Human::Body& b) {
             }
         }
         std::vector<float> P, N, U, Tg;
+        if (lk.distort != 0) {   // MakeHuman's Example plugin: the mesh pushed out along its normals
+            std::vector<float> nn; normals(pos, b.tri, nn); std::vector<float> moved = pos;
+            for (size_t k = 0; k < moved.size(); ++k) moved[k] += nn[k] * lk.distort;
+            unroll(moved, vt, cuv, P, N, U, Tg);
+        } else
         unroll(pos, vt, cuv, P, N, U, Tg);
         fill(bodyPart, P, N, U, Tg);
         matGL(b.skinMat, bodyPart.mat);
@@ -537,6 +544,7 @@ static void mul(const float* a, const float* b, float* o) {
 }
 
 unsigned render(int w, int h, bool hovered) {
+    PROF("Viewer::render");
     if (w < 8 || h < 8) return fboTex;
     ImGuiIO& io = ImGui::GetIO();
     if (hovered) {

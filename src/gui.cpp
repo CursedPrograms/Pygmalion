@@ -214,7 +214,7 @@ static int tab = 0, forcedTab = 1;   // MakeHuman opens on Modelling
 static std::string forcedTask;
 static char prompt[512] = "", search[64] = "";
 static std::string understood;
-static float randomAmount = 0.6f; static bool randMacros = true, randFace = true, randBody = true;
+static float randomAmount = 1.0f; static bool randMacros = true, randFace = true, randBody = true;
 struct State {
     std::vector<float> mods, macros;
     std::vector<std::pair<std::string, std::string>> gear;   // each proxy's file and material
@@ -908,23 +908,79 @@ static void statistics() {
 
 // Random, as MakeHuman's: what to randomise, how symmetric, and back to the start
 static bool rMacro = true, rFace = true, rBody = true, rHeight = false; static float rSym = 0.7f;
+// Modelling > Random: MakeHuman's randomize() (plugins/0_modeling_8_random.py): the chosen groups' modifiers in a
+// random order, each round its default with a spread by group (a mirror pair kept within "Symmetry" of each other),
+// the pregnancy target only for a young woman (MakeHuman's own test), all at once and undoable
+static float gaussIn(std::mt19937& rng, float lo, float hi, float mid, float sigmaFactor) {
+    const float sigma = sigmaFactor * std::fabs(hi - lo);
+    float v = sigma > 0 ? std::normal_distribution<float>(mid, sigma)(rng) : mid;
+    if (v < lo) v = lo + std::fabs(v - lo); else if (v > hi) v = hi - std::fabs(v - hi);
+    return std::clamp(v, lo, hi);
+}
+static std::string mirrorName(const Human::Modifier& m) {   // getSymmetricOpposite: an l- / r- word swapped
+    std::vector<std::string> parts; std::stringstream ss(m.name); std::string p; bool found = false;
+    while (std::getline(ss, p, '-')) { if (p == "l") { p = "r"; found = true; } else if (p == "r") { p = "l"; found = true; } parts.push_back(p); }
+    if (!found) return "";
+    std::string n; for (size_t k = 0; k < parts.size(); ++k) n += (k ? "-" : "") + parts[k];
+    return m.group + "/" + n;
+}
+static void randomizeMh(float symmetry, bool macro, bool height, bool face, bool bodyParts, float amount) {
+    std::vector<std::string> groups;
+    if (macro) groups.insert(groups.end(), {"macrodetails", "macrodetails-universal", "macrodetails-proportions"});
+    if (height) groups.push_back("macrodetails-height");
+    if (face) groups.insert(groups.end(), {"eyebrows", "eyes", "chin", "forehead", "head", "mouth", "nose", "neck", "ears", "cheek"});
+    if (bodyParts) groups.insert(groups.end(), {"pelvis", "hip", "armslegs", "stomach", "breast", "buttocks", "torso"});
+    std::vector<int> mods;
+    for (int i = 0; i < (int)body.mods.size(); ++i) if (std::find(groups.begin(), groups.end(), body.mods[i].group) != groups.end()) mods.push_back(i);
+    static std::mt19937 rng{std::random_device{}()};
+    std::shuffle(mods.begin(), mods.end(), rng);
+    std::map<std::string, float> vals;
+    static const std::set<std::string> transInOut = {"hip/hip-trans-in|out", "torso/torso-trans-in|out", "neck/neck-trans-in|out", "head/head-trans-in|out", "nose/nose-trans-in|out", "mouth/mouth-trans-in|out"};
+    static const std::set<std::string> faceGroups = {"head", "forehead", "eyebrows", "neck", "eyes", "nose", "ears", "chin", "cheek", "mouth"};
+    for (int i : mods) {
+        const auto& m = body.mods[i];
+        const std::string fn = m.fullName();
+        if (vals.count(fn)) continue;
+        const float lo = m.min(), hi = 1.0f, def = m.defaultValue;
+        float sigma = 0.1f; bool have = false; float v = 0;
+        if (fn == "forehead/forehead-nubian-less|more" || fn == "forehead/forehead-scale-vert-less|more") sigma = 0.02f;
+        else if (transInOut.count(fn)) {
+            if (symmetry == 1) v = def;
+            else { const float w = std::fabs(hi - lo) * (1 - symmetry); v = gaussIn(rng, std::max(lo, def - w / 2), std::min(hi, def + w / 2), def, 0.1f * amount); }
+            have = true;
+        } else if (faceGroups.count(m.group)) sigma = 0.1f;
+        else if (m.group == "macrodetails") sigma = 0.3f;
+        if (!have) v = gaussIn(rng, lo, hi, def, sigma * amount);
+        vals[fn] = v;
+        const std::string sym = mirrorName(m);
+        auto it = body.modByName.find(sym);
+        if (!sym.empty() && it != body.modByName.end() && !vals.count(sym)) {
+            if (symmetry == 1) vals[sym] = v;
+            else {
+                const auto& m2 = body.mods[it->second];
+                const float dev = (1 - symmetry) * std::fabs(1.0f - m2.min()) / 2;
+                const float sLo = std::max(m2.min(), std::min(v - dev, 1.0f)), sHi = std::max(m2.min(), std::min(v + dev, 1.0f));
+                vals[sym] = gaussIn(rng, sLo, sHi, v, sigma * amount);
+            }
+        }
+    }
+    // (MakeHuman's own condition, kept as it is: in effect most people aren't pregnant)
+    auto get = [&](const char* k, float d) { auto it = vals.find(k); return it == vals.end() ? d : it->second; };
+    if (get("macrodetails/Gender", 0) > 0.5f || get("macrodetails/Age", 0.5f) < 0.2f || get("macrodetails/Age", 0.7f) < 0.75f)
+        if (vals.count("stomach/stomach-pregnant-decr|incr")) vals["stomach/stomach-pregnant-decr|incr"] = 0;
+    const bool sym = body.symmetry; body.symmetry = false;
+    for (const auto& [fn, v] : vals) { auto it = body.modByName.find(fn); if (it != body.modByName.end()) Human::setModifier(body, it->second, v); }
+    body.symmetry = sym;
+}
 static void randomLeft(float w) {
     groupBox("Randomize settings");
     ImGui::Checkbox("Macro", &rMacro); ImGui::Checkbox("Face", &rFace); ImGui::Checkbox("Body", &rBody); ImGui::Checkbox("Height", &rHeight);
     ImGui::SetNextItemWidth(w); ImGui::SliderFloat("##sym", &rSym, 0, 1, "Symmetry: %.2f");
-    ImGui::SetNextItemWidth(w); ImGui::SliderFloat("##amt", &randomAmount, 0.1f, 1.0f, "Amount: %.2f");
-    if (ImGui::Button("Randomize", ImVec2(w, 0))) {
-        remember("Randomize"); redo.clear();
-        const float keepH = body.height;
-        const bool sym = body.symmetry;
-        body.symmetry = std::uniform_real_distribution<float>(0, 1)(*new std::mt19937(std::random_device{}())) < rSym;
-        Human::randomize(body, randomAmount, rMacro, rFace, rBody, (unsigned)std::random_device{}());
-        body.symmetry = sym;
-        if (!rHeight) Human::setMacro(body, "Height", keepH);
-        dirty = true;
-    }
+    ImGui::SetNextItemWidth(w); ImGui::SliderFloat("##amt", &randomAmount, 0.1f, 2.0f, "Amount: %.2f");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Pygmalion's own: the spread MakeHuman uses, times this (1 is MakeHuman's).");
+    if (ImGui::Button("Randomize", ImVec2(w, 0))) { remember("Randomize"); redo.clear(); randomizeMh(rSym, rMacro, rHeight, rFace, rBody, randomAmount); dirty = true; }
     groupBox("Restore settings");
-    if (ImGui::Button("Restore to defaults", ImVec2(w, 0))) { remember("Restore"); Human::resetAll(body); dirty = true; }
+    if (ImGui::Button("Restore to defaults", ImVec2(w, 0))) { rMacro = rFace = rBody = true; rHeight = false; rSym = 0.7f; randomAmount = 1.0f; }
 }
 
 // Files
@@ -1737,10 +1793,20 @@ static void targetsView(float lw) {
 
 static char targetName[64] = "my-shape";
 static void customFolder(std::string& dir) { dir = homeDir().empty() ? std::string() : (fs::u8path(homeDir()) / "custom").u8string(); std::error_code ec; if (!dir.empty()) fs::create_directories(fs::u8path(dir), ec); }
+// Modelling > Custom (MakeHuman's 0_modeling_9_custom_targets): every .target under the custom folder, by folder
+static std::map<int, std::string> customFolderOf;   // a custom modifier -> its folder (relative, "" the top)
+static std::string customShown;                     // the folder whose sliders show
+static bool keepCustomValues = true;
 static void loadCustomTargets() {
     std::string dir; customFolder(dir);
     std::error_code ec;
-    for (const auto& e : fs::directory_iterator(fs::u8path(dir), ec)) if (e.path().extension() == ".target") Human::addCustomTarget(body, e.path().u8string());
+    for (const auto& e : fs::recursive_directory_iterator(fs::u8path(dir), ec)) {
+        if (e.path().extension() != ".target") continue;
+        const fs::path rel = fs::relative(e.path(), fs::u8path(dir), ec);
+        std::string name = rel.parent_path().empty() ? rel.stem().u8string() : (rel.parent_path() / rel.stem()).generic_u8string();
+        const int m = Human::addCustomTarget(body, e.path().u8string(), name);
+        if (m >= 0) { customFolderOf[m] = rel.parent_path().generic_u8string(); std::string l = rel.stem().u8string(); std::replace(l.begin(), l.end(), '-', ' '); if (!l.empty()) l[0] = (char)toupper((unsigned char)l[0]); body.mods[m].label = l; }
+    }
 }
 static void saveTargetsLeft(float lw) {
     groupBox("Save the shape as a target");
@@ -1749,7 +1815,7 @@ static void saveTargetsLeft(float lw) {
         std::string dir; customFolder(dir);
         const std::string p = (fs::u8path(dir) / (std::string(targetName) + ".target")).u8string();
         std::string err;
-        if (Human::saveTarget(body, p, err)) { say("Saved " + p + " (Modelling > Custom)"); Human::addCustomTarget(body, p); } else say(err);
+        if (Human::saveTarget(body, p, err)) { say("Saved " + p + " (Modelling > Custom)"); const int m = Human::addCustomTarget(body, p); if (m >= 0) customFolderOf[m] = ""; } else say(err);
     }
     notYet("The whole shape as it is now, against MakeHuman's base mesh. It's saved in your custom folder and appears as a slider in Modelling > Custom.");
 }
@@ -1757,13 +1823,27 @@ static void saveTargetsLeft(float lw) {
 static void customLeft(float lw) {
     groupBox("Custom targets");
     std::string dir; customFolder(dir);
-    if (ImGui::Button("Look again", ImVec2(lw / 2 - 4, 0))) loadCustomTargets();
+    if (ImGui::Button("Rescan targets' folder", ImVec2(lw / 2 - 4, 0))) {
+        // Keep Values: the sliders keep what they were set to, else every custom one goes back to 0
+        if (!keepCustomValues) for (auto& [m, f] : customFolderOf) Human::setModifier(body, m, 0);
+        loadCustomTargets(); dirty = true;
+    }
     ImGui::SameLine();
 #ifdef _WIN32
     if (ImGui::Button("Open the folder", ImVec2(lw / 2 - 4, 0))) ShellExecuteW(nullptr, L"open", fs::u8path(dir).wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 #endif
+    ImGui::Checkbox("Keep Values", &keepCustomValues);
+    // the folders that have targets, as MakeHuman's folder buttons
+    std::map<std::string, int> folders;
+    for (const auto& [m, f] : customFolderOf) ++folders[f];
+    if (folders.size() > 1) {
+        groupBox("Folders");
+        if (!folders.count(customShown)) customShown = folders.begin()->first;
+        for (const auto& [f, c] : folders) if (ImGui::RadioButton((f.empty() ? std::string("Targets") : f).c_str(), customShown == f)) customShown = f;
+    } else if (!folders.empty()) customShown = folders.begin()->first;
+    groupBox("Targets");
     int n = 0;
-    for (size_t i = 0; i < body.mods.size(); ++i) if (body.mods[i].group == "custom") { modSlider((int)i, lw, "frontView"); ++n; }
+    for (const auto& [m, f] : customFolderOf) if (f == customShown && m < (int)body.mods.size()) { modSlider(m, lw, "frontView"); ++n; }
     if (!n) notYet(("Put your own .target files (from Blender's MakeTarget, or Utilities > Save targets) in " + dir + " and they appear here as sliders.").c_str());
 }
 
@@ -2064,6 +2144,7 @@ static bool runCommand(const std::string& line, std::string& err, const std::fun
         else if (a == "stlbinary") exportStlBinary = bv; else if (a == "normals") exportObjNormals = bv; else if (a == "feet") exportFeet = bv; else if (a == "posed") exportPosed = bv;
         else { ok = false; err = "exportopt: orient, bones, helpers, faceunits, fbxbinary, stlbinary, normals, feet, posed"; }
     }
+    else if (cmd == "randomize") randomizeMh(rest.empty() ? rSym : (float)atof(rest.c_str()), rMacro, rHeight, rFace, rBody, randomAmount);   // Modelling > Random, MakeHuman's way (randomize 0.7: the symmetry)
     else if (cmd == "shaders") Viewer::look().mhShaders = rest != "off";   // MakeHuman's own shaders (on) or Pygmalion's
     else if (cmd == "download") ok = installPack(rest, err);
     else if (cmd == "kindof") out(kindOfProxy(rest));   // what Install would call a .mhclo

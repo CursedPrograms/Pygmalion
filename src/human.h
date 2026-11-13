@@ -142,7 +142,8 @@ std::string relPath(const Body& b, const std::string& abs);         // as MakeHu
 std::string absPath(const Body& b, const std::string& rel);
 
 // Modelling > Custom: a .target of your own as a 0..1 slider ("custom/<name>"); -1 if it couldn't be read
-int addCustomTarget(Body& b, const std::string& targetFile);
+// rel: its path under the custom folder without ".target" (MakeHuman names it custom/<rel>); "" : its file name
+int addCustomTarget(Body& b, const std::string& targetFile, const std::string& rel = "");
 // Utilities > Save targets: the shape as it is now (against the base mesh) as a .target file
 bool saveTarget(const Body& b, const std::string& path, std::string& err);
 

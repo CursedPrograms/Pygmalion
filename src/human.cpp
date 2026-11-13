@@ -142,9 +142,9 @@ static void addTarget(Body& b, const fs::path& file, const fs::path& root) {
     b.targets.push_back(std::move(t));
 }
 
-int addCustomTarget(Body& b, const std::string& file) {
+int addCustomTarget(Body& b, const std::string& file, const std::string& rel) {
     const fs::path f = fs::u8path(file);
-    const std::string stem = f.stem().u8string();
+    const std::string stem = rel.empty() ? f.stem().u8string() : rel;
     const std::string full = "custom/" + stem;
     auto it = b.modByName.find(full);
     if (it != b.modByName.end()) return it->second;

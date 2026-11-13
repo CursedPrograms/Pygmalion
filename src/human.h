@@ -145,7 +145,9 @@ std::string absPath(const Body& b, const std::string& rel);
 // rel: its path under the custom folder without ".target" (MakeHuman names it custom/<rel>); "" : its file name
 int addCustomTarget(Body& b, const std::string& targetFile, const std::string& rel = "");
 // Utilities > Save targets: the shape as it is now (against the base mesh) as a .target file
-bool saveTarget(const Body& b, const std::string& path, std::string& err);
+// MakeHuman's Save Targets: the shape against the base mesh; strip: less the default body's own macro targets (so it
+// can be used inside MakeHuman); basePos: against that shape instead (a diff target from one model to another)
+bool saveTarget(const Body& b, const std::string& path, std::string& err, bool strip = false, const std::vector<float>* basePos = nullptr);
 
 float ageYears(const Body& b);
 float heightCm(const Body& b);

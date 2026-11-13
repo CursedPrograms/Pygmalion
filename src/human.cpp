@@ -170,13 +170,25 @@ int addCustomTarget(Body& b, const std::string& file, const std::string& rel) {
     return (int)b.mods.size() - 1;
 }
 
-bool saveTarget(const Body& b, const std::string& path, std::string& err) {
+bool saveTarget(const Body& b, const std::string& path, std::string& err, bool strip, const std::vector<float>* basePos) {
+    std::vector<float> pos = b.pos;
+    if (strip) {   // savetargets.stripTargets: half of each universal young target, a sixth of each ethnic one, taken off
+        static const char* UNIVERSAL[] = {"universal-female-young-averagemuscle-averageweight.target", "universal-male-young-averagemuscle-averageweight.target"};
+        static const char* ETHNIC[] = {"african-female-young.target", "african-male-young.target", "asian-female-young.target", "asian-male-young.target", "caucasian-female-young.target", "caucasian-male-young.target"};
+        auto off = [&](const char* name, float w) {
+            for (const auto& t : b.targets) if (t.path == std::string("macrodetails/") + name)
+                for (size_t k = 0; k < t.idx.size(); ++k) for (int c = 0; c < 3; ++c) pos[(size_t)t.idx[k] * 3 + c] -= t.d[k * 3 + c] * w;
+        };
+        for (const char* n : UNIVERSAL) off(n, 1.0f / 2);
+        for (const char* n : ETHNIC) off(n, 1.0f / 6);
+    }
+    const std::vector<float>& from = basePos && basePos->size() == pos.size() ? *basePos : b.base;
     std::ofstream o(fs::u8path(path));
     if (!o) { err = "Couldn't write " + path; return false; }
-    o << "# Written by Pygmalion: the shape against MakeHuman's base mesh\n";
+    o << "# Written by Pygmalion: " << (basePos ? "the difference between two models" : "the shape against MakeHuman's base mesh") << "\n# license AGPL3\n";
     char buf[96]; int n = 0;
     for (size_t v = 0; v < b.base.size() / 3; ++v) {
-        const float dx = b.pos[v * 3] - b.base[v * 3], dy = b.pos[v * 3 + 1] - b.base[v * 3 + 1], dz = b.pos[v * 3 + 2] - b.base[v * 3 + 2];
+        const float dx = pos[v * 3] - from[v * 3], dy = pos[v * 3 + 1] - from[v * 3 + 1], dz = pos[v * 3 + 2] - from[v * 3 + 2];
         if (std::fabs(dx) + std::fabs(dy) + std::fabs(dz) < 1e-5f) continue;
         snprintf(buf, sizeof buf, "%zu %.6f %.6f %.6f\n", v, dx, dy, dz); o << buf; ++n;
     }

@@ -227,10 +227,21 @@ static void getPose(std::string& pose, std::string& expression, std::vector<floa
 static float exportScale = 1.0f;   // MakeHuman's units are decimetres: 0.1 makes metres
 static double now() { return SDL_GetTicks() / 1000.0; }
 static std::vector<std::string> logs;   // Utilities > Logs: everything said in the status line
+// each line's level (MakeHuman's log levels: Debug, Message, Notice, Warning, Error), told by what it says
+static std::vector<int> logLevels;
+static std::vector<char> logPicked;
+static int logLevelOf(const std::string& s) {
+    std::string l = s; for (auto& c : l) c = (char)tolower((unsigned char)c);
+    for (const char* w : {"couldn't", "failed", "error", "can't", "cannot", "not valid", "doesn't fit", "not found", "unknown"}) if (l.find(w) != std::string::npos) return 4;
+    for (const char* w : {"no ", "not ", "isn't", "too ", "already", "warning", "missing"}) if (l.find(w) != std::string::npos) return 3;
+    for (const char* w : {"saved", "loaded", "exported", "installed", "made", "done", "rendered"}) if (l.find(w) != std::string::npos) return 2;
+    return 1;
+}
 static void say(const std::string& s) {
     toast = s; toastUntil = now() + 6;
     char t[16]; const Uint32 ms = SDL_GetTicks(); snprintf(t, sizeof t, "%02u:%02u ", ms / 60000 % 60, ms / 1000 % 60);
-    logs.push_back(t + s); if (logs.size() > 500) logs.erase(logs.begin());
+    logs.push_back(t + s); logLevels.push_back(logLevelOf(s)); logPicked.push_back(0);
+    if (logs.size() > 500) { logs.erase(logs.begin()); logLevels.erase(logLevels.begin()); logPicked.erase(logPicked.begin()); }
 }
 
 static State snapshot() {
@@ -904,6 +915,23 @@ static void statistics() {
     ImGui::Text("Chest: %s", units(Human::measureCm(body, "measure/measure-bust-circ-decr|incr")).c_str());
     ImGui::Text("Waist: %s", units(Human::measureCm(body, "measure/measure-waist-circ-decr|incr")).c_str());
     ImGui::Text("Hips: %s", units(Human::measureCm(body, "measure/measure-hips-circ-decr|incr")).c_str());
+    // MakeHuman's brassiere sizes (its syncBraSizes, its box switched off there): band from the underbust, cup from the difference
+    const float bust = Human::measureCm(body, "measure/measure-bust-circ-decr|incr"), under = Human::measureCm(body, "measure/measure-underbust-circ-decr|incr");
+    if (under > 0 && bust > 0) {
+        groupBox("Brassiere size");
+        static const char* EU[] = {"AA", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"};
+        static const char* JP[] = {"AAA", "AA", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"};
+        static const char* US[] = {"AA", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"};
+        static const char* UK[] = {"AA", "A", "B", "C", "D", "DD", "E", "F", "FF", "G", "GG", "H"};
+        const int mod = (int)under % 5;
+        const float band = mod < 2.5f ? under - mod : under - mod + 5;
+        int cup = std::clamp((int)std::lround((bust - under - 10) / 2), 0, 11);
+        ImGui::Text("EU: %d%s", (int)band, EU[cup]);
+        ImGui::Text("JP: %d%s", (int)band, JP[std::clamp((int)std::lround((bust - under - 5) / 2.5f), 0, 12)]);
+        float usBand = under * 0.393700787f; usBand = ((int)usBand % 2) ? usBand + 5 : usBand + 4;
+        ImGui::Text("US: %d%s", (int)usBand, US[cup]);
+        ImGui::Text("UK: %d%s", (int)usBand, UK[cup]);
+    }
 }
 
 // Random, as MakeHuman's: what to randomise, how symmetric, and back to the start
@@ -1791,7 +1819,6 @@ static void targetsView(float lw) {
     ImGui::EndChild();
 }
 
-static char targetName[64] = "my-shape";
 static void customFolder(std::string& dir) { dir = homeDir().empty() ? std::string() : (fs::u8path(homeDir()) / "custom").u8string(); std::error_code ec; if (!dir.empty()) fs::create_directories(fs::u8path(dir), ec); }
 // Modelling > Custom (MakeHuman's 0_modeling_9_custom_targets): every .target under the custom folder, by folder
 static std::map<int, std::string> customFolderOf;   // a custom modifier -> its folder (relative, "" the top)
@@ -1808,16 +1835,54 @@ static void loadCustomTargets() {
         if (m >= 0) { customFolderOf[m] = rel.parent_path().generic_u8string(); std::string l = rel.stem().u8string(); std::replace(l.begin(), l.end(), '-', ' '); if (!l.empty()) l[0] = (char)toupper((unsigned char)l[0]); body.mods[m].label = l; }
     }
 }
+// Utilities > Save targets (MakeHuman's 7_save_targets): the model as one target (base targets stripped or not), and a
+// diff target from a base model to this one (Set Base first); Alt+T saves quickly
+static char targetName[128] = "full_target.target", diffName[128] = "diff_target.target";
+static bool stripBase = true;
+static std::vector<float> diffBase;   // "Set Base": the base model's shape (MakeHuman keeps it in a cache file)
+static std::string targetsDir() { std::string d; customFolder(d); return d; }
+static void saveFullTarget(const std::string& p) {
+    std::string err;
+    if (Human::saveTarget(body, p, err, stripBase)) { say("Saving target to " + p); const int m = Human::addCustomTarget(body, p); if (m >= 0) customFolderOf[m] = ""; }
+    else say(err);
+}
 static void saveTargetsLeft(float lw) {
-    groupBox("Save the shape as a target");
+    groupBox("Save Model as Target");
+    ImGui::TextUnformatted("Filename:");
     ImGui::SetNextItemWidth(lw); ImGui::InputText("##tn", targetName, sizeof targetName);
+    ImGui::Checkbox("Strip Base Targets", &stripBase);
     if (ImGui::Button("Save", ImVec2(lw, 0))) {
-        std::string dir; customFolder(dir);
-        const std::string p = (fs::u8path(dir) / (std::string(targetName) + ".target")).u8string();
-        std::string err;
-        if (Human::saveTarget(body, p, err)) { say("Saved " + p + " (Modelling > Custom)"); const int m = Human::addCustomTarget(body, p); if (m >= 0) customFolderOf[m] = ""; } else say(err);
+        std::string n = targetName; if (fs::u8path(n).extension() != ".target") n += ".target";
+        saveFullTarget((fs::u8path(targetsDir()) / n).u8string());
     }
-    notYet("The whole shape as it is now, against MakeHuman's base mesh. It's saved in your custom folder and appears as a slider in Modelling > Custom.");
+    if (ImGui::Button("Save As ...", ImVec2(lw, 0))) {
+        const std::string p = fileDialog(true, L"MakeHuman Target (*.target)\0*.target\0All files (*.*)\0*.*\0\0", L"target", (fs::u8path(targetsDir()) / targetName).u8string());
+        if (!p.empty()) {
+            if (fs::u8path(p).extension() != ".target") say("Cannot save target to file: " + p + " - expected a path to a .target file");
+            else { saveFullTarget(p); snprintf(targetName, sizeof targetName, "%s", fs::u8path(p).filename().u8string().c_str()); }
+        }
+    }
+    groupBox("Save Diff Target");
+    ImGui::SetNextItemWidth(lw); ImGui::InputText("##dn", diffName, sizeof diffName);
+    if (ImGui::Button("Set Base", ImVec2(lw, 0))) { diffBase = body.pos; say("The base model is set: change or load the second model, then Save"); }
+    auto saveDiff = [&](const std::string& p) {
+        if (diffBase.empty()) { say("No Base Model defined. Press \"Set Base\""); return; }
+        std::string err; if (Human::saveTarget(body, p, err, false, &diffBase)) say("Saving target to " + p); else say(err);
+    };
+    if (ImGui::Button("Save##diff", ImVec2(lw, 0))) { std::string n = diffName; if (fs::u8path(n).extension() != ".target") n += ".target"; saveDiff((fs::u8path(targetsDir()) / n).u8string()); }
+    if (ImGui::Button("Save As ...##diff", ImVec2(lw, 0))) {
+        const std::string p = fileDialog(true, L"MakeHuman Target (*.target)\0*.target\0All files (*.*)\0*.*\0\0", L"target", (fs::u8path(targetsDir()) / diffName).u8string());
+        if (!p.empty()) saveDiff(p);
+    }
+    if (ImGui::Button("Clear Cache", ImVec2(lw, 0))) { diffBase.clear(); say("The base model is forgotten"); }
+    groupBox("Info");
+    notYet("Save target saves the current state of all targets applied to the default start up mesh as one global target. The strip option will "
+           "remove all targets that constitute the default mesh from the global target. This is mandatory when reusing the global target inside "
+           "MakeHuman (or Pygmalion: it appears in Modelling > Custom). For usage on the base mesh in MakeTarget uncheck the strip option.\n\n"
+           "Save diff target saves the data difference of two models as a global target. First create or load a model and press \"Set Base\". "
+           "Then create or load a second model. Pressing \"Save\" will create a global target, which can transform the first model into the "
+           "second one. The resulting global diff target is absolutely specific to the first model and will not work on any other model.\n\n"
+           "The default license of the saved global targets is AGPL3.");
 }
 
 static void customLeft(float lw) {
@@ -2145,6 +2210,7 @@ static bool runCommand(const std::string& line, std::string& err, const std::fun
         else { ok = false; err = "exportopt: orient, bones, helpers, faceunits, fbxbinary, stlbinary, normals, feet, posed"; }
     }
     else if (cmd == "randomize") randomizeMh(rest.empty() ? rSym : (float)atof(rest.c_str()), rMacro, rHeight, rFace, rBody, randomAmount);   // Modelling > Random, MakeHuman's way (randomize 0.7: the symmetry)
+    else if (cmd == "savetarget") { Human::apply(body); std::istringstream ts(rest); std::string f, st; ts >> f >> st; ok = Human::saveTarget(body, f, err, st == "strip"); }   // savetarget file.target [strip]
     else if (cmd == "shaders") Viewer::look().mhShaders = rest != "off";   // MakeHuman's own shaders (on) or Pygmalion's
     else if (cmd == "download") ok = installPack(rest, err);
     else if (cmd == "kindof") out(kindOfProxy(rest));   // what Install would call a .mhclo
@@ -2703,11 +2769,31 @@ static void dataView() {
     ImGui::TextWrapped("Your data: %s", userDataDir().c_str());
     ImGui::TextWrapped("MakeHuman's own data: %s", makehumanDataDir().empty() ? "(MakeHuman isn't installed)" : makehumanDataDir().c_str());
 }
+// Utilities > Logs (MakeHuman's 7_logging): the level shown and up, lines picked (click; Ctrl+click for more) and copied
+static int logLevel = 0;
 static void logsView() {
+    groupBox("Level");
+    static const char* LEVELS[] = {"Debug", "Message", "Notice", "Warning", "Error"};
+    for (int k = 0; k < 5; ++k) ImGui::RadioButton(LEVELS[k], &logLevel, k);
+    if (ImGui::Button("Copy to Clipboard")) {
+        std::string text;
+        for (size_t i = 0; i < logs.size(); ++i) if (i < logPicked.size() && logPicked[i]) text += logs[i] + "\n";
+        if (text.empty()) say("No log items selected"); else ImGui::SetClipboardText(text.c_str());
+    }
+    ImGui::SameLine(); if (ImGui::Button("Clear")) { logs.clear(); logLevels.clear(); logPicked.clear(); }
     groupBox("Logs");
-    if (ImGui::Button("Clear")) logs.clear();
     ImGui::BeginChild("lg");
-    for (const auto& l : logs) ImGui::TextUnformatted(l.c_str());
+    static const ImU32 COLS[] = {IM_COL32(0x9a, 0x9a, 0x9a, 255), IM_COL32(0xe6, 0xe6, 0xe6, 255), IM_COL32(0x9c, 0xd7, 0xff, 255), IM_COL32(0xff, 0xc8, 0x5a, 255), IM_COL32(0xff, 0x6b, 0x6b, 255)};
+    for (size_t i = 0; i < logs.size(); ++i) {
+        const int lv = i < logLevels.size() ? logLevels[i] : 1;
+        if (lv < logLevel) continue;
+        ImGui::PushID((int)i); ImGui::PushStyleColor(ImGuiCol_Text, COLS[std::clamp(lv, 0, 4)]);
+        if (ImGui::Selectable(logs[i].c_str(), logPicked[i] != 0)) {
+            if (!ImGui::GetIO().KeyCtrl) std::fill(logPicked.begin(), logPicked.end(), 0);
+            logPicked[i] = !logPicked[i];
+        }
+        ImGui::PopStyleColor(); ImGui::PopID();
+    }
     if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) ImGui::SetScrollHereY(1);
     ImGui::EndChild();
 }

@@ -17,6 +17,8 @@ struct Look {
     bool bones = false;                             // the skeleton over the body
     bool smooth = false;                            // MakeHuman's Smooth: one Catmull-Clark subdivision
     bool mhShaders = true;                          // each object drawn with its material's own MakeHuman shader
+    // MakeHuman's slider behaviour: while a slider is dragged, refit the clothes / redo the normals (else when let go)
+    bool dragging = false, fitWhileDragging = true, normalsWhileDragging = true;
     std::string bgImage;                            // a picture behind the person (Settings > Background)
     float bgOpacity = 1;
     // MakeHuman's scene (Rendering > Scene): ambient light, shine and up to 8 lights (MakeHuman's limit). They light

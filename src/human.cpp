@@ -317,6 +317,82 @@ bool applyUvMap(Body& b, std::string& err) {
     b.uv = uv; b.triUv = triUv; b.faces4Uv = f4; b.uvMapIn = want;
     return true;
 }
+const std::vector<std::string>& fileTags(const std::string& path) {
+    struct E { std::filesystem::file_time_type t; std::vector<std::string> tags; std::string title; };
+    static std::map<std::string, E> cache;
+    std::error_code ec;
+    fs::path p = fs::u8path(path);
+    if (p.extension() == ".bvh") { fs::path meta = p; meta.replace_extension(".meta"); if (fs::exists(meta, ec)) p = meta; }
+    const auto t = fs::last_write_time(p, ec);
+    auto it = cache.find(path);
+    if (it != cache.end() && it->second.t == t) return it->second.tags;
+    E e; e.t = t;
+    std::ifstream in(p); std::string line;
+    for (int n = 0; std::getline(in, line) && n < 4000; ++n) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        std::istringstream ls(line); std::string k; ls >> k;
+        auto add = [&](std::string s) { while (!s.empty() && s.back() == ' ') s.pop_back(); for (auto& c : s) c = (char)tolower((unsigned char)c); if (!s.empty() && std::find(e.tags.begin(), e.tags.end(), s) == e.tags.end()) e.tags.push_back(s); };
+        if (k == "tag") { std::string v; std::getline(ls >> std::ws, v); add(v); }
+        else if (k == "tags") { std::string v; std::getline(ls >> std::ws, v); std::istringstream ts(v); std::string one; while (std::getline(ts, one, ';')) add(one); }
+        else if (k == "name" && e.title.empty()) std::getline(ls >> std::ws, e.title);
+        else if (k == "verts" || k == "v") break;   // the geometry starts: no more header
+    }
+    while (!e.title.empty() && (e.title.back() == ' ' || e.title.back() == '\r')) e.title.pop_back();
+    return (cache[path] = e).tags;
+}
+std::string fileTitle(const std::string& path) {
+    fileTags(path);
+    struct Peek { static std::string get(const std::string& p) { std::ifstream in(fs::u8path(p)); std::string line, t;
+        for (int n = 0; std::getline(in, line) && n < 4000; ++n) { std::istringstream ls(line); std::string k; ls >> k; if (k == "name") { std::getline(ls >> std::ws, t); break; } if (k == "verts" || k == "v") break; }
+        while (!t.empty() && (t.back() == ' ' || t.back() == '\r')) t.pop_back(); return t; } };
+    return Peek::get(path);
+}
+float weightKg(const Body& b) {
+    // calculateSurface(meshData, vertGroups=['body']) / 100: the body group's face areas, dm2 to m2
+    double area = 0;
+    for (const auto& g : b.faceGroups) {
+        if (g.first != "body") continue;
+        for (const auto& r : g.second)
+            for (int f = r.first; f < r.second; ++f) {
+                const int* v = &b.faces4[(size_t)f * 4];
+                auto P = [&](int i) { return &b.pos[(size_t)v[i] * 3]; };
+                auto tri = [&](const float* a, const float* c, const float* d) {
+                    const double u[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]}, w[3] = {d[0] - a[0], d[1] - a[1], d[2] - a[2]};
+                    const double x = u[1] * w[2] - u[2] * w[1], y = u[2] * w[0] - u[0] * w[2], z = u[0] * w[1] - u[1] * w[0];
+                    return 0.5 * std::sqrt(x * x + y * y + z * z);
+                };
+                area += tri(P(0), P(1), P(2)); if (v[3] != v[2]) area += tri(P(0), P(2), P(3));
+            }
+    }
+    const double bsa = area / 100.0, h = heightCm(b);
+    return h > 0 ? (float)(bsa * bsa * 3600.0 / h) : 0.0f;
+}
+int convertModelTags(const std::string& folder, std::vector<std::string>& log) {
+    int n = 0; std::error_code ec;
+    for (const auto& e : fs::recursive_directory_iterator(fs::u8path(folder), ec)) {
+        if (e.path().extension() != ".mhm") continue;
+        std::string t; if (!readAll(e.path(), t)) continue;
+        std::istringstream in(t); std::string line, out; bool changed = false;
+        while (std::getline(in, line)) {
+            std::string l = line; if (!l.empty() && l.back() == '\r') l.pop_back();
+            if (!changed && l.rfind("tags", 0) == 0 && l.find(",,") != std::string::npos) {
+                std::istringstream ws(l); std::string w, key, joined; ws >> key;
+                while (ws >> w) { size_t at; while ((at = w.find(",,")) != std::string::npos) w.replace(at, 2, " "); joined += (joined.empty() ? "" : ";") + w; }
+                log.push_back("Replacing " + e.path().u8string() + ": \"" + l + "\" by \"" + key + " " + joined + "\"");
+                line = key + " " + joined; changed = true;
+            }
+            out += line + "\n";
+        }
+        if (!changed) continue;
+        const fs::path backup = e.path().u8string() + "~";
+        if (fs::exists(backup, ec)) { log.push_back("Backup file " + backup.u8string() + " already exists: " + e.path().u8string() + " not converted"); continue; }
+        fs::copy_file(e.path(), backup, ec);
+        if (ec) { log.push_back("Failed to back up " + e.path().u8string()); continue; }
+        std::ofstream o(e.path(), std::ios::binary); o << out;
+        if (o) { ++n; log.push_back("Successfully converted: " + e.path().u8string()); }
+    }
+    return n;
+}
 static void readMat(const std::string& mhmat, Mat::Material& m) { if (!Mat::fromFile(mhmat, m, resolveAsset)) m = Mat::Material(); }
 static std::string defaultSkin() { return resolveAsset("skins/default.mhmat", ""); }
 
@@ -764,10 +840,17 @@ float heightCm(const Body& b) {
 bool saveMhm(const Body& b, const std::string& path, const std::string& name, std::string& err) {
     std::ofstream o(fs::u8path(path));
     if (!o) { err = "Couldn't write " + path; return false; }
-    o << "# Written by Pygmalion\nversion v1.1.1\nname " << name << "\ncamera 0.0 0.0 0.0 0.0 0.0 1.0\n";
+    o << "# Written by Pygmalion\nversion v1.1.1\n";
+    if (!b.uuid.empty()) o << "uuid " << b.uuid << "\n";
+    const std::string nm = b.name.empty() ? name : b.name;
+    if (!nm.empty()) o << "name " << nm << "\n";
+    if (!b.tags.empty()) { std::vector<std::string> t = b.tags; std::sort(t.begin(), t.end()); o << "tags "; for (size_t i = 0; i < t.size(); ++i) o << (i ? ";" : "") << t[i]; o << "\n"; }
     char buf[512];
+    snprintf(buf, sizeof buf, "camera %s %s %s %s %s %s\n", std::to_string(b.camera[0]).c_str(), std::to_string(b.camera[1]).c_str(), std::to_string(b.camera[2]).c_str(),
+             std::to_string(b.camera[3]).c_str(), std::to_string(b.camera[4]).c_str(), std::to_string(b.camera[5]).c_str());
+    o << buf;
     for (const auto& m : b.mods) {
-        if (!m.macro && std::fabs(m.value - m.defaultValue) < 1e-6f) continue;
+        if (!m.macro && m.value == 0) continue;   // MakeHuman writes every modifier with a value, and the macros
         snprintf(buf, sizeof buf, "modifier %s %f\n", m.fullName().c_str(), m.value);
         o << buf;
     }
@@ -776,7 +859,7 @@ bool saveMhm(const Body& b, const std::string& path, const std::string& name, st
     o << "clothesHideFaces " << (b.hideUnderClothes ? "True" : "False") << "\n";
     o << "skinMaterial " << (b.skinMaterial.empty() ? std::string("skins/default.mhmat") : relPath(b, b.skinMaterial)) << "\n";
     for (const auto& p : b.proxies) if (!p.material.empty()) o << "material " << p.name << " " << p.uuid << " " << relPath(b, p.material) << "\n";
-    o << "subdivide False\n";
+    // (subdivide, MakeHuman's last line, is written by the window: it knows the view's Smooth)
     return true;
 }
 
@@ -784,6 +867,7 @@ bool loadMhm(Body& b, const std::string& path, std::string& err) {
     std::ifstream in(fs::u8path(path));
     if (!in) { err = "Couldn't read " + path; return false; }
     resetAll(b);
+    b.name.clear(); b.uuid.clear(); b.tags.clear(); b.subdivide = false; b.hasCamera = false;
     std::string line;
     int n = 0;
     std::vector<std::array<std::string, 3>> wearLater, matLater;
@@ -796,6 +880,17 @@ bool loadMhm(Body& b, const std::string& path, std::string& err) {
         static const std::set<std::string> gear = {"clothes", "hair", "eyebrows", "eyelashes", "teeth", "tongue", "eyes", "proxy"};
         if (gear.count(k)) { std::string nm, id; ls >> nm >> id; wearLater.push_back({k, nm, id}); continue; }
         if (k == "skinMaterial") { std::string f; std::getline(ls >> std::ws, f); skinLater = f; continue; }
+        if (k == "uuid") { ls >> b.uuid; continue; }
+        if (k == "name") { std::getline(ls >> std::ws, b.name); continue; }
+        if (k == "tags") {   // "a;b;c" (and the old "a,,b c" form: words, ',,' a space inside a tag)
+            std::string t; std::getline(ls >> std::ws, t);
+            if (t.find(",,") != std::string::npos) { std::istringstream ws(t); std::string w, out; while (ws >> w) { size_t at; while ((at = w.find(",,")) != std::string::npos) w.replace(at, 2, " "); out += (out.empty() ? "" : ";") + w; } t = out; }
+            std::istringstream ts(t); std::string one;
+            while (std::getline(ts, one, ';')) { for (auto& c : one) c = (char)tolower((unsigned char)c); if (!one.empty() && std::find(b.tags.begin(), b.tags.end(), one) == b.tags.end()) b.tags.push_back(one); }
+            continue;
+        }
+        if (k == "camera") { for (float& c : b.camera) ls >> c; b.hasCamera = true; continue; }
+        if (k == "subdivide") { std::string f; ls >> f; for (auto& c : f) c = (char)tolower((unsigned char)c); b.subdivide = f == "true" || f == "yes"; continue; }
         if (k == "clothesHideFaces") { std::string f; ls >> f; b.hideUnderClothes = f != "False"; continue; }
         if (k == "material") { std::string nm, id, f; ls >> nm >> id; std::getline(ls >> std::ws, f); matLater.push_back({nm, id, f}); continue; }
         if (k != "modifier" || !(ls >> name >> v)) continue;

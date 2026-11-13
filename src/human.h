@@ -95,7 +95,19 @@ struct Body {
     bool hideUnderClothes = true;        // clothes hide the body's faces under them
     float skinTint[3] = {1, 1, 1};       // Material Editor: the skin's colour multiplied in
     Mat::Material skinMat;               // the skin's whole material (skins/default.mhmat when none is chosen)
+    // the model's metadata (Files > Save): its name, uuid and tags, the camera and Smooth, as .mhm files keep them
+    std::string name, uuid;
+    std::vector<std::string> tags;
+    float camera[6] = {0, 0, 0, 0, 0, 1};   // MakeHuman's: rotation x, y (degrees), translation x, y, z, zoom
+    bool subdivide = false, hasCamera = false;
 };
+// a file's tags (MakeHuman's "tag" lines, a model's "tags a;b", a pose's .meta) and its "name" line, for the choosers
+const std::vector<std::string>& fileTags(const std::string& path);
+std::string fileTitle(const std::string& path);
+// MakeHuman's real weight: the body's surface area (Mosteller) turned into kilograms for its height
+float weightKg(const Body& b);
+// 1_convert_model_tags: old "tags a,,b c" lines in the models under folder become "tags a b;c", the file kept as .mhm~
+int convertModelTags(const std::string& folder, std::vector<std::string>& log);
 // where assets are looked for when a file names one (materials' textures, litspheres, shaders): set once the roots are
 void setAssetRoots(const std::vector<std::string>& roots);
 // a path as a file writes it ("data/litspheres/x.png", "x.png" beside it...) -> absolute, "" if it isn't anywhere

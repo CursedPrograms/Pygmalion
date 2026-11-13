@@ -398,12 +398,14 @@ static void subdivide(const std::vector<float>& pos, const std::vector<int>& tri
 }
 
 static void normals(const std::vector<float>& pos, const std::vector<int>& tri, std::vector<float>& n);
+static bool keepNormals = false;   // a slider is being dragged with "Update normals real-time" off: the old normals stay
 // a mesh corner by corner (smoothed first with Smooth on)
 static void unroll(const std::vector<float>& pos, const std::vector<int>& tri, const std::vector<float>& cuv, std::vector<float>& P, std::vector<float>& N, std::vector<float>& U, std::vector<float>& Tg) {
     std::vector<float> sp; std::vector<int> st; std::vector<float> su;
     const std::vector<float>* p = &pos; const std::vector<int>* t = &tri; const std::vector<float>* u = &cuv;
     if (lk.smooth) { subdivide(pos, tri, cuv, sp, st, su); p = &sp; t = &st; u = &su; }
-    std::vector<float> n; normals(*p, *t, n);
+    std::vector<float> n;
+    if (keepNormals) n.assign(p->size(), 0); else normals(*p, *t, n);
     P.clear(); N.clear(); P.reserve(t->size() * 3); N.reserve(t->size() * 3);
     for (int v : *t) { P.insert(P.end(), &(*p)[(size_t)v * 3], &(*p)[(size_t)v * 3] + 3); N.insert(N.end(), &n[(size_t)v * 3], &n[(size_t)v * 3] + 3); }
     U = *u;
@@ -427,7 +429,8 @@ static void unroll(const std::vector<float>& pos, const std::vector<int>& tri, c
 
 static void fill(Part& pt, const std::vector<float>& P, const std::vector<float>& N, const std::vector<float>& U, const std::vector<float>& Tg) {
     if (!pt.vao) { glGenVertexArrays_(1, &pt.vao); glGenBuffers_(1, &pt.pos); glGenBuffers_(1, &pt.nrm); glGenBuffers_(1, &pt.uv); glGenBuffers_(1, &pt.tg); }
-    upload(pt.vao, pt.pos, 0, 3, P); upload(pt.vao, pt.nrm, 1, 3, N); upload(pt.vao, pt.uv, 2, 2, U); upload(pt.vao, pt.tg, 3, 3, Tg);
+    const bool same = (int)P.size() / 3 == pt.count;
+    upload(pt.vao, pt.pos, 0, 3, P); if (!(keepNormals && same)) upload(pt.vao, pt.nrm, 1, 3, N); upload(pt.vao, pt.uv, 2, 2, U); if (!(keepNormals && same)) upload(pt.vao, pt.tg, 3, 3, Tg);
     pt.count = (int)P.size() / 3;
 }
 
@@ -467,6 +470,8 @@ static void matGL(const Mat::Material& m, MatGL& g) {
 }
 
 void update(const Human::Body& b) {
+    keepNormals = lk.dragging && !lk.normalsWhileDragging;
+    const bool keepFit = lk.dragging && !lk.fitWhileDragging;
     eth[0] = b.african; eth[1] = b.asian; eth[2] = b.caucasian;
     const std::vector<float>& pos = b.shown.empty() ? b.pos : b.shown;
     // the body: its visible triangles, less those under clothes (all of them under a topology)
@@ -494,6 +499,7 @@ void update(const Human::Body& b) {
     for (size_t i = 0; i < parts.size(); ++i) {
         Part& pt = parts[i];
         if (i >= b.proxies.size()) { pt.count = 0; continue; }
+        if (keepFit && pt.count) continue;   // "Fit objects real-time" off: the clothes catch up when the slider is let go
         const Human::Proxy& p = b.proxies[i];
         std::vector<float> fit; Human::fitProxy(b, p, fit);
         std::vector<float> P, N, U, Tg;

@@ -269,6 +269,57 @@ static void loadSliders(Body& b, const fs::path& file) {
 }
 
 // ---------- proxies (.mhclo): everything fitted to the body ----------
+static std::vector<std::string> assetRoots;
+void setAssetRoots(const std::vector<std::string>& roots) { assetRoots = roots; }
+std::string resolveAsset(const std::string& written, const std::string& folder) {
+    if (written.empty() || written == "None") return "";
+    std::error_code ec;
+    const fs::path w = fs::u8path(written);
+    if (w.is_absolute()) return fs::exists(w, ec) ? w.lexically_normal().u8string() : "";
+    std::vector<fs::path> tries;
+    if (!folder.empty()) tries.push_back(fs::u8path(folder) / w);
+    std::string tail = written; if (tail.rfind("data/", 0) == 0) tail = tail.substr(5);
+    for (const auto& r : assetRoots) { tries.push_back(fs::u8path(r) / w); tries.push_back(fs::u8path(r) / fs::u8path(tail)); tries.push_back(fs::u8path(r).parent_path() / w); }
+    if (!folder.empty()) tries.push_back(fs::u8path(folder) / w.filename());   // MakeHuman's last try: beside the file
+    for (const auto& t : tries) if (fs::exists(t, ec) && fs::is_regular_file(t, ec)) return t.lexically_normal().u8string();
+    return "";
+}
+bool applyUvMap(Body& b, std::string& err) {
+    const std::string want = b.skinMat.uvMap;
+    if (want == b.uvMapIn) return true;
+    if (b.uvOwn.empty()) { b.uvOwn = b.uv; b.triUvOwn = b.triUv; b.faces4UvOwn = b.faces4Uv; }
+    b.uv = b.uvOwn; b.triUv = b.triUvOwn; b.faces4Uv = b.faces4UvOwn; b.uvMapIn.clear();
+    if (want.empty()) return true;
+    std::string t;
+    if (!readAll(fs::u8path(want), t)) { err = "Couldn't read the uv map " + want; return false; }
+    std::vector<float> uv; std::vector<int> f4;
+    std::istringstream in(t); std::string line;
+    while (std::getline(in, line)) {
+        if (line.size() > 3 && line[0] == 'v' && line[1] == 't') { float u, v; if (sscanf(line.c_str() + 3, "%f %f", &u, &v) == 2) { uv.push_back(u); uv.push_back(v); } }
+        else if (line.size() > 2 && line[0] == 'f' && line[1] == ' ') {
+            int a[4] = {0, 0, 0, 0}, w[4] = {0, 0, 0, 0}, n = 0; std::istringstream ls(line.substr(2)); std::string c;
+            while (n < 4 && ls >> c) { if (sscanf(c.c_str(), "%d/%d", &a[n], &w[n]) == 2) ++n; else if (sscanf(c.c_str(), "%d", &a[n]) == 1) { w[n] = a[n]; ++n; } }
+            for (int k = 0; k < 4; ++k) f4.push_back(w[k < n ? k : std::max(n - 1, 0)] - 1);
+        }
+    }
+    if (f4.size() != b.faces4.size()) { err = "The uv map doesn't fit this mesh (" + std::to_string(f4.size() / 4) + " faces, the body has " + std::to_string(b.faces4.size() / 4) + ")"; return false; }
+    // the visible faces' triangles in base.obj's order, as loadBase cut them
+    std::vector<char> visible(b.faces4.size() / 4, 1);
+    for (const auto& g : b.faceGroups) if (g.first.rfind("helper-", 0) == 0 || g.first.rfind("joint-", 0) == 0) for (const auto& r : g.second) for (int f = r.first; f < r.second; ++f) visible[f] = 0;
+    std::vector<int> triUv;
+    for (size_t f = 0; f < visible.size(); ++f) {
+        if (!visible[f]) continue;
+        const int* q = &f4[f * 4]; const int* v = &b.faces4[f * 4];
+        const int n = v[3] == v[2] ? 3 : 4;
+        for (int k = 1; k + 1 < n; ++k) triUv.insert(triUv.end(), {q[0], q[k], q[k + 1]});
+    }
+    if (triUv.size() != b.triUv.size()) { err = "The uv map's faces don't match the body's"; return false; }
+    b.uv = uv; b.triUv = triUv; b.faces4Uv = f4; b.uvMapIn = want;
+    return true;
+}
+static void readMat(const std::string& mhmat, Mat::Material& m) { if (!Mat::fromFile(mhmat, m, resolveAsset)) m = Mat::Material(); }
+static std::string defaultSkin() { return resolveAsset("skins/default.mhmat", ""); }
+
 bool loadMaterial(const std::string& mhmat, std::string& texture, bool& transparent) {
     std::string mt;
     const fs::path mp = fs::u8path(mhmat);
@@ -298,6 +349,15 @@ bool loadProxyFile(const std::string& path, Proxy& p, std::string& err) {
     enum { NONE, VERTS, DELETE } mode = NONE;
     bool sawVerts = false;   // (keywords like material may sit between "verts" and its numbers)
     while (std::getline(in, line)) {
+        {   // licence comments: "# author: ...", "# license: ...", "# homepage: ...", "# copyright: ..." (makehuman.updateFromComment)
+            const size_t a = line.find_first_not_of(" \t");
+            if (a != std::string::npos && line[a] == '#') {
+                std::istringstream cs(line.substr(a + 1)); std::string key, val; cs >> key; std::getline(cs >> std::ws, val);
+                while (!key.empty() && key.back() == ':') key.pop_back();
+                while (!val.empty() && (val.back() == '\r' || val.back() == ' ')) val.pop_back();
+                if (key == "author") p.author = val; else if (key == "license") p.license = val; else if (key == "homepage") p.homepage = val; else if (key == "copyright") p.copyright = val;
+            }
+        }
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty() || line[0] == '#') continue;
         std::istringstream ls(line);
@@ -361,6 +421,7 @@ bool loadProxyFile(const std::string& path, Proxy& p, std::string& err) {
                 while (c < eol && *c != ' ' && *c != '\t') ++c;
                 v.push_back(a - 1); u.push_back(w - 1);
             }
+            if (p.tri.empty()) p.vertsPerFace = v.size() == 3 ? 3 : 4;   // MakeHuman judges by the first face
             for (size_t k = 1; k + 1 < v.size(); ++k)
                 for (size_t qq : {(size_t)0, k, k + 1}) {
                     p.tri.push_back(v[qq]);
@@ -375,6 +436,7 @@ bool loadProxyFile(const std::string& path, Proxy& p, std::string& err) {
     if (!material.empty()) {
         p.material = (mhclo.parent_path() / fs::u8path(material)).lexically_normal().u8string();
         loadMaterial(p.material, p.texture, p.transparent);
+        readMat(p.material, p.mat);
     }
     return true;
 }
@@ -425,6 +487,8 @@ bool wear(Body& b, const std::string& file, std::string& err) {
 }
 bool setSkin(Body& b, const std::string& mhmat) {
     b.skinMaterial = mhmat; b.skinTexture.clear();
+    readMat(mhmat.empty() ? defaultSkin() : mhmat, b.skinMat);
+    { std::string e; applyUvMap(b, e); }
     if (mhmat.empty()) return true;
     bool t;
     if (!loadMaterial(mhmat, b.skinTexture, t)) { b.skinMaterial.clear(); return false; }
@@ -433,7 +497,7 @@ bool setSkin(Body& b, const std::string& mhmat) {
     return true;
 }
 bool setProxyMaterial(Body& b, const std::string& kind, const std::string& mhmat) {
-    for (auto& p : b.proxies) if (p.kind == kind) { p.material = mhmat; return loadMaterial(mhmat, p.texture, p.transparent); }
+    for (auto& p : b.proxies) if (p.kind == kind) { p.material = mhmat; readMat(mhmat, p.mat); return loadMaterial(mhmat, p.texture, p.transparent); }
     return false;
 }
 std::vector<char> hiddenVerts(const Body& b) {
@@ -754,7 +818,7 @@ bool loadMhm(Body& b, const std::string& path, std::string& err) {
         for (const auto& m : matLater) {
             const std::string f = absPath(b, m[2]);
             if (f.empty()) continue;
-            for (auto& p : b.proxies) if (p.uuid == m[1] || p.name == m[0]) { p.material = f; loadMaterial(f, p.texture, p.transparent); }
+            for (auto& p : b.proxies) if (p.uuid == m[1] || p.name == m[0]) { p.material = f; loadMaterial(f, p.texture, p.transparent); readMat(f, p.mat); }
         }
         const bool plain = skinLater.empty() || fs::u8path(skinLater).filename() == "default.mhmat";
         setSkin(b, plain ? std::string() : absPath(b, skinLater));

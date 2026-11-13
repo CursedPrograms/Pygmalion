@@ -274,7 +274,7 @@ static void saveSettings() {
       << "\nrealtime=" << prefs.realtime << "\nmetric=" << prefs.metric
       << "\nturnSpeed=" << lk.turnSpeed << "\nmoveSpeed=" << lk.moveSpeed << "\nzoomSpeed=" << lk.zoomSpeed
       << "\ninvertTurn=" << lk.invertTurn << "\ninvertZoom=" << lk.invertZoom
-      << "\nbgImage=" << lk.bgImage << "\nbgOpacity=" << lk.bgOpacity << "\n";
+      << "\nmhShaders=" << lk.mhShaders << "\nbgImage=" << lk.bgImage << "\nbgOpacity=" << lk.bgOpacity << "\n";
     o << "socketAccept=" << sockCfg.accept << "\nsocketAdvanced=" << sockCfg.advanced << "\nsocketHost=" << sockCfg.host << "\nsocketPort=" << sockCfg.port << "\n";
 }
 static void loadSettings() {
@@ -291,6 +291,7 @@ static void loadSettings() {
         else if (k == "invertTurn") lk.invertTurn = b; else if (k == "invertZoom") lk.invertZoom = b;
         else if (k == "bgImage") { std::error_code ec; if (!v.empty() && fs::exists(fs::u8path(v), ec)) lk.bgImage = v; }
         else if (k == "bgOpacity") lk.bgOpacity = std::clamp(f, 0.0f, 1.0f);
+        else if (k == "mhShaders") lk.mhShaders = b;
         else if (k == "socketAccept") sockCfg.accept = b; else if (k == "socketAdvanced") sockCfg.advanced = b;
         else if (k == "socketHost" && !v.empty()) { sockCfg.host = v; snprintf(sockHost, sizeof sockHost, "%s", v.c_str()); }
         else if (k == "socketPort") { sockCfg.port = std::clamp(atoi(v.c_str()), 1, 65535); snprintf(sockPort, sizeof sockPort, "%d", sockCfg.port); }
@@ -1306,45 +1307,191 @@ static void backgroundLeft(float lw) {
 
 // ---------- Utilities ----------
 static int matPick = 0;   // 0: the skin; k: proxy k-1
+// Utilities > Material Editor: MakeHuman's (plugins/7_material_editor.py) - the object, its shader, the shader's
+// config, custom defines and parameters, every material setting (sliders), a description, and the .mhmat file
 static void materialEditor(float lw) {
     groupBox("Object");
     std::vector<std::string> names = {"Skin"};
     for (const auto& p : body.proxies) names.push_back(niceName(p.file) + " (" + p.kind + ")");
     matPick = std::clamp(matPick, 0, (int)names.size() - 1);
-    std::vector<const char*> cn; for (const auto& n : names) cn.push_back(n.c_str());
-    ImGui::SetNextItemWidth(lw); ImGui::Combo("##obj", &matPick, cn.data(), (int)cn.size());
-    float* tint = matPick == 0 ? body.skinTint : body.proxies[matPick - 1].tint;
-    std::string& tex = matPick == 0 ? body.skinTexture : body.proxies[matPick - 1].texture;
-    groupBox("Colour");
-    for (int c = 0; c < 3; ++c) { static const char* n[] = {"Red %.2f", "Green %.2f", "Blue %.2f"}; ImGui::PushID(c); ImGui::SetNextItemWidth(lw); if (ImGui::SliderFloat("##t", &tint[c], 0, 2, n[c])) dirty = true; ImGui::PopID(); }
-    if (ImGui::Button("Plain", ImVec2(lw, 0))) { tint[0] = tint[1] = tint[2] = 1; dirty = true; }
-    groupBox("Texture");
-    ImGui::PushTextWrapPos(lw); ImGui::TextDisabled("%s", tex.empty() ? "(none)" : tex.c_str()); ImGui::PopTextWrapPos();
-    if (ImGui::Button("Change texture...", ImVec2(lw, 0))) {
-        const std::string p = fileDialog(false, L"Pictures\0*.png;*.jpg;*.jpeg\0\0", L"png", homeDir() + "\\");
-        if (!p.empty()) { tex = p; dirty = true; }
+    for (int k = 0; k < (int)names.size(); ++k) if (ImGui::RadioButton(names[k].c_str(), matPick == k)) matPick = k;
+    Human::Proxy* px = matPick == 0 ? nullptr : &body.proxies[matPick - 1];
+    Mat::Material& m = px ? px->mat : body.skinMat;
+    bool changed = false;
+    // ---- Shader: [None] and MakeHuman's six
+    groupBox("Shader");
+    if (ImGui::RadioButton("[None]", m.shader.empty())) { m.shader.clear(); changed = true; }
+    for (int k = 0; k < Mat::SHADER_COUNT; ++k) if (ImGui::RadioButton(Mat::SHADERS[k], m.shader == Mat::SHADERS[k])) { m.shader = Mat::SHADERS[k]; changed = true; }
+    // ---- Shader config: on only where the material has the texture and the shader takes it
+    groupBox("Shader config");
+    {
+        const auto& defs = m.shader.empty() ? std::vector<std::string>() : Mat::defineables(m.shader);
+        auto takes = [&](const char* d, const char* u) {
+            if (m.shader.empty()) return true;
+            if (std::find(defs.begin(), defs.end(), d) != defs.end()) return true;
+            for (const auto& x : Mat::uniforms(m.shader)) if (x.name == u) return true;
+            return false;
+        };
+        struct C { const char* name; bool* v; bool on; };
+        const C cs[] = {{"diffuse", &m.cfgDiffuse, m.supportsDiffuse() && takes("DIFFUSE", "diffuseTexture")},
+                        {"bump", &m.cfgBump, m.supportsBump() && takes("BUMPMAP", "bumpmapTexture")},
+                        {"normal", &m.cfgNormal, !m.shader.empty() && m.supportsNormal() && takes("NORMALMAP", "normalmapTexture")},
+                        {"displacement", &m.cfgDisplacement, !m.shader.empty() && m.supportsDisplacement() && takes("DISPLACEMENT", "displacementmapTexture")},
+                        {"spec", &m.cfgSpec, !m.shader.empty() && m.supportsSpecular() && takes("SPECULARMAP", "specularmapTexture")},
+                        {"vertexColors", &m.cfgVertexColors, m.shader.empty() || std::find(defs.begin(), defs.end(), "VERTEX_COLOR") != defs.end()},
+                        {"transparency", &m.cfgTransparency, !m.shader.empty() && m.supportsTransparency() && takes("TRANSPARENCYMAP", "transparencymapTexture")},
+                        {"ambientOcclusion", &m.cfgAo, !m.shader.empty() && m.supportsAo() && takes("AOMAP", "aomapTexture")}};
+        for (const auto& c : cs) { ImGui::BeginDisabled(!c.on); changed |= ImGui::Checkbox(c.name, c.v); ImGui::EndDisabled(); }
     }
-    if (matPick > 0) { if (ImGui::Checkbox("See-through (alpha)", &body.proxies[matPick - 1].transparent)) dirty = true; }
-    groupBox("Material file");
-    if (ImGui::Button("Load a material (.mhmat)...", ImVec2(lw, 0))) {
-        const std::string p = fileDialog(false, L"MakeHuman material\0*.mhmat\0\0", L"mhmat", homeDir() + "\\");
-        if (!p.empty()) { remember("Material"); if (matPick == 0) Human::setSkin(body, p); else Human::setProxyMaterial(body, body.proxies[matPick - 1].kind, p); dirty = true; }
-    }
-    if (ImGui::Button("Save as a material...", ImVec2(lw, 0))) {
-        const std::string p = fileDialog(true, L"MakeHuman material\0*.mhmat\0\0", L"mhmat", homeDir() + "\\material.mhmat");
-        if (!p.empty()) {
-            std::ofstream o(fs::u8path(p));
-            char b[128];
-            o << "# Written by Pygmalion\nname " << fs::u8path(p).stem().u8string() << "\n";
-            snprintf(b, sizeof b, "diffuseColor %.4f %.4f %.4f\n", std::min(tint[0], 1.0f), std::min(tint[1], 1.0f), std::min(tint[2], 1.0f)); o << b;
-            if (!tex.empty()) {
-                const fs::path src = fs::u8path(tex), dst = fs::u8path(p).parent_path() / src.filename();
-                std::error_code ec; if (!fs::exists(dst, ec)) fs::copy_file(src, dst, ec);
-                o << "diffuseTexture " << src.filename().u8string() << "\n";
+    // ---- Custom shader defines: the shader's own, besides the config's
+    if (!m.shader.empty()) {
+        std::vector<std::string> custom;
+        for (const auto& d : Mat::defineables(m.shader)) { bool cfg = false; for (int k = 0; k < 8; ++k) if (d == Mat::CONFIG_DEFINES[k]) cfg = true; if (!cfg) custom.push_back(d); }
+        if (!custom.empty()) {
+            groupBox("Custom shader defines");
+            for (const auto& d : custom) {
+                bool on = std::find(m.shaderDefines.begin(), m.shaderDefines.end(), d) != m.shaderDefines.end();
+                if (ImGui::Checkbox(d.c_str(), &on)) {
+                    if (on) m.shaderDefines.push_back(d); else m.shaderDefines.erase(std::remove(m.shaderDefines.begin(), m.shaderDefines.end(), d), m.shaderDefines.end());
+                    std::sort(m.shaderDefines.begin(), m.shaderDefines.end()); changed = true;
+                }
             }
-            if (matPick > 0 && body.proxies[matPick - 1].transparent) o << "transparent True\n";
-            say("Saved " + p);
         }
+    }
+    // ---- Shader parameters: the shader's uniforms the material doesn't set itself
+    if (!m.shader.empty()) {
+        groupBox("Shader parameters");
+        int shown = 0;
+        for (const auto& u : Mat::uniforms(m.shader)) {
+            if (Mat::isMaterialParam(u.name)) continue;
+            ImGui::PushID(u.name.c_str()); ++shown;
+            std::string v = m.param(u.name, u.def);
+            if (u.type == "sampler2D") {
+                ImGui::TextUnformatted(u.name.c_str());
+                ImGui::PushTextWrapPos(lw); ImGui::TextDisabled("%s", v.empty() ? "(none)" : fs::u8path(v).filename().u8string().c_str()); ImGui::PopTextWrapPos();
+                if (ImGui::Button("Browse...", ImVec2(lw / 2 - 4, 0))) {
+                    const std::string f = fileDialog(false, L"Pictures\0*.png;*.jpg;*.jpeg;*.bmp;*.tga\0\0", L"png", (fs::u8path(dataDir) / "litspheres").u8string() + "\\");
+                    if (!f.empty()) { m.setParam(u.name, f); changed = true; }
+                }
+                ImGui::SameLine(); if (ImGui::Button("Clear", ImVec2(lw / 2 - 4, 0))) { m.shaderParams.erase(std::remove_if(m.shaderParams.begin(), m.shaderParams.end(), [&](const auto& q) { return q.first == u.name; }), m.shaderParams.end()); changed = true; }
+            } else if (u.type == "float" || u.type == "int") {
+                float f = (float)atof(v.c_str());
+                const float hi = std::max(1.0f, std::fabs((float)atof(u.def.c_str())) * 4);
+                ImGui::SetNextItemWidth(lw);
+                if (ImGui::SliderFloat("##v", &f, 0, hi, (u.name + " %.3f").c_str())) { char b2[32]; snprintf(b2, sizeof b2, "%g", f); m.setParam(u.name, b2); changed = true; }
+            } else if (u.type == "vec3" || u.type == "vec4" || u.type == "vec2") {
+                const int n = u.type == "vec2" ? 2 : u.type == "vec3" ? 3 : 4;
+                float x[4] = {0, 0, 0, 0}; { std::istringstream vs(v); for (int k = 0; k < n; ++k) vs >> x[k]; }
+                ImGui::TextUnformatted(u.name.c_str());
+                bool ch = false;
+                for (int k = 0; k < n; ++k) { ImGui::PushID(k); ImGui::SetNextItemWidth(lw); ch |= ImGui::SliderFloat("##c", &x[k], 0, 1, "%.3f"); ImGui::PopID(); }
+                if (ch) { std::string t; for (int k = 0; k < n; ++k) { char b2[32]; snprintf(b2, sizeof b2, "%g", x[k]); t += (k ? " " : "") + std::string(b2); } m.setParam(u.name, t); changed = true; }
+            } else ImGui::TextDisabled("%s (%s)", u.name.c_str(), u.type.c_str());
+            ImGui::PopID();
+        }
+        if (!shown) ImGui::TextDisabled("This shader has none of its own.");
+    }
+    // ---- Material settings
+    groupBox("Material settings");
+    auto colour = [&](const char* label, float* c, bool enabled) {
+        ImGui::BeginDisabled(!enabled); ImGui::TextUnformatted(label);
+        ImGui::PushID(label);
+        static const char* n[] = {"Red %.3f", "Green %.3f", "Blue %.3f"};
+        for (int k = 0; k < 3; ++k) { ImGui::PushID(k); ImGui::SetNextItemWidth(lw); changed |= ImGui::SliderFloat("##c", &c[k], 0, 1, n[k]); ImGui::PopID(); }
+        ImGui::PopID(); ImGui::EndDisabled();
+    };
+    auto scalar = [&](const char* label, float* v, bool enabled = true) { ImGui::BeginDisabled(!enabled); ImGui::SetNextItemWidth(lw); changed |= ImGui::SliderFloat(label, v, 0, 1, (std::string(label).substr(2) + " %.3f").c_str()); ImGui::EndDisabled(); };
+    auto truth = [&](const char* label, bool* v) { changed |= ImGui::Checkbox(label, v); };
+    auto image = [&](const char* label, std::string& t, bool enabled) {
+        ImGui::BeginDisabled(!enabled);
+        ImGui::TextUnformatted(label);
+        ImGui::PushID(label);
+        ImGui::PushTextWrapPos(lw); ImGui::TextDisabled("%s", t.empty() ? "(none)" : fs::u8path(t).filename().u8string().c_str()); ImGui::PopTextWrapPos();
+        if (ImGui::Button("Browse...", ImVec2(lw / 2 - 4, 0))) {
+            const std::string f = fileDialog(false, L"Pictures\0*.png;*.jpg;*.jpeg;*.bmp;*.tga\0\0", L"png", (t.empty() ? homeDir() : fs::u8path(t).parent_path().u8string()) + "\\");
+            if (!f.empty()) { t = f; changed = true; }
+        }
+        ImGui::SameLine(); if (ImGui::Button("Clear", ImVec2(lw / 2 - 4, 0))) { t.clear(); changed = true; }
+        ImGui::PopID(); ImGui::EndDisabled();
+    };
+    const bool sh = !m.shader.empty();
+    auto uni = [&](const char* u) { if (!sh) return true; for (const auto& x : Mat::uniforms(m.shader)) if (x.name == u) return true; return false; };
+    auto def = [&](const char* d) { if (!sh) return false; const auto& ds = Mat::defineables(m.shader); return std::find(ds.begin(), ds.end(), d) != ds.end(); };
+    // which settings the chosen shader reads (MakeHuman greys out the rest; the fixed-function [None] reads the colours)
+    const bool fixed = !sh || m.shader == "skin" || m.shader == "normalmap";
+    colour("Diffuse", m.diffuse, (uni("diffuse") || fixed) && !m.autoBlendSkin);
+    image("Diffuse texture", m.diffuseTexture, !sh || uni("diffuseTexture") || def("DIFFUSE"));
+    colour("Ambient", m.ambient, uni("ambient") || fixed);
+    colour("Specular", m.specular, uni("specular") || fixed);
+    scalar("##Specular shininess", &m.shininess, uni("specular") || fixed);
+    colour("Emissive", m.emissive, uni("emissive") || fixed);
+    scalar("##Opacity", &m.opacity, uni("diffuse") || fixed);
+    scalar("##Translucency", &m.translucency);
+    truth("Shadeless", &m.shadeless); truth("Wireframe", &m.wireframe); truth("Transparent", &m.transparent);
+    truth("Alpha to Coverage", &m.alphaToCoverage); truth("Backface culling", &m.backfaceCull); truth("Depthless", &m.depthless);
+    truth("Auto ethnic skin", &m.autoBlendSkin);
+    image("Transparency map texture", m.transparencyMapTexture, sh && (uni("transparencymapTexture") || def("TRANSPARENCYMAP")));
+    scalar("##Transparency (map) intensity", &m.transparencyMapIntensity, sh && (uni("transparencymapTexture") || def("TRANSPARENCYMAP")));
+    image("Bump map texture", m.bumpMapTexture, sh && (uni("bumpmapTexture") || def("BUMPMAP")));
+    scalar("##Bump map intensity", &m.bumpMapIntensity, sh && (uni("bumpmapTexture") || def("BUMPMAP")));
+    image("Normal map texture", m.normalMapTexture, sh && (uni("normalmapTexture") || def("NORMALMAP")));
+    scalar("##Normal map intensity", &m.normalMapIntensity, sh && (uni("normalmapTexture") || def("NORMALMAP")));
+    image("Displacement map texture", m.displacementMapTexture, sh && (uni("displacementmapTexture") || def("DISPLACEMENT")));
+    scalar("##Displacement map intensity", &m.displacementMapIntensity, sh && (uni("displacementmapTexture") || def("DISPLACEMENT")));
+    image("Specular map texture", m.specularMapTexture, sh && (uni("specularmapTexture") || def("SPECULARMAP")));
+    scalar("##Specular map intensity", &m.specularMapIntensity, sh && (uni("specularmapTexture") || def("SPECULARMAP")));
+    image("Ambient Occlusion texture", m.aoMapTexture, sh && (uni("aomapTexture") || def("AOMAP")));
+    scalar("##AO map intensity", &m.aoMapIntensity, sh && (uni("aomapTexture") || def("AOMAP")));
+    {   // the uv map: one of MakeHuman's uv sets (data/uvs), or the mesh's own
+        ImGui::TextUnformatted("UV map");
+        std::vector<std::string> uvs = filesIn("uvs", ".mhuv"); for (const auto& f : filesIn("uvs", ".obj")) uvs.push_back(f);
+        const std::string cur = m.uvMap.empty() ? "default" : fs::u8path(m.uvMap).stem().u8string();
+        ImGui::SetNextItemWidth(lw);
+        if (ImGui::BeginCombo("##uv", cur.c_str())) {
+            if (ImGui::Selectable("default", m.uvMap.empty())) { m.uvMap.clear(); changed = true; }
+            for (const auto& f : uvs) { const std::string n = fs::u8path(f).stem().u8string(); if (n == "default") continue; if (ImGui::Selectable(n.c_str(), m.uvMap == f)) { m.uvMap = f; changed = true; } }
+            ImGui::EndCombo();
+        }
+    }
+    {
+        static char nameBuf[128]; static const Mat::Material* nameOf = nullptr;
+        if (nameOf != &m) { snprintf(nameBuf, sizeof nameBuf, "%s", m.name.c_str()); nameOf = &m; }
+        ImGui::TextUnformatted("Material name");
+        ImGui::SetNextItemWidth(lw); if (ImGui::InputText("##mname", nameBuf, sizeof nameBuf)) m.name = nameBuf;
+    }
+    // ---- Description: the object, its size and its licence
+    groupBox("Description");
+    {
+        size_t nv, nf; int vpf; std::string author = "unknown", license = "unknown", file = "internal", nm;
+        if (px) {
+            nv = px->pos.size() / 3; nf = px->tri.size() / 3; if (px->vertsPerFace == 4) nf = (nf + 1) / 2; vpf = px->vertsPerFace;
+            author = px->author; license = px->license; file = px->file; nm = px->name;
+        } else { nv = body.base.size() / 3; nf = body.faces4.size() / 4; vpf = 4; nm = "base.obj"; }
+        ImGui::PushTextWrapPos(lw);
+        ImGui::TextWrapped("%s:\n%zu vertices\n%zu faces\n%d vertices per face.\nAuthor: %s\nLicense: %s\n\nFile: %s", nm.c_str(), nv, nf, vpf, author.c_str(), license.c_str(), file.c_str());
+        ImGui::PopTextWrapPos();
+    }
+    // ---- Material file
+    groupBox("Material file");
+    if (ImGui::Button("Load", ImVec2(lw / 2 - 4, 0))) {
+        const std::string dir = m.filename.empty() ? homeDir() : fs::u8path(m.filename).parent_path().u8string();
+        const std::string f = fileDialog(false, L"MakeHuman Material (*.mhmat)\0*.mhmat\0\0", L"mhmat", dir + "\\");
+        if (!f.empty()) { remember("Material"); if (px) Human::setProxyMaterial(body, px->kind, f); else Human::setSkin(body, f); dirty = true; }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Save", ImVec2(lw / 2 - 4, 0))) {
+        const std::string dir = m.filename.empty() ? (fs::u8path(userDataDir()) / "skins").u8string() : fs::u8path(m.filename).parent_path().u8string();
+        std::string f = fileDialog(true, L"MakeHuman Material (*.mhmat)\0*.mhmat\0\0", L"mhmat", dir + "\\" + (m.name.empty() ? std::string("material") : m.name) + ".mhmat");
+        if (!f.empty()) {
+            if (fs::u8path(f).extension().empty()) f += ".mhmat";
+            std::string err; say(Mat::toFile(m, f, err) ? "Saved " + f : err);
+        }
+    }
+    if (changed) {
+        // the old fields the rest of Pygmalion reads, kept in step
+        if (px) { px->texture = m.diffuseTexture; px->transparent = m.transparent; } else body.skinTexture = m.diffuseTexture;
+        if (!px) { std::string err; if (!Human::applyUvMap(body, err)) { say(err); m.uvMap.clear(); Human::applyUvMap(body, err); } }
+        dirty = true;
     }
 }
 
@@ -1491,6 +1638,8 @@ static bool runCommand(const std::string& line, std::string& err, const std::fun
     else if (cmd == "symmetry") body.symmetry = rest != "off";
     else if (cmd == "bones") { showBones = rest != "off"; Viewer::look().bones = showBones; }
     else if (cmd == "smooth") Viewer::look().smooth = rest != "off";
+    else if (cmd == "camera") { lookFor(rest == "face" ? "faceCamera" : rest); Viewer::update(body); }   // a MakeHuman view: faceCamera, frontView, leftView...
+    else if (cmd == "shaders") Viewer::look().mhShaders = rest != "off";   // MakeHuman's own shaders (on) or Pygmalion's
     else if (cmd == "download") ok = installPack(rest, err);
     else if (cmd == "kindof") out(kindOfProxy(rest));   // what Install would call a .mhclo
     else if (cmd == "install") {
@@ -1536,6 +1685,15 @@ static bool runCommand(const std::string& line, std::string& err, const std::fun
         if (k >= 0) scenePreset(k);
         else if (a == "save") { const std::string f = rest.size() > 5 ? rest.substr(5) : ""; ok = !f.empty() && saveScene(f); if (!ok) err = "scene save file.pygscene"; }
         else ok = loadScene(rest, err);
+    }
+    else if (cmd == "material") {   // material skin|<kind> save file.mhmat | material skin|<kind> file.mhmat
+        std::istringstream ms(rest); std::string who, verb, file; ms >> who >> verb; std::getline(ms >> std::ws, file);
+        if (verb != "save") { file = verb + (file.empty() ? "" : " " + file); verb = "load"; }
+        Mat::Material* m = who == "skin" ? &body.skinMat : nullptr;
+        for (auto& px : body.proxies) if (!m && px.kind == who) m = &px.mat;
+        if (!m) { ok = false; err = "nothing worn of the kind " + who; }
+        else if (verb == "save") ok = Mat::toFile(*m, file, err, {"Written by Pygmalion"});
+        else { const std::string f = Human::absPath(body, file).empty() ? file : Human::absPath(body, file); ok = who == "skin" ? Human::setSkin(body, f) : Human::setProxyMaterial(body, who, f); if (!ok) err = "couldn't load " + file; }
     }
     else if (cmd == "help") out(COMMANDS);
     else { ok = false; err = "unknown command " + cmd + " (help lists them)"; }
@@ -1997,6 +2155,9 @@ static void frame() {
             int u = prefs.metric ? 0 : 1;
             if (ImGui::RadioButton("Metric (cm)", &u, 0)) prefs.metric = true;
             if (ImGui::RadioButton("Imperial (in)", &u, 1)) prefs.metric = false;
+            groupBox("Shading");
+            ImGui::Checkbox("MakeHuman's shaders", &Viewer::look().mhShaders);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Each object drawn with its material's own shader (litsphere, phong, toon, xray...), as MakeHuman draws it.\nOff: Pygmalion's own shading, lit by every light in the scene.");
             groupBox("Models folder");
             ImGui::TextWrapped("%s", homeDir().c_str());
             groupBox("Settings");
@@ -2253,6 +2414,9 @@ int main(int argc, char** argv) {
     if (!userDataDir().empty()) body.roots.push_back(userDataDir());
     if (!makehumanDataDir().empty()) body.roots.push_back(makehumanDataDir());
     body.roots.push_back(dataDir);
+    Human::setAssetRoots(body.roots);
+    Mat::setShaderFolder((fs::u8path(dataDir) / "shaders" / "glsl").u8string());
+    Human::setSkin(body, "");   // the default skin's material (skins/default.mhmat)
     loadSettings();
     loadCustomTargets();
     Human::defaultGear(body);

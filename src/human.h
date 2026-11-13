@@ -6,6 +6,8 @@
 // Its weight is the product of those variables' current values and its group's factor (a slider's value), and the
 // mesh is the base plus every target's offsets times its weight.
 #pragma once
+#include "material.h"
+
 #include <map>
 #include <string>
 #include <vector>
@@ -52,6 +54,9 @@ struct Proxy {                           // something fitted to the body (MakeHu
     std::vector<int> deleteVerts;        // the body's vertices it covers (hidden under it)
     float tint[3] = {1, 1, 1};           // Material Editor: its colour multiplied in
     std::vector<std::string> tags;       // its "tag" lines (a topology tagged "genitals" has them)
+    Mat::Material mat;                   // its whole material (MakeHuman's Material Editor), read from material
+    std::string author = "MakeHuman Team", license = "CC0", homepage, copyright;   // "# author: ..." comments (MakeHuman's LicenseInfo)
+    int vertsPerFace = 4;                // its obj's faces (MakeHuman's vertsPerFaceForExport)
 };
 bool loadProxyFile(const std::string& mhclo, Proxy& p, std::string& err);
 // a material: its diffuse texture (absolute path) and whether it's see-through
@@ -67,6 +72,8 @@ struct Body {
     // every face of base.obj as MakeHuman holds it (fvert/fuvs: 4 a face, a triangle repeats its last corner), and
     // its face groups as runs of faces [start, stop) - for the socket (Blender's MPFB reads the whole seed mesh)
     std::vector<int> faces4, faces4Uv;
+    std::vector<float> uvOwn; std::vector<int> triUvOwn, faces4UvOwn;   // the mesh's own uvs, while a uv map is used
+    std::string uvMapIn;                                                // the uv map in use ("" the mesh's own)
     std::vector<std::pair<std::string, std::vector<std::pair<int, int>>>> faceGroups;
     // targets and modifiers
     std::vector<Target> targets;
@@ -86,7 +93,14 @@ struct Body {
     std::string skinMaterial, skinTexture;   // "" : the litsphere skin by ethnicity
     bool hideUnderClothes = true;        // clothes hide the body's faces under them
     float skinTint[3] = {1, 1, 1};       // Material Editor: the skin's colour multiplied in
+    Mat::Material skinMat;               // the skin's whole material (skins/default.mhmat when none is chosen)
 };
+// where assets are looked for when a file names one (materials' textures, litspheres, shaders): set once the roots are
+void setAssetRoots(const std::vector<std::string>& roots);
+// a path as a file writes it ("data/litspheres/x.png", "x.png" beside it...) -> absolute, "" if it isn't anywhere
+std::string resolveAsset(const std::string& written, const std::string& folder);
+// the skin material's uv map (MakeHuman's data/uvs: an OBJ of uvs and faces) on the body, or its own uvs back
+bool applyUvMap(Body& b, std::string& err);
 
 extern const char* VAR_NAMES[];          // the macro value names, in val's order
 int varIndex(const std::string& v);

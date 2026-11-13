@@ -1,6 +1,7 @@
 // Pygmalion - the 3D view (see viewer.h). MakeHuman's litsphere shading: the normal in view space picks a colour from
 // a lit sphere picture; the three skin tones' spheres are blended by the ethnicity sliders. OpenGL 3.3 core.
 #include "viewer.h"
+#include "material.h"
 
 #include <SDL.h>
 #include <SDL_opengl.h>
@@ -37,6 +38,7 @@ GLF(void, glUniformMatrix4fv, (GLint, GLsizei, GLboolean, const GLfloat*))
 GLF(void, glUniform1i, (GLint, GLint))
 GLF(void, glUniform1f, (GLint, GLfloat))
 GLF(void, glUniform3f, (GLint, GLfloat, GLfloat, GLfloat))
+GLF(void, glUniform4f, (GLint, GLfloat, GLfloat, GLfloat, GLfloat))
 GLF(void, glUniform3fv, (GLint, GLsizei, const GLfloat*))
 GLF(void, glUniform2f, (GLint, GLfloat, GLfloat))
 GLF(void, glGenVertexArrays, (GLsizei, GLuint*))
@@ -79,16 +81,24 @@ namespace Viewer {
 
 static Look lk;
 Look& look() { return lk; }
-static GLuint prog = 0, progLine = 0;
+static GLuint prog = 0, progLine = 0, progMh = 0;
+static float mhPos[24], mhCol[24], mhSpec[24]; static int mhN = 0;   // the scene's lights as MakeHuman's shaders take them   // progMh: MakeHuman's own shaders, by each object's material
 // a mesh drawn corner by corner (uvs are per corner): the body, and each proxy (eyes, clothes, hair...)
-struct Part { GLuint vao = 0, pos = 0, nrm = 0, uv = 0, tex = 0; int count = 0, mode = 3; bool cutout = false; float tint[3] = {1, 1, 1}; };
+// what MakeHuman's shader needs of a material: its shader and defines, colours, textures and parameters
+struct MatGL {
+    int sh = 1; bool blend = false, wire = false; bool dDiffuse = false, dNormal = false, dAo = false, dAlpha = false, autoSkin = false, shadeless = false, backfaceCull = true, depthless = false, xray = false;
+    GLuint diffuse = 0, litsphere = 0, normal = 0, ao = 0, alpha = 0;
+    float diff[4] = {1, 1, 1, 1}, spec[4] = {1, 1, 1, 0.2f}, amb[3] = {1, 1, 1}, emis[3] = {0, 0, 0};
+    float additive = 0, normalInt = 1, silhouette = 0.2f, toonShine = 20, ambI = 0.4f, specI = 0.2f, diffI = 0.4f, specTh = 0.3f, diffTh = 0.5f, edge = 1, xrayI = 0.7f;
+};
+struct Part { GLuint vao = 0, pos = 0, nrm = 0, uv = 0, tg = 0, tex = 0; int count = 0, mode = 3; bool cutout = false; float tint[3] = {1, 1, 1}; MatGL mat; };
 static Part bodyPart;
 static std::vector<Part> parts;
 static std::map<std::string, GLuint> texCache;
 static GLuint gridVao = 0, gridVbo = 0; static int gridCount = 0;
 static GLuint progBg = 0, bgVao = 0, bgTex = 0; static std::string bgLoaded;
 static std::vector<float> boneSegs;
-static GLuint lit[3] = {0, 0, 0}, litEye = 0;
+static GLuint lit[3] = {0, 0, 0}, litEye = 0, lit_standard = 0;
 static GLuint fbo = 0, fboTex = 0, fboDepth = 0; static int fbW = 0, fbH = 0;
 static float eth[3] = {1 / 3.0f, 1 / 3.0f, 1 / 3.0f};
 static float target[3] = {0, 8.5f, 0}, height = 17, bodyMid = 8.5f;
@@ -121,7 +131,7 @@ static GLuint textureLoad(const std::string& path) {
 bool init(const std::string& data) {
 #define L(name) name##_ = (PFN_##name)SDL_GL_GetProcAddress(#name); if (!name##_) return false;
     L(glCreateShader) L(glShaderSource) L(glCompileShader) L(glCreateProgram) L(glAttachShader) L(glLinkProgram) L(glUseProgram)
-    L(glGetUniformLocation) L(glUniformMatrix4fv) L(glUniform1i) L(glUniform1f) L(glUniform3f) L(glUniform3fv) L(glUniform2f) L(glGenVertexArrays) L(glBindVertexArray)
+    L(glGetUniformLocation) L(glUniformMatrix4fv) L(glUniform1i) L(glUniform1f) L(glUniform3f) L(glUniform4f) L(glUniform3fv) L(glUniform2f) L(glGenVertexArrays) L(glBindVertexArray)
     L(glGenBuffers) L(glBindBuffer) L(glBufferData) L(glEnableVertexAttribArray) L(glVertexAttribPointer) L(glGenFramebuffers)
     L(glBindFramebuffer) L(glFramebufferTexture2D) L(glGenRenderbuffers) L(glBindRenderbuffer) L(glRenderbufferStorage)
     L(glFramebufferRenderbuffer) L(glGenerateMipmap) L(glActiveTexture)
@@ -174,6 +184,108 @@ void shade() {
   }
   o = vec4(skin, 1);
 })");
+    progMh = make(R"(#version 330
+layout(location=0) in vec3 p; layout(location=1) in vec3 n; layout(location=2) in vec2 t; layout(location=3) in vec3 tg;
+uniform mat4 mvp, view; out vec3 vN, vV, vTg; out vec2 vT;
+void main() { vN = mat3(view) * n; vTg = mat3(view) * tg; vV = vec3(view * vec4(p, 1)); vT = t; gl_Position = mvp * vec4(p, 1); })",
+                  R"(#version 330
+in vec3 vN, vV, vTg; in vec2 vT; out vec4 o;
+uniform int sh;                 // 0 none (fixed function), 1 litsphere, 2 normalmap, 3 phong, 4 skin, 5 toon, 6 xray
+uniform int dDiffuse, dNormal, dAo, dAlpha, cutout, autoSkin, shadeless, blend;
+uniform sampler2D diffuseTexture, litsphereTexture, normalmapTexture, aomapTexture, alphaTexture, litA, litB, litC;
+uniform vec3 eth;
+uniform vec4 mDiffuse;          // rgb, opacity
+uniform vec4 mSpecular;         // rgb, shininess 0..1
+uniform vec3 mAmbient, mEmissive;
+uniform float AdditiveShading, normalmapIntensity;
+uniform float silhouetteThreshold, toonShininess, ambientIntensity, specularIntensity, diffuseIntensity, specular_th, diffuse_th;
+uniform float edgefalloff, xrayIntensity;
+uniform vec3 sceneAmb, l0pos, l0col, l0spec;
+uniform int nl; uniform vec3 lpos[8], lrgb[8], lspec[8];
+uniform float light; uniform vec3 lcol, tint;
+vec3 viewNormal() {
+  vec3 n = normalize(vN); if (!gl_FrontFacing) n = -n;
+  if (dNormal == 1) {             // the normal map, tangent to view space
+    vec3 t = normalize(vTg - n * dot(n, vTg)); vec3 b = normalize(cross(n, t));
+    vec3 m = (2.0 * texture(normalmapTexture, vT).rgb - 1.0) * normalmapIntensity;
+    n = normalize(mat3(t, b, n) * m);
+  }
+  return n;
+}
+vec4 shadeIt() {
+  vec4 tex = dDiffuse == 1 ? texture(diffuseTexture, vT) : vec4(1.0);
+  if (shadeless == 1) return vec4(tex.rgb * mDiffuse.rgb, tex.a * mDiffuse.a);
+  if (sh == 1) {                 // litsphere
+    vec3 n = viewNormal();
+    vec2 q = n.xy * 0.495 + 0.5;
+    vec3 shading = autoSkin == 1 ? texture(litA, q).rgb * eth.x + texture(litB, q).rgb * eth.y + texture(litC, q).rgb * eth.z : texture(litsphereTexture, q).rgb;
+    vec4 c;
+    if (dDiffuse == 1) {
+      c.rgb = (1.0 - AdditiveShading) * shading * tex.rgb * vec3(2.0 - (shading.r + shading.g + shading.b) / 3.0);
+      c.rgb += AdditiveShading * (shading + tex.rgb);
+      c.a = tex.a;
+    } else { c.rgb = shading; c.a = dAlpha == 1 ? texture(alphaTexture, vT).a : 1.0; }
+    if (dAo == 1) c.rgb *= texture(aomapTexture, vT).rgb;
+    return c;
+  }
+  vec3 n = viewNormal();
+  vec3 L = normalize(l0pos - vV), E = normalize(-vV);
+  vec3 ambientCol = mEmissive + mAmbient * sceneAmb;          // gl_FrontLightModelProduct.sceneColor (the light's own ambient is 0)
+  if (sh == 3 || sh == 4) {      // phong; skin (its gradient and AO maps as white)
+    if (dAo == 1) tex.rgb *= texture(aomapTexture, vT).rgb;
+    vec4 c = vec4(ambientCol * tex.rgb, tex.a);
+    float NdotL = max(dot(n, L), 0.0);
+    if (NdotL > 0.0) {
+      c.rgb += (sh == 3 ? l0col * mDiffuse.rgb : vec3(1.0)) * NdotL * tex.rgb;
+      vec3 H = normalize(normalize(l0pos) + vec3(0, 0, 1));
+      c.rgb += l0spec * mSpecular.rgb * pow(max(dot(n, H), 0.0), max(mSpecular.a * (sh == 3 ? 255.0 : 128.0), 1.0));
+    }
+    if (sh == 3) c.rgb += mEmissive;
+    return c;
+  }
+  if (sh == 2) {                 // normalmap: lit in tangent space (its ambient is the light's, which is 0)
+    vec3 nn = normalize(vN); if (!gl_FrontFacing) nn = -nn;
+    vec3 t = normalize(vTg - nn * dot(nn, vTg)); vec3 b = cross(nn, t);
+    vec3 lv = l0pos - vV, ev = -vV;
+    vec3 lVec = normalize(vec3(dot(lv, t), dot(lv, b), dot(lv, nn))), vVec = normalize(vec3(dot(ev, t), dot(ev, b), dot(ev, nn)));
+    vec4 base = texture(diffuseTexture, vT);
+    vec3 bump = normalize(texture(normalmapTexture, vT).xyz * 2.0 - 1.0);
+    float d = max(dot(lVec, bump), 0.0);
+    float s = pow(clamp(dot(reflect(-lVec, bump), vVec), 0.0, 1.0), max(mSpecular.a * 128.0, 1.0));
+    return vec4(l0col * mDiffuse.rgb * d * base.rgb + l0spec * mSpecular.rgb * s, 1.0);
+  }
+  if (sh == 5) {                 // toon
+    tex = texture(diffuseTexture, vT);
+    float sil = max(dot(n, E), 0.0);
+    if (sil < silhouetteThreshold) return vec4(0.0, 0.0, 0.0, tex.a);
+    vec3 H = normalize(L + E);
+    float m = ambientIntensity;
+    m += specularIntensity * smoothstep(specular_th - 0.01, specular_th, pow(max(dot(n, H), 0.0), toonShininess));
+    m += diffuseIntensity * smoothstep(diffuse_th - 0.01, diffuse_th, max(dot(n, L), 0.0));
+    return vec4(m * tex.rgb, tex.a);
+  }
+  if (sh == 6) {                 // xray: see-through at the middle, bright at the edges
+    float opac = abs(dot(normalize(-vN), normalize(-vV)));
+    opac = (mAmbient.r + mAmbient.g + mAmbient.b) / 3.0 + xrayIntensity * (1.0 - pow(opac, edgefalloff));
+    vec4 dc = vec4(1.0); if (dDiffuse == 1) dc += texture(diffuseTexture, vT);
+    return vec4(opac * dc.rgb, opac);
+  }
+  // [None]: OpenGL's fixed-function lighting, every light, the texture multiplied in
+  vec3 c = ambientCol;
+  for (int i = 0; i < nl; ++i) {
+    vec3 Li = normalize(lpos[i] - vV);
+    float k = max(dot(n, Li), 0.0);
+    c += lrgb[i] * mDiffuse.rgb * k;
+    if (k > 0.0) c += lspec[i] * mSpecular.rgb * pow(max(dot(n, normalize(Li + E)), 0.0), max(mSpecular.a * 128.0, 1.0));
+  }
+  return vec4(c * tex.rgb, mDiffuse.a * tex.a);
+}
+void main() {
+  o = shadeIt();
+  if (cutout == 1 && o.a < 0.4) discard;
+  if (blend == 0) o.a = 1.0; else if (sh != 6) o.a *= mDiffuse.a;
+  o.rgb *= light * lcol * tint;
+})");
     progBg = make(R"(#version 330
 out vec2 T; void main() { vec2 p = vec2((gl_VertexID & 1) * 2 - 1, (gl_VertexID >> 1) * 2 - 1); T = p * 0.5 + 0.5; gl_Position = vec4(p, 0.999, 1); })",
                   R"(#version 330
@@ -189,6 +301,8 @@ out vec4 o; uniform vec3 col; void main() { o = vec4(col, 1); })");
     lit[1] = texture((ls / "skinmat_asian.png").u8string());
     lit[2] = texture((ls / "skinmat_caucasian.png").u8string());
     litEye = texture((ls / "skinmat_eye.png").u8string());
+    lit_standard = texture((ls / "lit_standard_skin.png").u8string());
+    if (!lit_standard) lit_standard = lit[2];
 
     glGenVertexArrays_(1, &gridVao); glGenBuffers_(1, &gridVbo);
     return prog != 0;
@@ -285,7 +399,7 @@ static void subdivide(const std::vector<float>& pos, const std::vector<int>& tri
 
 static void normals(const std::vector<float>& pos, const std::vector<int>& tri, std::vector<float>& n);
 // a mesh corner by corner (smoothed first with Smooth on)
-static void unroll(const std::vector<float>& pos, const std::vector<int>& tri, const std::vector<float>& cuv, std::vector<float>& P, std::vector<float>& N, std::vector<float>& U) {
+static void unroll(const std::vector<float>& pos, const std::vector<int>& tri, const std::vector<float>& cuv, std::vector<float>& P, std::vector<float>& N, std::vector<float>& U, std::vector<float>& Tg) {
     std::vector<float> sp; std::vector<int> st; std::vector<float> su;
     const std::vector<float>* p = &pos; const std::vector<int>* t = &tri; const std::vector<float>* u = &cuv;
     if (lk.smooth) { subdivide(pos, tri, cuv, sp, st, su); p = &sp; t = &st; u = &su; }
@@ -293,12 +407,63 @@ static void unroll(const std::vector<float>& pos, const std::vector<int>& tri, c
     P.clear(); N.clear(); P.reserve(t->size() * 3); N.reserve(t->size() * 3);
     for (int v : *t) { P.insert(P.end(), &(*p)[(size_t)v * 3], &(*p)[(size_t)v * 3] + 3); N.insert(N.end(), &n[(size_t)v * 3], &n[(size_t)v * 3] + 3); }
     U = *u;
+    // the tangent (the direction u grows in), for normal maps
+    std::vector<float> tv(p->size(), 0);
+    for (size_t c = 0; c + 2 < t->size(); c += 3) {
+        const float* a = &(*p)[(size_t)(*t)[c] * 3]; const float* b = &(*p)[(size_t)(*t)[c + 1] * 3]; const float* d = &(*p)[(size_t)(*t)[c + 2] * 3];
+        if (c * 2 + 5 >= u->size()) break;
+        const float du1 = (*u)[c * 2 + 2] - (*u)[c * 2], dv1 = (*u)[c * 2 + 3] - (*u)[c * 2 + 1], du2 = (*u)[c * 2 + 4] - (*u)[c * 2], dv2 = (*u)[c * 2 + 5] - (*u)[c * 2 + 1];
+        const float det = du1 * dv2 - du2 * dv1; if (std::fabs(det) < 1e-12f) continue;
+        const float r = 1 / det;
+        for (int k = 0; k < 3; ++k) { const float tk = ((b[k] - a[k]) * dv2 - (d[k] - a[k]) * dv1) * r; for (int q = 0; q < 3; ++q) tv[(size_t)(*t)[c + q] * 3 + k] += tk; }
+    }
+    Tg.clear(); Tg.reserve(t->size() * 3);
+    for (int v : *t) {
+        float x = tv[(size_t)v * 3], y = tv[(size_t)v * 3 + 1], z = tv[(size_t)v * 3 + 2]; const float l = std::sqrt(x * x + y * y + z * z);
+        if (l > 1e-12f) { x /= l; y /= l; z /= l; } else { x = 1; y = 0; z = 0; }
+        Tg.insert(Tg.end(), {x, y, z});
+    }
 }
 
-static void fill(Part& pt, const std::vector<float>& P, const std::vector<float>& N, const std::vector<float>& U) {
-    if (!pt.vao) { glGenVertexArrays_(1, &pt.vao); glGenBuffers_(1, &pt.pos); glGenBuffers_(1, &pt.nrm); glGenBuffers_(1, &pt.uv); }
-    upload(pt.vao, pt.pos, 0, 3, P); upload(pt.vao, pt.nrm, 1, 3, N); upload(pt.vao, pt.uv, 2, 2, U);
+static void fill(Part& pt, const std::vector<float>& P, const std::vector<float>& N, const std::vector<float>& U, const std::vector<float>& Tg) {
+    if (!pt.vao) { glGenVertexArrays_(1, &pt.vao); glGenBuffers_(1, &pt.pos); glGenBuffers_(1, &pt.nrm); glGenBuffers_(1, &pt.uv); glGenBuffers_(1, &pt.tg); }
+    upload(pt.vao, pt.pos, 0, 3, P); upload(pt.vao, pt.nrm, 1, 3, N); upload(pt.vao, pt.uv, 2, 2, U); upload(pt.vao, pt.tg, 3, 3, Tg);
     pt.count = (int)P.size() / 3;
+}
+
+// a material as MakeHuman's shader takes it (material.py's _updateShaderConfig, and the shader's parameter defaults)
+static void matGL(const Mat::Material& m, MatGL& g) {
+    g = MatGL();
+    const std::string& s = m.shader;
+    g.sh = s.empty() ? 0 : s == "litsphere" ? 1 : s == "normalmap" ? 2 : s == "phong" ? 3 : s == "skin" ? 4 : s == "toon" ? 5 : s == "xray" ? 6 : 1;
+    const std::set<std::string> d = m.defines();
+    // shaders that read a texture without a define (normalmap, skin and toon always do) take it when it's there
+    const bool always = g.sh == 2 || g.sh == 4 || g.sh == 5;
+    g.dDiffuse = (d.count("DIFFUSE") || ((always || g.sh == 0) && m.supportsDiffuse())) && !m.diffuseTexture.empty();
+    g.dNormal = (d.count("NORMALMAP") || g.sh == 2) && !m.normalMapTexture.empty();
+    g.dAo = d.count("AOMAP") && !m.aoMapTexture.empty();
+    g.dAlpha = d.count("ALPHA_MAP") && !m.transparencyMapTexture.empty();
+    g.autoSkin = m.autoBlendSkin;
+    g.shadeless = m.shadeless; g.backfaceCull = m.backfaceCull; g.depthless = m.depthless; g.xray = g.sh == 6;
+    g.blend = g.xray || (m.transparent && m.opacity < 0.999f); g.wire = m.wireframe;
+    g.diffuse = g.dDiffuse ? texture(m.diffuseTexture) : 0;
+    g.normal = g.dNormal ? texture(m.normalMapTexture) : 0;
+    g.ao = g.dAo ? texture(m.aoMapTexture) : 0;
+    g.alpha = g.dAlpha ? texture(m.transparencyMapTexture) : 0;
+    if (g.dDiffuse && !g.diffuse) g.dDiffuse = false;
+    if (g.dNormal && !g.normal) g.dNormal = false;
+    if (g.dAo && !g.ao) g.dAo = false;
+    const std::string lit = m.param("litsphereTexture");
+    g.litsphere = lit.empty() ? 0 : texture(lit);
+    if (!g.litsphere) g.litsphere = lit_standard;
+    for (int c = 0; c < 3; ++c) { g.diff[c] = m.diffuse[c]; g.spec[c] = m.specular[c]; g.amb[c] = m.ambient[c]; g.emis[c] = m.emissive[c]; }
+    g.diff[3] = m.opacity; g.spec[3] = m.shininess;
+    g.normalInt = m.normalMapIntensity;
+    auto f = [&](const char* name, float def) { const std::string v = m.param(name); if (!v.empty()) return (float)atof(v.c_str());
+                                                 for (const auto& u : Mat::uniforms(s)) if (u.name == name && !u.def.empty()) return (float)atof(u.def.c_str()); return def; };
+    g.additive = f("AdditiveShading", 0); g.silhouette = f("silhouetteThreshold", 0.2f); g.toonShine = f("shininess", 20);
+    g.ambI = f("ambientIntensity", 0.4f); g.specI = f("specularIntensity", 0.2f); g.diffI = f("diffuseIntensity", 0.4f);
+    g.specTh = f("specular_th", 0.3f); g.diffTh = f("diffuse_th", 0.5f); g.edge = f("edgefalloff", 1); g.xrayI = f("intensity", 0.7f);
 }
 
 void update(const Human::Body& b) {
@@ -316,9 +481,10 @@ void update(const Human::Body& b) {
                 if (u >= 0 && (size_t)u * 2 + 1 < b.uv.size()) cuv.insert(cuv.end(), {b.uv[(size_t)u * 2], b.uv[(size_t)u * 2 + 1]}); else cuv.insert(cuv.end(), {0, 0});
             }
         }
-        std::vector<float> P, N, U;
-        unroll(pos, vt, cuv, P, N, U);
-        fill(bodyPart, P, N, U);
+        std::vector<float> P, N, U, Tg;
+        unroll(pos, vt, cuv, P, N, U, Tg);
+        fill(bodyPart, P, N, U, Tg);
+        matGL(b.skinMat, bodyPart.mat);
         bodyPart.tex = texture(b.skinTexture);
         bodyPart.mode = bodyPart.tex ? 4 : 0;
         for (int c = 0; c < 3; ++c) bodyPart.tint[c] = b.skinTint[c];
@@ -330,9 +496,10 @@ void update(const Human::Body& b) {
         if (i >= b.proxies.size()) { pt.count = 0; continue; }
         const Human::Proxy& p = b.proxies[i];
         std::vector<float> fit; Human::fitProxy(b, p, fit);
-        std::vector<float> P, N, U;
-        unroll(fit, p.tri, p.uv, P, N, U);
-        fill(pt, P, N, U);
+        std::vector<float> P, N, U, Tg;
+        unroll(fit, p.tri, p.uv, P, N, U, Tg);
+        fill(pt, P, N, U, Tg);
+        matGL(p.kind == "proxymeshes" ? b.skinMat : p.mat, pt.mat);
         const bool topology = p.kind == "proxymeshes";
         pt.tex = texture(topology ? b.skinTexture : p.texture);
         pt.mode = p.kind == "eyes" ? 1 : topology ? (pt.tex ? 4 : 0) : 3;
@@ -451,6 +618,7 @@ unsigned render(int w, int h, bool hovered) {
     glUniform3f_(glGetUniformLocation_(prog, "lcol"), lk.lightCol[0], lk.lightCol[1], lk.lightCol[2]);
     {   // the scene's lights, turned into view space (those that turn with the view are there already)
         float dirs[24] = {0}, cols[24] = {0}, specs[24] = {0}; int nl = 0;
+        mhN = 0;
         for (const auto& L : lk.lights) {
             if (!L.on || nl == 8) continue;
             const float cp2 = std::cos(L.pitch), d[3] = {cp2 * std::sin(L.yaw), std::sin(L.pitch), cp2 * std::cos(L.yaw)};
@@ -458,6 +626,9 @@ unsigned render(int w, int h, bool hovered) {
             if (L.withView) { v[0] = d[0]; v[1] = d[1]; v[2] = d[2]; }
             else { v[0] = s[0] * d[0] + s[1] * d[1] + s[2] * d[2]; v[1] = u[0] * d[0] + u[1] * d[1] + u[2] * d[2]; v[2] = -(f[0] * d[0] + f[1] * d[1] + f[2] * d[2]); }
             for (int c = 0; c < 3; ++c) { dirs[nl * 3 + c] = v[c]; cols[nl * 3 + c] = L.col[c] * L.strength; specs[nl * 3 + c] = L.spec[c] * L.strength; }
+            // MakeHuman's lights are points: far out along the direction, in view space
+            for (int c = 0; c < 3; ++c) { mhPos[nl * 3 + c] = v[c] * 31.0f; mhCol[nl * 3 + c] = cols[nl * 3 + c]; mhSpec[nl * 3 + c] = specs[nl * 3 + c]; }
+            mhN = nl + 1;
             ++nl;
         }
         glUniform1i_(glGetUniformLocation_(prog, "nl"), nl);
@@ -472,8 +643,66 @@ unsigned render(int w, int h, bool hovered) {
     glUniform1i_(glGetUniformLocation_(prog, "litA"), 0); glUniform1i_(glGetUniformLocation_(prog, "litB"), 1);
     glUniform1i_(glGetUniformLocation_(prog, "litC"), 2); glUniform1i_(glGetUniformLocation_(prog, "tex"), 3);
     const GLint uMode = glGetUniformLocation_(prog, "mode"), uHas = glGetUniformLocation_(prog, "hasTex"), uCut = glGetUniformLocation_(prog, "cutout");
+    // MakeHuman's shaders: the frame's uniforms
+    const bool mh = lk.mhShaders && lk.shading != 1 && progMh;
+    if (mh) {
+        glUseProgram_(progMh);
+        auto U = [&](const char* n) { return glGetUniformLocation_(progMh, n); };
+        glUniformMatrix4fv_(U("mvp"), 1, GL_FALSE, mvp); glUniformMatrix4fv_(U("view"), 1, GL_FALSE, V);
+        glUniform3f_(U("eth"), eth[0], eth[1], eth[2]);
+        glUniform1f_(U("light"), lk.light); glUniform3f_(U("lcol"), lk.lightCol[0], lk.lightCol[1], lk.lightCol[2]);
+        glUniform3f_(U("sceneAmb"), lk.ambient[0], lk.ambient[1], lk.ambient[2]);
+        glUniform3f_(U("l0pos"), mhN ? mhPos[0] : -10.99f, mhN ? mhPos[1] : 20, mhN ? mhPos[2] : 20);
+        glUniform3f_(U("l0col"), mhN ? mhCol[0] : 0, mhN ? mhCol[1] : 0, mhN ? mhCol[2] : 0);
+        glUniform3f_(U("l0spec"), mhN ? mhSpec[0] : 0, mhN ? mhSpec[1] : 0, mhN ? mhSpec[2] : 0);
+        glUniform1i_(U("nl"), mhN);
+        glUniform3fv_(U("lpos"), 8, mhPos); glUniform3fv_(U("lrgb"), 8, mhCol); glUniform3fv_(U("lspec"), 8, mhSpec);
+        const char* units[] = {"diffuseTexture", "litsphereTexture", "normalmapTexture", "aomapTexture", "alphaTexture", "litA", "litB", "litC"};
+        for (int k = 0; k < 8; ++k) glUniform1i_(U(units[k]), k);
+        glUseProgram_(prog);
+    }
+    auto drawMh = [&](const Part& pt) {
+        const MatGL& g = pt.mat;
+        glUseProgram_(progMh);
+        auto U = [&](const char* n) { return glGetUniformLocation_(progMh, n); };
+        const GLuint tex[8] = {g.diffuse, g.litsphere, g.normal, g.ao, g.alpha, lit[0], lit[1], lit[2]};
+        for (int k = 0; k < 8; ++k) { glActiveTexture_(GL_TEXTURE0 + k); glBindTexture(GL_TEXTURE_2D, tex[k]); }
+        glUniform1i_(U("sh"), g.sh);
+        glUniform1i_(U("dDiffuse"), g.dDiffuse); glUniform1i_(U("dNormal"), g.dNormal); glUniform1i_(U("dAo"), g.dAo); glUniform1i_(U("dAlpha"), g.dAlpha);
+        glUniform1i_(U("autoSkin"), g.autoSkin); glUniform1i_(U("shadeless"), g.shadeless); glUniform1i_(U("cutout"), pt.cutout ? 1 : 0); glUniform1i_(U("blend"), g.blend);
+        glUniform3f_(U("tint"), pt.tint[0], pt.tint[1], pt.tint[2]);
+        const float d4[4] = {g.diff[0], g.diff[1], g.diff[2], g.diff[3]};
+        glUniform3f_(U("mAmbient"), g.amb[0], g.amb[1], g.amb[2]); glUniform3f_(U("mEmissive"), g.emis[0], g.emis[1], g.emis[2]);
+        glUniform4f_(U("mDiffuse"), d4[0], d4[1], d4[2], d4[3]); glUniform4f_(U("mSpecular"), g.spec[0], g.spec[1], g.spec[2], g.spec[3]);
+        glUniform1f_(U("AdditiveShading"), g.additive); glUniform1f_(U("normalmapIntensity"), g.normalInt);
+        glUniform1f_(U("silhouetteThreshold"), g.silhouette); glUniform1f_(U("toonShininess"), g.toonShine); glUniform1f_(U("ambientIntensity"), g.ambI);
+        glUniform1f_(U("specularIntensity"), g.specI); glUniform1f_(U("diffuseIntensity"), g.diffI); glUniform1f_(U("specular_th"), g.specTh);
+        glUniform1f_(U("diffuse_th"), g.diffTh); glUniform1f_(U("edgefalloff"), g.edge); glUniform1f_(U("xrayIntensity"), g.xrayI);
+        if (g.blend) { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); glDepthMask(GL_FALSE); }
+        if (g.depthless) glDisable(GL_DEPTH_TEST);
+        if (g.wire) glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+        glBindVertexArray_(pt.vao);
+        glDrawArrays(GL_TRIANGLES, 0, pt.count);
+        if (g.wire) glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+        if (g.blend) { glDisable(GL_BLEND); glDepthMask(GL_TRUE); }
+        if (g.depthless) glEnable(GL_DEPTH_TEST);
+        glUseProgram_(prog);
+    };
     auto draw = [&](const Part& pt, bool lines) {
         if (!pt.count) return;
+        if (mh) {
+            drawMh(pt);
+            if (lines) {
+                glUseProgram_(progLine);
+                glUniformMatrix4fv_(glGetUniformLocation_(progLine, "mvp"), 1, GL_FALSE, mvp);
+                glUniform3f_(glGetUniformLocation_(progLine, "col"), 0.88f, 0.25f, 0.54f);
+                glPolygonMode(GL_FRONT_AND_BACK, GL_LINE); glEnable(GL_POLYGON_OFFSET_LINE); glPolygonOffset(-1, -1);
+                glDrawArrays(GL_TRIANGLES, 0, pt.count);
+                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL); glDisable(GL_POLYGON_OFFSET_LINE);
+                glUseProgram_(prog);
+            }
+            return;
+        }
         for (int k = 0; k < 3; ++k) { glActiveTexture_(GL_TEXTURE0 + k); glBindTexture(GL_TEXTURE_2D, pt.mode == 1 && k == 0 ? litEye : lit[k]); }
         glActiveTexture_(GL_TEXTURE0 + 3); glBindTexture(GL_TEXTURE_2D, pt.tex);
         const bool clay = lk.shading == 1 && pt.mode != 1;

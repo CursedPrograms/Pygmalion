@@ -67,6 +67,16 @@ MakeHuman's own layout, tab for tab:
 - **Settings:** slider behaviour and pictures, units, a background picture to model against, mouse speeds and
   inverting, and MakeHuman's shortcuts (Ctrl+S save, Ctrl+E export, 1/3/7 front/side/top...). Kept between runs.
 
+## Minimum requirements
+
+| | |
+| --- | --- |
+| **System** | Windows 10 or 11, 64-bit |
+| **Processor** | any 64-bit processor |
+| **Memory** | 4 GB RAM |
+| **Graphics** | any graphics card with OpenGL 3.3 (2010 or newer) |
+| **Disk** | 500 MB |
+
 ## Download and run
 
 Windows: **Pygmalion-setup.exe** from [Releases](https://github.com/CursedPrograms/Pygmalion/releases) installs it

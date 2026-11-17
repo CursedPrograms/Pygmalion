@@ -55,6 +55,14 @@ int currentSide();                              // MakeHuman's sides: 0 front ..
 // Utilities > Skeleton Debug: the body coloured by one bone's weights (per body vertex, empty: off), and coloured
 // lines (axes) and triangles (bone planes), 3 floats a point and 4 a colour
 void setDebugWeights(const std::vector<float>& perVertex);
+// Sims-style editing: a part of the body tinted (0..1 per body vertex, empty: off), drawn over its own look
+void setHighlight(const std::vector<float>& perVertex);
+// the body vertex under a point of the view (pixels from the view's top left), nearest the eye; -1 if none
+int pick(const Human::Body& b, float mx, float my);
+// a point in the body's space to the view's pixels (false: behind the eye)
+bool project(const float p[3], float& sx, float& sy);
+// while a part is being dragged, the left button doesn't turn the view
+void holdView(bool hold);
 // MakeHuman's Lightmap SSS: the skin drawn unlit with this picture (top row first; empty: back to its own material)
 void setSkinOverride(const std::vector<unsigned char>& rgba, int w, int h);
 // the scene's lights as points in the body's own space (the ones that turn with the view go where the view has them)

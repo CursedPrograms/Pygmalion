@@ -64,6 +64,10 @@ MakeHuman's own layout, tab for tab:
   where they sit on the body), Data and Logs. MakeHuman's own data folder is read too.
 - **The toolbar:** Undo and Redo (shapes, clothes, skin and pose), Reset, Wire, Clay, Floor, Bones, Ortho, Smooth
   (MakeHuman's subdivision), symmetry, and the camera's views.
+- **Shape by dragging** (the Parts button, on by default in Modelling): point at the body and the part under the
+  mouse lights up (the nose, the chin, an eye, the stomach...); drag it and its sliders follow the mouse (drag the
+  mouth up and it moves up, drag a chin up and it gets shorter); Shift+drag sizes it, Alt+drag turns the view.
+- **Eye colours** and every worn item's materials: Materials > Skin/Material, picked in the Object list on the right.
 - **Settings:** slider behaviour and pictures, units, a background picture to model against, mouse speeds and
   inverting, and MakeHuman's shortcuts (Ctrl+S save, Ctrl+E export, 1/3/7 front/side/top...). Kept between runs.
 

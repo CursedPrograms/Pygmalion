@@ -297,6 +297,7 @@ void main() {
   if (cutout == 1 && o.a < 0.4) discard;
   if (blend == 0) o.a = 1.0; else if (sh != 6) o.a *= mDiffuse.a;
   o.rgb *= light * lcol * tint;
+  if (weightView == 2) o.rgb = mix(o.rgb, vec3(1.0), clamp(vW, 0.0, 1.0) * 0.3);   // the part being edited: white at 30%
 })");
     progDbg = make(R"(#version 330
 layout(location=0) in vec3 p; layout(location=1) in vec4 c; uniform mat4 mvp; out vec4 C; void main() { C = c; gl_Position = mvp * vec4(p, 1); })",
@@ -559,7 +560,51 @@ void focus(const float at[3], float dist, float yaw, float pitch) {
     for (int c = 0; c < 3; ++c) target[c] = at[c];
     lk.dist = dist; lk.yaw = yaw; lk.pitch = pitch;
 }
-void setDebugWeights(const std::vector<float>& w) { dbgWeights = w; }
+static int weightMode = 1;                     // 1 Skeleton Debug's heat map, 2 the Sims-style highlight
+static bool viewHeld = false;
+static float lastMvp[16]; static int lastW = 0, lastH = 0; static bool haveMvp = false;
+void setDebugWeights(const std::vector<float>& w) { dbgWeights = w; weightMode = 1; }
+void setHighlight(const std::vector<float>& w) { dbgWeights = w; weightMode = 2; }
+void holdView(bool hold) { viewHeld = hold; }
+bool project(const float p[3], float& sx, float& sy) {
+    if (!haveMvp) return false;
+    const float* M = lastMvp;
+    const float x = M[0] * p[0] + M[4] * p[1] + M[8] * p[2] + M[12], y = M[1] * p[0] + M[5] * p[1] + M[9] * p[2] + M[13];
+    const float w = M[3] * p[0] + M[7] * p[1] + M[11] * p[2] + M[15];
+    if (w <= 1e-6f) return false;
+    sx = (x / w * 0.5f + 0.5f) * lastW; sy = (1 - (y / w * 0.5f + 0.5f)) * lastH;
+    return true;
+}
+int pick(const Human::Body& b, float mx, float my) {
+    if (!haveMvp) return -1;
+    const std::vector<float>& pos = b.shown.empty() ? b.pos : b.shown;
+    const size_t nv = pos.size() / 3;
+    std::vector<float> sx(nv), sy(nv), sz(nv);
+    const float* M = lastMvp;
+    for (size_t i = 0; i < nv; ++i) {
+        const float* p = &pos[i * 3];
+        const float w = M[3] * p[0] + M[7] * p[1] + M[11] * p[2] + M[15];
+        if (w <= 1e-6f) { sz[i] = 1e9f; continue; }
+        sx[i] = ((M[0] * p[0] + M[4] * p[1] + M[8] * p[2] + M[12]) / w * 0.5f + 0.5f) * lastW;
+        sy[i] = (1 - ((M[1] * p[0] + M[5] * p[1] + M[9] * p[2] + M[13]) / w * 0.5f + 0.5f)) * lastH;
+        sz[i] = (M[2] * p[0] + M[6] * p[1] + M[10] * p[2] + M[14]) / w;
+    }
+    const std::vector<char> hid = Human::hiddenVerts(b);
+    int best = -1; float bestZ = 1e9f;
+    for (size_t t = 0; t + 2 < b.tri.size(); t += 3) {
+        const int i0 = b.tri[t], i1 = b.tri[t + 1], i2 = b.tri[t + 2];
+        if (sz[i0] > 1e8f || sz[i1] > 1e8f || sz[i2] > 1e8f || hid[i0] || hid[i1] || hid[i2]) continue;
+        const float x0 = sx[i0], y0 = sy[i0], x1 = sx[i1], y1 = sy[i1], x2 = sx[i2], y2 = sy[i2];
+        if (mx < std::min({x0, x1, x2}) || mx > std::max({x0, x1, x2}) || my < std::min({y0, y1, y2}) || my > std::max({y0, y1, y2})) continue;
+        const float d = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
+        if (std::fabs(d) < 1e-9f) continue;
+        const float a = ((y1 - y2) * (mx - x2) + (x2 - x1) * (my - y2)) / d, c = ((y2 - y0) * (mx - x2) + (x0 - x2) * (my - y2)) / d, e = 1 - a - c;
+        if (a < 0 || c < 0 || e < 0) continue;
+        const float z = a * sz[i0] + c * sz[i1] + e * sz[i2];
+        if (z < bestZ) { bestZ = z; best = a >= c && a >= e ? i0 : c >= e ? i1 : i2; }
+    }
+    return best;
+}
 static GLuint skinOverride = 0;
 void setSkinOverride(const std::vector<unsigned char>& rgba, int w, int h) {
     if (rgba.empty()) { if (skinOverride) { glDeleteTextures(1, &skinOverride); skinOverride = 0; } return; }
@@ -627,7 +672,7 @@ unsigned render(int w, int h, bool hovered) {
         if (ImGui::IsMouseDragging(ImGuiMouseButton_Left) || ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) { const float d = fine ? 150.0f : 30.0f; b.x += io.MouseDelta.x / d; b.y -= io.MouseDelta.y / d; }
         if (ImGui::IsMouseDragging(ImGuiMouseButton_Right)) { const float d = fine ? 500.0f : 100.0f; b.scale = std::fabs(b.scale + io.MouseDelta.y / d); }
     } else if (hovered) {
-        if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) { const float sg = lk.invertTurn ? -lk.turnSpeed : lk.turnSpeed; lk.yaw -= io.MouseDelta.x * 0.008f * sg; lk.pitch = std::clamp(lk.pitch + io.MouseDelta.y * 0.006f * sg, -1.4f, 1.4f); }
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Left) && !viewHeld) { const float sg = lk.invertTurn ? -lk.turnSpeed : lk.turnSpeed; lk.yaw -= io.MouseDelta.x * 0.008f * sg; lk.pitch = std::clamp(lk.pitch + io.MouseDelta.y * 0.006f * sg, -1.4f, 1.4f); }
         if (ImGui::IsMouseDragging(ImGuiMouseButton_Right) || ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
             const float k = lk.dist * 0.0015f * lk.moveSpeed, cy = std::cos(lk.yaw), sy = std::sin(lk.yaw);
             target[0] -= io.MouseDelta.x * k * cy; target[2] += io.MouseDelta.x * k * sy; target[1] += io.MouseDelta.y * k;
@@ -689,6 +734,7 @@ unsigned render(int w, int h, bool hovered) {
         memcpy(P, O, sizeof O);
     }
     float mvp[16]; mul(P, V, mvp);
+    memcpy(lastMvp, mvp, sizeof mvp); lastW = w; lastH = h; haveMvp = true;
     // the floor
     if (lk.grid && !lk.transparent) {
         std::vector<float> g;
@@ -789,7 +835,7 @@ unsigned render(int w, int h, bool hovered) {
         const GLuint tex[8] = {g.diffuse, g.litsphere, g.normal, g.ao, g.alpha, lit[0], lit[1], lit[2]};
         for (int k = 0; k < 8; ++k) { glActiveTexture_(GL_TEXTURE0 + k); glBindTexture(GL_TEXTURE_2D, tex[k]); }
         glUniform1i_(U("sh"), g.sh);
-        glUniform1i_(U("weightView"), &pt == &bodyPart && pt.hasWt ? 1 : 0);
+        glUniform1i_(U("weightView"), &pt == &bodyPart && pt.hasWt ? weightMode : 0);
         if (!(&pt == &bodyPart && pt.hasWt)) { glBindVertexArray_(pt.vao); glDisableVertexAttribArray_(4); glVertexAttrib1f_(4, 0); }
         glUniform1i_(U("dDiffuse"), g.dDiffuse); glUniform1i_(U("dNormal"), g.dNormal); glUniform1i_(U("dAo"), g.dAo); glUniform1i_(U("dAlpha"), g.dAlpha);
         glUniform1i_(U("autoSkin"), g.autoSkin); glUniform1i_(U("shadeless"), g.shadeless); glUniform1i_(U("cutout"), pt.cutout ? 1 : 0); glUniform1i_(U("blend"), g.blend);

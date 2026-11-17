@@ -1411,6 +1411,154 @@ static void symmetry(bool rightToLeft) {
     dirty = true;
 }
 
+// ---------- Sims-style editing: point at a part of the body, it lights up; drag it and its sliders follow ----------
+// Each modifier's effect is read from its targets (what +1 does to each vertex, less what -1 does). The part under the
+// mouse is the smallest modifier group that moves the vertex there; dragging picks, for each screen axis, the
+// modifier of that part whose effect on screen best follows it: the nose's up/down by dragging up, its width by
+// dragging sideways... Shift drags the part's size instead (the modifiers that spread it out), Alt turns the view.
+static bool partsOn = true;
+static float testPart[4] = {-1, -1, 0, 0}; static bool testPartSize = false; static int testPartFrame = 0;
+struct PartMod { std::vector<int> idx; std::vector<float> d; float maxLen = 0; };
+static std::vector<PartMod> partMods;                 // per modifier (empty for macros)
+static std::vector<std::vector<int>> modsAtVert;      // per body vertex: the modifiers that move it clearly
+static std::vector<int> hoverMods;                    // the part under the mouse: its modifiers
+static std::string hoverGroup;
+static bool partGrab = false, hlShown = false;
+struct AxisVec { float t[2], s[2]; };
+static std::vector<AxisVec> grabVecs;
+static void buildPartMods() {
+    if (!partMods.empty() || body.mods.empty()) return;
+    const size_t nv = body.pos.size() / 3;
+    partMods.assign(body.mods.size(), PartMod());
+    modsAtVert.assign(nv, {});
+    for (size_t i = 0; i < body.mods.size(); ++i) {
+        const Human::Modifier& m = body.mods[i];
+        if (m.macro || m.group == "measure") continue;
+        std::map<int, std::array<float, 3>> acc;
+        auto add = [&](const std::string& group, float sign) {
+            auto it = body.groupTargets.find(group);
+            if (it == body.groupTargets.end() || it->second.empty()) return;
+            const float k = sign / it->second.size();   // the variants (by gender, age...) averaged
+            for (int ti : it->second) {
+                const Human::Target& t = body.targets[ti];
+                for (size_t j = 0; j < t.idx.size(); ++j) { auto& a = acc[t.idx[j]]; for (int c = 0; c < 3; ++c) a[c] += t.d[j * 3 + c] * k; }
+            }
+        };
+        add(m.right, 1);
+        if (!m.left.empty()) add(m.left, -1);
+        PartMod& pm = partMods[i];
+        for (const auto& [v, d] : acc) {
+            const float len = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            if (len < 1e-5f) continue;
+            pm.idx.push_back(v); pm.d.insert(pm.d.end(), d.begin(), d.end());
+            pm.maxLen = std::max(pm.maxLen, len);
+        }
+        for (size_t j = 0; j < pm.idx.size(); ++j) {
+            const float* d = &pm.d[j * 3];
+            if (std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) > 0.3f * pm.maxLen && (size_t)pm.idx[j] < nv) modsAtVert[pm.idx[j]].push_back((int)i);
+        }
+    }
+}
+static void showPart(const std::vector<int>& mods) {
+    std::vector<float> w;
+    if (!mods.empty()) {
+        w.assign(body.pos.size() / 3, 0.0f);
+        for (int i : mods) {
+            const PartMod& pm = partMods[i];
+            for (size_t j = 0; j < pm.idx.size(); ++j) {
+                const float* d = &pm.d[j * 3];
+                float& o = w[pm.idx[j]];
+                o = std::max(o, std::min(1.0f, 1.6f * std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) / pm.maxLen));
+            }
+        }
+    }
+    Viewer::setHighlight(w);
+    hlShown = !w.empty();
+    Viewer::update(body);
+}
+static void hoverPart(float x, float y) {   // the part under (x, y) in the view, lit up
+    const int v = Viewer::pick(body, x, y);
+    std::vector<int> mods; std::string group;
+    if (v >= 0 && (size_t)v < modsAtVert.size() && !modsAtVert[v].empty()) {
+        int smallest = -1;
+        for (int i : modsAtVert[v]) if (smallest < 0 || partMods[i].idx.size() < partMods[smallest].idx.size()) smallest = i;
+        group = body.mods[smallest].group;
+        for (int i : modsAtVert[v]) if (body.mods[i].group == group) mods.push_back(i);
+    }
+    if (mods != hoverMods) { hoverMods = mods; hoverGroup = group; showPart(mods); }
+}
+static void grabPart() {
+    // each modifier's pull on screen: the whole part's shift (t) and its spread from its middle (s), in pixels
+    const std::vector<float>& pos = body.pos;
+    grabVecs.assign(hoverMods.size(), AxisVec{{0, 0}, {0, 0}});
+    for (size_t k = 0; k < hoverMods.size(); ++k) {
+        const PartMod& pm = partMods[hoverMods[k]];
+        float cx = 0, cy = 0, wsum = 0;
+        std::vector<float> px(pm.idx.size()), py(pm.idx.size()), qx(pm.idx.size()), qy(pm.idx.size()), wt(pm.idx.size(), 0.0f);
+        for (size_t j = 0; j < pm.idx.size(); ++j) {
+            const float* p = &pos[(size_t)pm.idx[j] * 3]; const float* d = &pm.d[j * 3];
+            const float moved[3] = {p[0] + d[0], p[1] + d[1], p[2] + d[2]};
+            float ax, ay, bx, by;
+            if (!Viewer::project(p, ax, ay) || !Viewer::project(moved, bx, by)) continue;
+            wt[j] = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) / pm.maxLen;
+            px[j] = ax; py[j] = ay; qx[j] = bx - ax; qy[j] = by - ay;
+            cx += ax * wt[j]; cy += ay * wt[j]; wsum += wt[j];
+        }
+        if (wsum <= 0) continue;
+        cx /= wsum; cy /= wsum;
+        AxisVec& a = grabVecs[k];
+        for (size_t j = 0; j < pm.idx.size(); ++j) {
+            if (wt[j] <= 0) continue;
+            a.t[0] += qx[j] * wt[j]; a.t[1] += qy[j] * wt[j];
+            a.s[0] += qx[j] * wt[j] * (px[j] >= cx ? 1.0f : -1.0f); a.s[1] += qy[j] * wt[j] * (py[j] >= cy ? 1.0f : -1.0f);
+        }
+        for (int c = 0; c < 2; ++c) { a.t[c] /= wsum; a.s[c] /= wsum; }
+        // a part going the same way all over is a move, not a size change (and the other way round)
+        if (std::hypot(a.s[0], a.s[1]) < std::hypot(a.t[0], a.t[1])) { a.s[0] = a.s[1] = 0; } else { a.t[0] = a.t[1] = 0; }
+    }
+    remember("Shape " + hoverGroup); redo.clear();
+    partGrab = true; Viewer::holdView(true);
+}
+static void dragPart(float dx, float dy, bool size) {
+    if (dx == 0 && dy == 0) return;
+    for (int axis = 0; axis < 2; ++axis) {
+        const float dm = axis == 0 ? dx : dy;
+        if (dm == 0) continue;
+        int best = -1; float bestV = 0;
+        for (size_t k = 0; k < hoverMods.size(); ++k) {
+            const float* v = size ? grabVecs[k].s : grabVecs[k].t;
+            const float len = std::hypot(v[0], v[1]);
+            if (len < 0.5f || std::fabs(v[axis]) < 0.6f * len) continue;   // it must mostly go this way on screen
+            if (std::fabs(v[axis]) > std::fabs(bestV)) { bestV = v[axis]; best = (int)k; }
+        }
+        if (best < 0) continue;
+        const int mi = hoverMods[best];
+        Human::setModifier(body, mi, body.mods[mi].value + dm / (bestV >= 0 ? std::max(bestV, 40.0f) : std::min(bestV, -40.0f))   /* the part follows the mouse, but never faster than 40 px for the whole slider */);
+        dirty = true;
+    }
+}
+static void partsInput(ImVec2 at, bool hovered) {
+    ImGuiIO& io = ImGui::GetIO();
+    const bool active = partsOn && cat == CAT_MODELLING && !body.shown.size();
+    if (partGrab) {
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) { partGrab = false; Viewer::holdView(false); return; }
+        dragPart(io.MouseDelta.x, io.MouseDelta.y, io.KeyShift);
+        return;
+    }
+    if (!active || !hovered || io.KeyAlt || ImGui::IsMouseDown(ImGuiMouseButton_Right) || ImGui::IsMouseDown(ImGuiMouseButton_Middle)) {
+        if (hlShown && testPart[0] < 0 && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) { hoverMods.clear(); hoverGroup.clear(); showPart({}); }
+        return;
+    }
+    buildPartMods();
+    if (ImGui::IsMouseDown(ImGuiMouseButton_Left) && !ImGui::IsMouseClicked(ImGuiMouseButton_Left)) return;   // turning the view
+    // what's under the mouse: the smallest group of modifiers that moves that vertex
+    hoverPart(io.MousePos.x - at.x, io.MousePos.y - at.y);
+    if (!hoverMods.empty()) {
+        ImGui::SetTooltip("%s", (T(hoverGroup.c_str()) + std::string(": ") + T("drag to shape, Shift+drag to size, Alt+drag turns")).c_str());
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) grabPart();
+    }
+}
+
 static float toolbarH = 34;   // one row of buttons, or more when the window is narrow
 static void toolbar(float x, float y, float w) {
     ImGui::SetNextWindowPos(ImVec2(x, y)); ImGui::SetNextWindowSize(ImVec2(w, toolbarH));
@@ -1438,6 +1586,7 @@ static void toolbar(float x, float y, float w) {
     if (btn(T("R>L"), T("Copy the right side's shapes to the left"))) symmetry(true);
     if (btn(T("L>R"), T("Copy the left side's shapes to the right"))) symmetry(false);
     if (btn(T("Symm"), T("Moving a left slider moves the right one too"), body.symmetry)) body.symmetry = !body.symmetry;
+    if (btn(T("Parts"), T("Point at a part of the body (in Modelling) and drag it to shape it; Shift+drag sizes it, Alt+drag turns the view"), partsOn)) { partsOn = !partsOn; if (!partsOn && hlShown) showPart({}); }
     gap();
     const float PI = 3.14159265f;
     { Viewer::Look& L2 = Viewer::look(); bool any = false; for (const auto& sd : L2.sides) if (!sd.file.empty()) any = true;
@@ -3744,6 +3893,17 @@ static void frame() {
     const ImVec2 a = ImGui::GetCursorScreenPos(), size = ImGui::GetContentRegionAvail();
     viewW = (int)size.x; viewH = (int)size.y;
     ImGui::InvisibleButton("v", size, ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight | ImGuiButtonFlags_MouseButtonMiddle);
+    partsInput(a, ImGui::IsItemHovered() || ImGui::IsItemActive());
+    if (testPart[0] >= 0 && ++testPartFrame == 3) {   // tests: --part u v [dx dy]: point there, then drag (in steps, as a mouse)
+        buildPartMods(); hoverPart(testPart[0] * size.x, testPart[1] * size.y);
+        std::string names; for (int m : hoverMods) names += " " + body.mods[m].fullName();
+        fprintf(stderr, "part: %s:%s\n", hoverGroup.c_str(), names.c_str());
+        if ((testPart[2] != 0 || testPart[3] != 0) && !hoverMods.empty()) {
+            grabPart(); Viewer::holdView(false); partGrab = false;
+            for (int k = 0; k < 10; ++k) dragPart(testPart[2] / 10, testPart[3] / 10, testPartSize);
+            for (int m : hoverMods) if (body.mods[m].value != 0) fprintf(stderr, "  %s = %.3f\n", body.mods[m].fullName().c_str(), body.mods[m].value);
+        }
+    }
     const unsigned tex = Viewer::render((int)size.x, (int)size.y, ImGui::IsItemHovered() || ImGui::IsItemActive());
     ImGui::GetWindowDrawList()->AddImage((ImTextureID)(intptr_t)tex, a, ImVec2(a.x + size.x, a.y + size.y), ImVec2(0, 1), ImVec2(1, 0));
     if (cat == CAT_RENDERING && task[CAT_RENDERING] == "Viewer" && renderedTex) {   // the last render, fitted
@@ -3794,6 +3954,9 @@ int main(int argc, char** argv) {
         else if (args[i] == "--tab" && i + 1 < args.size()) forcedTab = atoi(args[++i].c_str());
         else if (args[i] == "--task" && i + 1 < args.size()) forcedTask = args[++i];
         else if (args[i] == "--object" && i + 1 < args.size()) matObject = args[++i];   // tests: Materials' Object
+        else if (args[i] == "--part" && i + 2 < args.size()) { testPart[0] = (float)atof(args[++i].c_str()); testPart[1] = (float)atof(args[++i].c_str());   // tests: point at (u, v) of the view
+            if (i + 2 < args.size() && args[i + 1][0] != '-') { testPart[2] = (float)atof(args[++i].c_str()); testPart[3] = (float)atof(args[++i].c_str()); } }
+        else if (args[i] == "--part-size") testPartSize = true;
         else if (args[i] == "--pose" && i + 1 < args.size()) startPose = args[++i];
         else if (args[i] == "--yaw" && i + 1 < args.size()) startYaw = (float)atof(args[++i].c_str());
         else if (args[i] == "--unit" && i + 1 < args.size()) startUnits.push_back(args[++i]);

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Pygmalion VERSION 1.0.0 LANGUAGES C CXX)
+project(Pygmalion VERSION 1.1.0 LANGUAGES C CXX)
 # Pygmalion: people in 3D with sliders, on your own PC. Part of Atelier. AGPL-3.0 (its maths are MakeHuman's).
 # The body and its 1,280 shapes are MakeHuman's data (CC0), in data beside the program.
 set(CMAKE_CXX_STANDARD 17)

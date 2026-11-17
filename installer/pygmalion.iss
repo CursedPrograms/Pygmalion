@@ -3,7 +3,7 @@
 ; uses too - with Start menu and Desktop shortcuts; MakeHuman's body, shapes and asset pack are inside.
 
 #define AppName "Pygmalion"
-#define AppVersion "1.0.0"
+#define AppVersion "1.1.0"
 #define AppPublisher "Cursed Entertainment"
 #define AppURL "https://cursedprograms.github.io/Pygmalion/"
 

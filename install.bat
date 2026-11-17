@@ -1,7 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-rem Installs Pygmalion for this user: %LOCALAPPDATA%\Programs\Pygmalion, with Start menu and Desktop shortcuts.
+rem Installs Pygmalion for this user: %LOCALAPPDATA%\Programs\Pygmalion, with Start menu and Desktop shortcuts named Atelier - Pygmalion.
 rem Run build.bat first (or unzip a release and run this beside it).
 set "SRC=dist\Pygmalion"
 if exist "Pygmalion.exe" set "SRC=."
@@ -11,7 +11,7 @@ if not errorlevel 1 ( echo Pygmalion is open: close it and run this again. & exi
 set "INST=%LOCALAPPDATA%\Programs\Pygmalion"
 if not exist "%INST%" mkdir "%INST%"
 xcopy /e /i /q /y "%SRC%\*" "%INST%\" >nul || ( echo Couldn't copy to %INST% & exit /b 1 )
-powershell -NoProfile -Command "$s=New-Object -ComObject WScript.Shell; foreach($d in @([Environment]::GetFolderPath('Programs'),[Environment]::GetFolderPath('Desktop'))){ $l=$s.CreateShortcut((Join-Path $d 'Pygmalion.lnk')); $l.TargetPath='%INST%\Pygmalion.exe'; $l.WorkingDirectory='%INST%'; $l.IconLocation='%INST%\Pygmalion.exe,0'; $l.Description='Pygmalion: people in 3D with sliders'; $l.Save() }"
+powershell -NoProfile -Command "$s=New-Object -ComObject WScript.Shell; foreach($d in @([Environment]::GetFolderPath('Programs'),[Environment]::GetFolderPath('Desktop'))){ Remove-Item (Join-Path $d 'Pygmalion.lnk') -Force -ErrorAction SilentlyContinue; $l=$s.CreateShortcut((Join-Path $d 'Atelier - Pygmalion.lnk')); $l.TargetPath='%INST%\Pygmalion.exe'; $l.WorkingDirectory='%INST%'; $l.IconLocation='%INST%\Pygmalion.exe,0'; $l.Description='Pygmalion: people in 3D with sliders'; $l.Save() }"
 echo Installed: %INST%
 if /i not "%~1"=="--quiet" echo Start it from the Start menu or the Desktop.
 exit /b 0

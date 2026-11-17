@@ -826,23 +826,50 @@ static void geometriesLeft(const std::string& t, float lw) {
     const Human::Proxy* cur = Human::worn(body, kind);
     if (chooser(kind.c_str(), files, cur ? cur->file : std::string(), picked, lw, kind != "eyes")) putOn(picked, kind);
 }
+// MakeHuman's Skin/Material: an Object list on the right (Skin, then each worn proxy) picks whose materials the
+// chooser on the left shows - the eye colours, hair colours, eyebrow and lash colours, the skins
+static std::string matObject = "skin";   // "skin" or a worn proxy's kind
+static std::vector<std::string> proxyMaterials(const Human::Proxy& p) {
+    // beside it, and the same folders in every asset root (the eyes can be in data, their colours in the asset pack)
+    std::vector<std::string> mats;
+    std::set<std::string> seen;
+    std::error_code ec;
+    const fs::path rel = fs::u8path(Human::relPath(body, p.file)).parent_path();
+    std::vector<fs::path> dirs = {fs::u8path(p.file).parent_path(), fs::u8path(p.file).parent_path().parent_path() / "materials"};
+    for (const auto& r : body.roots) if (!rel.empty() && !rel.is_absolute()) { dirs.push_back(fs::u8path(r) / rel); dirs.push_back(fs::u8path(r) / rel.parent_path() / "materials"); }
+    for (const fs::path& d : dirs)
+        for (const auto& e : fs::directory_iterator(d, ec))
+            if (e.path().extension() == ".mhmat" && seen.insert(e.path().filename().u8string()).second) mats.push_back(e.path().u8string());
+    std::sort(mats.begin(), mats.end());
+    return mats;
+}
+static const Human::Proxy* matProxy() {
+    if (matObject == "skin") return nullptr;
+    for (const auto& p : body.proxies) if (p.kind == matObject) return &p;
+    matObject = "skin";
+    return nullptr;
+}
 static void materialsLeft(float lw) {
-    // MakeHuman's Skin/Material: the skins, then each worn proxy's own materials (eye colours, hair colours...)
     std::string picked;
-    groupBox(T("Skin"));
-    std::vector<std::string> skins = library("skins", ".mhmat");
-    if (chooser("skin", skins, body.skinMaterial, picked, lw, true, "Default")) { remember("Skin"); Human::setSkin(body, picked); dirty = true; say(picked.empty() ? "The default skin" : niceName(picked)); }
+    const Human::Proxy* p = matProxy();
+    if (!p) {
+        groupBox(T("Skin"));
+        std::vector<std::string> skins = library("skins", ".mhmat");
+        if (chooser("skin", skins, body.skinMaterial, picked, lw, true, "Default")) { remember("Skin"); Human::setSkin(body, picked); dirty = true; say(picked.empty() ? "The default skin" : niceName(picked)); }
+        return;
+    }
+    groupBox((niceName(p->file) + " " + T("material")).c_str());
+    std::vector<std::string> mats = proxyMaterials(*p);
+    if (mats.empty()) { ImGui::TextDisabled("%s", T("No materials for it")); return; }
+    if (chooser(("m" + p->file).c_str(), mats, p->material, picked, lw, false)) { remember("Material"); Human::setProxyMaterial(body, p->kind, picked); dirty = true; say(niceName(picked)); }
+}
+static void materialsRight() {
+    groupBox(T("Object"));
+    if (ImGui::RadioButton(T("Skin"), matObject == "skin")) matObject = "skin";
     for (const auto& p : body.proxies) {
         if (p.kind == "proxymeshes") continue;
-        std::vector<std::string> mats;
-        std::error_code ec;
-        const fs::path dir = fs::u8path(p.file).parent_path();
-        for (const fs::path d : {dir, dir.parent_path() / "materials"})
-            for (const auto& e : fs::directory_iterator(d, ec)) if (e.path().extension() == ".mhmat") mats.push_back(e.path().u8string());
-        if (mats.size() < 2) continue;
-        std::sort(mats.begin(), mats.end());
-        groupBox((niceName(p.file) + " material").c_str());
-        if (chooser(("m" + p.file).c_str(), mats, p.material, picked, lw, false)) { remember("Material"); Human::setProxyMaterial(body, p.kind, picked); dirty = true; }
+        const std::string label = niceName(p.file) + " (" + T(p.kind.c_str()) + ")";
+        if (ImGui::RadioButton(label.c_str(), matObject == p.kind)) matObject = p.kind;
     }
 }
 
@@ -3677,6 +3704,7 @@ static void frame() {
             else if (t != "Main" && t != "Random" && t != "Custom") { if (const Human::Tab* tb = tabNamed(t)) modTabRight(*tb); }
             else if (t == "Main") statistics();
         } else if (cat == CAT_FILES) filesRight();
+        else if (cat == CAT_MATERIALS) materialsRight();
         else if (cat == CAT_UTILITIES && t == "Scripting") scriptingRight();
         else if (cat == CAT_UTILITIES && t == "Shell") shellView();
         else if ((cat == CAT_POSE && t == "Expression") || (cat == CAT_UTILITIES && t == "Expression mixer")) {
@@ -3765,6 +3793,7 @@ int main(int argc, char** argv) {
         else if (args[i] == "--describe" && i + 1 < args.size()) describeWords = args[++i];
         else if (args[i] == "--tab" && i + 1 < args.size()) forcedTab = atoi(args[++i].c_str());
         else if (args[i] == "--task" && i + 1 < args.size()) forcedTask = args[++i];
+        else if (args[i] == "--object" && i + 1 < args.size()) matObject = args[++i];   // tests: Materials' Object
         else if (args[i] == "--pose" && i + 1 < args.size()) startPose = args[++i];
         else if (args[i] == "--yaw" && i + 1 < args.size()) startYaw = (float)atof(args[++i].c_str());
         else if (args[i] == "--unit" && i + 1 < args.size()) startUnits.push_back(args[++i]);

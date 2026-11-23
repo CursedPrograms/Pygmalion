@@ -107,6 +107,7 @@ static GLuint gridVao = 0, gridVbo = 0; static int gridCount = 0;
 static GLuint progBg = 0, bgVao = 0, bgTex = 0; static std::string bgLoaded;
 static GLuint progPlane = 0;   // MakeHuman's side backgrounds: a textured quad in the scene
 static std::vector<float> boneSegs;
+static GLuint progHair = 0, hairVao = 0, hairVbo = 0; static int hairCount = 0; static HairLook hairLook;   // strand hair
 static GLuint lit[3] = {0, 0, 0}, litEye = 0, lit_standard = 0;
 static GLuint fbo = 0, fboTex = 0, fboDepth = 0; static int fbW = 0, fbH = 0;   // fboDepth: a depth texture (SSS reads it)
 // subsurface scattering: the skin drawn alone (sssTex, sharing the view's depth), blurred across (sssTmp), then down (sssOut)
@@ -402,6 +403,30 @@ void main() {
     progSssComp = make(fullVs, R"(#version 330
 in vec2 T; out vec4 o; uniform sampler2D blurred, mask;
 void main() { float a = texture(mask, T).a; if (a == 0.0) discard; o = vec4(texture(blurred, T).rgb, 1.0); })");
+    // strand hair: line segments, each point with its tangent and how far along its strand it is (0 root, 1 tip);
+    // Kajiya-Kay shading (the light across the strand), two highlights shifted along it (Marschner's R and TRT, as
+    // TressFX does), the scene's lights in view space
+    progHair = make(R"(#version 330
+layout(location=0) in vec3 p; layout(location=1) in vec3 tg; layout(location=2) in float along;
+uniform mat4 mvp, view; out vec3 vT; out float vA;
+void main() { vT = mat3(view) * tg; vA = along; gl_Position = mvp * vec4(p, 1); })", R"(#version 330
+in vec3 vT; in float vA; out vec4 o;
+uniform vec3 rootCol, tipCol, amb, ldir[8], lrgb[8]; uniform int nl; uniform float shift, gloss, shine, light; uniform vec3 lcol;
+float kk(vec3 t, vec3 h, float e) { float th = dot(t, h); return pow(sqrt(max(1.0 - th * th, 0.0)), e); }
+void main() {
+  vec3 t = normalize(vT), e = vec3(0, 0, 1), c = mix(rootCol, tipCol, vA);
+  vec3 col = c * amb;
+  for (int i = 0; i < nl; ++i) {
+    vec3 l = ldir[i];
+    float tl = dot(t, l), diff = sqrt(max(1.0 - tl * tl, 0.0));          // Kajiya-Kay diffuse
+    vec3 h = normalize(l + e);
+    float s1 = kk(normalize(t + vec3(0, 0, 1) * shift), h, gloss);         // the white highlight
+    float s2 = kk(normalize(t - vec3(0, 0, 1) * shift), h, gloss * 0.25);  // the coloured one, softer
+    col += lrgb[i] * (c * diff * 0.75 + shine * (s1 * 0.6 + s2 * 0.5 * c * 2.0));
+  }
+  o = vec4(col * light * lcol, 1.0);
+})");
+    glGenVertexArrays_(1, &hairVao); glGenBuffers_(1, &hairVbo);
     glGenVertexArrays_(1, &gridVao); glGenBuffers_(1, &gridVbo);
     return prog != 0;
 }
@@ -1028,6 +1053,33 @@ unsigned render(int w, int h, bool hovered) {
         glUseProgram_(prog);
     }
     for (const Part& pt : parts) draw(pt, lk.wire && pt.mode != 1 && !pt.cutout);
+    if (hairCount && progHair) {   // strand hair
+        PROF("Viewer::hair");
+        glUseProgram_(progHair);
+        auto H = [&](const char* nm) { return glGetUniformLocation_(progHair, nm); };
+        glUniformMatrix4fv_(H("mvp"), 1, GL_FALSE, mvp); glUniformMatrix4fv_(H("view"), 1, GL_FALSE, V);
+        glUniform3f_(H("rootCol"), hairLook.root[0], hairLook.root[1], hairLook.root[2]);
+        glUniform3f_(H("tipCol"), hairLook.tip[0], hairLook.tip[1], hairLook.tip[2]);
+        glUniform1f_(H("shift"), hairLook.shift); glUniform1f_(H("gloss"), hairLook.gloss); glUniform1f_(H("shine"), hairLook.shine);
+        glUniform1f_(H("light"), lk.light); glUniform3f_(H("lcol"), lk.lightCol[0], lk.lightCol[1], lk.lightCol[2]);
+        glUniform3f_(H("amb"), lk.ambient[0], lk.ambient[1], lk.ambient[2]);
+        {   // the same lights as the skin (view space)
+            float dirs[24] = {0}, cols[24] = {0}; int nl = 0;
+            for (const auto& L : lk.lights) {
+                if (!L.on || nl == 8) continue;
+                const float cp2 = std::cos(L.pitch), d[3] = {cp2 * std::sin(L.yaw), std::sin(L.pitch), cp2 * std::cos(L.yaw)};
+                float vv[3];
+                if (L.withView) { vv[0] = d[0]; vv[1] = d[1]; vv[2] = d[2]; }
+                else { vv[0] = s[0] * d[0] + s[1] * d[1] + s[2] * d[2]; vv[1] = u[0] * d[0] + u[1] * d[1] + u[2] * d[2]; vv[2] = -(f[0] * d[0] + f[1] * d[1] + f[2] * d[2]); }
+                for (int c = 0; c < 3; ++c) { dirs[nl * 3 + c] = vv[c]; cols[nl * 3 + c] = L.col[c] * L.strength; }
+                ++nl;
+            }
+            glUniform1i_(H("nl"), nl); glUniform3fv_(H("ldir"), 8, dirs); glUniform3fv_(H("lrgb"), 8, cols);
+        }
+        glBindVertexArray_(hairVao);
+        glDrawArrays(GL_LINES, 0, hairCount);
+        glUseProgram_(prog);
+    }
     if (lk.bones && !boneSegs.empty()) {
         glDisable(GL_DEPTH_TEST);
         glBindVertexArray_(gridVao); glBindBuffer_(GL_ARRAY_BUFFER, gridVbo);
@@ -1080,6 +1132,32 @@ void readPixels(std::vector<unsigned char>& rgba, int& w, int& h) {
 }
 
 void setBones(const std::vector<float>& lines) { boneSegs = lines; }
+
+void setHair(const std::vector<float>& pos, const std::vector<int>& offsets, const HairLook& lookIn) {
+    hairLook = lookIn;
+    std::vector<float> v;   // per segment end: position 3, tangent 3, along 1
+    const int nc = (int)offsets.size() - 1;
+    v.reserve(pos.size() * 2 * 7 / 3);
+    for (int c = 0; c < nc; ++c) {
+        const int a = offsets[c], b = offsets[c + 1], n = b - a;
+        if (n < 2) continue;
+        for (int i = a; i < b - 1; ++i) {
+            const float* p0 = &pos[i * 3]; const float* p1 = &pos[(i + 1) * 3];
+            float t[3] = {p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]};
+            const float l = std::sqrt(t[0] * t[0] + t[1] * t[1] + t[2] * t[2]); if (l > 0) for (float& x : t) x /= l;
+            const float u0 = (float)(i - a) / (n - 1), u1 = (float)(i + 1 - a) / (n - 1);
+            v.insert(v.end(), {p0[0], p0[1], p0[2], t[0], t[1], t[2], u0, p1[0], p1[1], p1[2], t[0], t[1], t[2], u1});
+        }
+    }
+    hairCount = (int)v.size() / 7;
+    if (!hairVao) return;
+    glBindVertexArray_(hairVao); glBindBuffer_(GL_ARRAY_BUFFER, hairVbo);
+    glBufferData_(GL_ARRAY_BUFFER, (GLsizeiptr)(v.size() * 4), v.data(), GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray_(0); glVertexAttribPointer_(0, 3, GL_FLOAT, GL_FALSE, 28, nullptr);
+    glEnableVertexAttribArray_(1); glVertexAttribPointer_(1, 3, GL_FLOAT, GL_FALSE, 28, (const void*)12);
+    glEnableVertexAttribArray_(2); glVertexAttribPointer_(2, 1, GL_FLOAT, GL_FALSE, 28, (const void*)24);
+    glBindVertexArray_(0);
+}
 
 bool renderImage(int w, int h, int ss, std::vector<unsigned char>& rgba) {
     ss = std::clamp(ss, 1, 4);

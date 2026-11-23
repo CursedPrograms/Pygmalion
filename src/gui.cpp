@@ -13,6 +13,7 @@
 #include "viewer.h"
 #include "export.h"
 #include "mhscene.h"
+#include "hair.h"
 #include "lang.h"
 #include "profile.h"
 #ifdef _WIN32
@@ -790,6 +791,104 @@ static void putOn(const std::string& f, const std::string& kind) {
     if (f.empty()) { Human::takeOff(body, kind); dirty = true; return; }
     if (Human::wear(body, f, err)) { dirty = true; say((Human::isWorn(body, f) ? "On: " : "Off: ") + niceName(f)); } else say(err);
 }
+// ---------- strand hair (Geometries > Hair): Blender's hair tools as a stack, each with its sliders ----------
+static Hair::Groom groom;
+static bool strands = false, hairDirty = false;
+static void rgbSliders(const char* id, float* c, float maxV, float lw);
+static void rebuildHair() {
+    hairDirty = false;
+    if (!strands) { Viewer::setHair({}, {0}, Viewer::HairLook()); return; }
+    PROF("rebuildHair");
+    Hair::Surface s; Hair::surfaceFromBody(body, groom.growOn, s);
+    Hair::evaluate(groom, s, true);
+    Viewer::HairLook hl;
+    for (int c = 0; c < 3; ++c) { hl.root[c] = groom.rootColor[c]; hl.tip[c] = groom.tipColor[c]; }
+    hl.shift = groom.shift; hl.gloss = groom.gloss; hl.shine = groom.shine;
+    Viewer::setHair(groom.result.pos, groom.result.offsets, hl);
+}
+static Hair::Tool startingGenerate() {   // Generate Hair Curves with numbers for a person (Blender's are for a metre-sized object)
+    Hair::Tool g = Hair::makeTool("Generate Hair Curves");
+    g.set("Density", 400); g.set("Hair Length", 1.6f); g.set("Control Points", 16);
+    return g;
+}
+static void toolSliders(Hair::Tool& t, float lw) {
+    for (auto& p : t.params) {
+        ImGui::PushID(p.name.c_str());
+        bool ch = false;
+        const std::string label = std::string(T(p.name.c_str()));
+        if (p.kind == Hair::Param::BOOL) { bool b = p.v[0] != 0; if (ImGui::Checkbox(label.c_str(), &b)) { p.v[0] = b ? 1.0f : 0.0f; ch = true; } }
+        else if (p.kind == Hair::Param::INT) {
+            int v = (int)p.v[0]; const int lo = (int)std::max(p.min, -100000.0f), hi = (int)std::min(p.softMax, 100000.0f);
+            ImGui::SetNextItemWidth(lw); if (ImGui::SliderInt("##v", &v, lo, std::max(hi, lo + 1), (label + " %d").c_str())) { p.v[0] = (float)std::clamp(v, (int)std::max(p.min, -2e9f), (int)std::min(p.max, 2e9f)); ch = true; }
+        } else if (p.kind == Hair::Param::FLOAT) {
+            ImGui::SetNextItemWidth(lw); if (ImGui::SliderFloat("##v", &p.v[0], std::max(p.min, -p.softMax), p.softMax, (label + " %.3g").c_str())) { p.v[0] = std::clamp(p.v[0], p.min, p.max); ch = true; }
+        } else {
+            static const char* ax[] = {"X", "Y", "Z"};
+            for (int k = 0; k < 3; ++k) { ImGui::PushID(k); ImGui::SetNextItemWidth(lw); if (ImGui::SliderFloat("##v", &p.v[k], -std::max(1.0f, p.softMax), std::max(1.0f, p.softMax), (label + " " + ax[k] + " %.3g").c_str())) ch = true; ImGui::PopID(); }
+        }
+        if (!p.tip.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T(p.tip.c_str()));
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {   // right-click: Blender's default back
+            const Hair::Tool d = Hair::makeTool(t.type);
+            for (const auto& q : d.params) if (q.name == p.name) { std::memcpy(p.v, q.v, sizeof p.v); ch = true; }
+        }
+        if (ch) hairDirty = true;
+        ImGui::PopID();
+    }
+}
+static void strandsUi(float lw) {
+    groupBox(T("Strand hair"));
+    if (ImGui::Checkbox(T("Strands"), &strands)) {
+        remember("Hair");
+        if (strands && groom.stack.empty()) groom.stack.push_back(startingGenerate());
+        hairDirty = true;
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("Real hair, strand by strand: Blender's hair tools (Generate, Clump, Curl, Frizz...) one after another, each with its sliders"));
+    if (!strands) return;
+    static const char* GROW[] = {"Scalp", "Where the hairstyle is", "Everywhere"};
+    ImGui::SetNextItemWidth(lw);
+    if (ImGui::BeginCombo("##grow", (std::string(T("Grows on")) + ": " + T(GROW[groom.growOn])).c_str())) {
+        for (int i = 0; i < 3; ++i) if (ImGui::Selectable(T(GROW[i]), groom.growOn == i)) { groom.growOn = i; hairDirty = true; }
+        ImGui::EndCombo();
+    }
+    if (ImGui::TreeNode(T("Colour and shine"))) {
+        ImGui::TextDisabled("%s", T("At the roots")); rgbSliders("hr", groom.rootColor, 1, lw - 20);
+        ImGui::TextDisabled("%s", T("At the tips")); rgbSliders("ht", groom.tipColor, 1, lw - 20);
+        ImGui::SetNextItemWidth(lw - 20); ImGui::SliderFloat("##hs", &groom.shine, 0, 2, T("Shine %.2f"));
+        ImGui::SetNextItemWidth(lw - 20); ImGui::SliderFloat("##hg", &groom.gloss, 4, 400, T("Gloss %.0f"), ImGuiSliderFlags_Logarithmic);
+        ImGui::SetNextItemWidth(lw - 20); ImGui::SliderFloat("##hf", &groom.shift, -0.5f, 0.5f, T("Highlight shift %.2f"));
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("Moves the highlights along the strands (the hair's scales tilt them)"));
+        hairDirty = true;   // cheap: only the look
+        ImGui::TreePop();
+    }
+    int moveFrom = -1, moveTo = -1, drop = -1;
+    for (size_t i = 0; i < groom.stack.size(); ++i) {
+        Hair::Tool& t = groom.stack[i];
+        ImGui::PushID((int)i);
+        if (ImGui::Checkbox("##on", &t.on)) hairDirty = true;
+        ImGui::SameLine();
+        const bool done = Hair::ported(t.type);
+        std::string title = std::string(T(t.type.c_str())) + (done ? "" : std::string("  (") + T("coming") + ")");
+        const bool open = ImGui::CollapsingHeader((title + "###h").c_str(), ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap);
+        ImGui::SameLine(lw - 50);
+        if (ImGui::SmallButton("^") && i > 0) { moveFrom = (int)i; moveTo = (int)i - 1; }
+        ImGui::SameLine(); if (ImGui::SmallButton("v") && i + 1 < groom.stack.size()) { moveFrom = (int)i; moveTo = (int)i + 1; }
+        ImGui::SameLine(); if (ImGui::SmallButton("x")) drop = (int)i;
+        if (open) { ImGui::BeginDisabled(!t.on); toolSliders(t, lw); ImGui::EndDisabled(); }
+        ImGui::PopID();
+    }
+    if (moveFrom >= 0) { remember("Hair"); std::swap(groom.stack[moveFrom], groom.stack[moveTo]); hairDirty = true; }
+    if (drop >= 0) { remember("Hair"); groom.stack.erase(groom.stack.begin() + drop); hairDirty = true; }
+    ImGui::SetNextItemWidth(lw);
+    if (ImGui::BeginCombo("##add", T("Add a hair tool..."))) {
+        for (const auto& ty : Hair::toolTypes()) {
+            const std::string l = std::string(T(ty.c_str())) + (Hair::ported(ty) ? "" : std::string("  (") + T("coming") + ")");
+            if (ImGui::Selectable(l.c_str())) { remember("Hair"); groom.stack.push_back(ty == "Generate Hair Curves" ? startingGenerate() : Hair::makeTool(ty)); hairDirty = true; }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::TextDisabled("%s", (std::to_string(groom.result.curveCount()) + " " + T("strands") + ", " + std::to_string(groom.result.pointCount()) + " " + T("points")).c_str());
+    if (hairDirty) rebuildHair();
+}
 static void geometriesLeft(const std::string& t, float lw) {
     const std::string kind = kindOf(t);
     groupBox(t.c_str());
@@ -824,6 +923,7 @@ static void geometriesLeft(const std::string& t, float lw) {
         return;
     }
     const Human::Proxy* cur = Human::worn(body, kind);
+    if (kind == "hair") strandsUi(lw);
     if (chooser(kind.c_str(), files, cur ? cur->file : std::string(), picked, lw, kind != "eyes")) putOn(picked, kind);
 }
 // MakeHuman's Skin/Material: an Object list on the right (Skin, then each worn proxy) picks whose materials the
@@ -3916,6 +4016,7 @@ static void frame() {
         repose();
         { const bool want = cat == CAT_UTILITIES && task[CAT_UTILITIES] == "Skeleton Debug"; if (want || dbgActive) { if (!want) dbgActive = false; skeletonDebugUpdate(); } }
         Viewer::update(body);
+        if (strands) rebuildHair();   // the hair follows the body's shape and pose
         dirty = false;
     }
     const ImVec2 a = ImGui::GetCursorScreenPos(), size = ImGui::GetContentRegionAvail();
@@ -3990,6 +4091,8 @@ int main(int argc, char** argv) {
         else if (args[i] == "--unit" && i + 1 < args.size()) startUnits.push_back(args[++i]);
         else if (args[i] == "--script" && i + 1 < args.size()) startScript = args[++i];
         else if (args[i] == "--socket") socketArg = true;
+        else if (args[i] == "--hair-test" && i + 1 < args.size()) { std::exit(Hair::selfTest(args[i + 1]) ? 1 : 0); }   // tests: the hair tools against Blender
+        else if (args[i] == "--strands") { strands = true; groom.stack.push_back(startingGenerate()); hairDirty = true; }   // tests: strand hair on
         else if (args[i] == "--no-sss") Viewer::look().sss = false, Viewer::look().translucency = 0;   // tests: the skin without subsurface scattering   // the socket server on for this run (Utilities > Socket)
         else file = args[i];
     }

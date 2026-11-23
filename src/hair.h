@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 
+namespace Human { struct Body; }
+
 namespace Hair {
 
 // The curves: Blender's CurvesGeometry for hair. Strand c's points are [offsets[c], offsets[c + 1]).
@@ -82,7 +84,14 @@ struct Groom {
     float rootColor[3] = {0.08f, 0.05f, 0.035f}, tipColor[3] = {0.25f, 0.17f, 0.11f};
     float thickness = 1;                  // multiplies every radius (Blender's Set Hair Curve Profile does the shape)
     bool shown = true;
+    // where it grows on the body: 0 the scalp (worked out from the head's joint markers), 1 where the MakeHuman
+    // hairstyle being worn is fitted, 2 everywhere
+    int growOn = 0;
+    float shift = 0.1f, gloss = 80, shine = 0.4f;   // the look: highlight shift along the strand, sharpness, strength
 };
+
+// The body as a surface to grow on (posed if posed), with the mask for growOn.
+void surfaceFromBody(const Human::Body& b, int growOn, Surface& s);
 
 // Runs the stack on g.base over the surface into g.result. viewport: Blender's Is Viewport (the Viewport Amount
 // sliders thin the hair while editing).
@@ -91,10 +100,26 @@ void evaluate(Groom& g, const Surface& s, bool viewport = true);
 // Keeps attached roots on the surface as it changes (shaped, posed): moves each curve rigidly with its root.
 void followSurface(Curves& c, const Surface& before, const Surface& after);
 
-// Blender's random hash (BLI_hash_int_2d and friends), so seeds behave alike.
+// Blender's shape_range node group: a 0..1 falloff along a curve (Shape 0: constant 1, 0.5: linear, toward -1/1:
+// pushed to the root or the tip), Base its steepness.
+float shapeRange(float value, float min, float max, float shape, float base);
+// Blender's curve frames on a poly curve (curve_poly.cc): tangents bisecting the segments, minimum-twist normals.
+void curveFrames(const float* pos, int n, std::vector<float>& tangents, std::vector<float>& normals);
+// Blender's Random Value node: a float, vector or int from an id and a seed (noise::hash_to_float...).
+float randomFloat(int id, int seed, float min, float max);
+void randomVector(int id, int seed, const float min[3], const float max[3], float out[3]);
+int randomInt(int id, int seed, int min, int max);
+// Restore Curve Segment Length: each segment's length mixed toward the reference's by factor, directions kept,
+// from the root out (pin: the point at that parameter along the curve stays where the reference had it).
+void restoreSegmentLength(Curves& c, const std::vector<float>& reference, float factor, float pin = 0, const std::vector<char>* selection = nullptr);
+// Runs the ported tools against Blender's own results (tests/hair/*.json); prints each check, returns failures.
+int selfTest(const std::string& folder);
+
+// Blender's random hash (noise::hash, Bob Jenkins' lookup3), so seeds behave alike.
 uint32_t hash(uint32_t kx);
 uint32_t hash(uint32_t kx, uint32_t ky);
 uint32_t hash(uint32_t kx, uint32_t ky, uint32_t kz);
-float hashFloat(uint32_t kx, uint32_t ky = 0, uint32_t kz = 0);   // 0..1
+float hashFloat(uint32_t kx, uint32_t ky = 0, uint32_t kz = 0);   // 0..1, the 3D hash
+float hashFloat2(uint32_t kx, uint32_t ky);                         // 0..1, the 2D hash
 
 }  // namespace Hair

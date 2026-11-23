@@ -80,6 +80,10 @@ float bodyHeight();
 unsigned render(int w, int h, bool hovered);
 void readPixels(std::vector<unsigned char>& rgba, int& w, int& h);
 void setBones(const std::vector<float>& lines);  // posed bones, head and tail (6 floats each)
+// strand hair (Hair::Curves): offsets as Hair keeps them (curve c's points are [offsets[c], offsets[c + 1])), 3 floats a
+// point; drawn with Kajiya-Kay hair shading, root colour fading to tip colour. Empty: none.
+struct HairLook { float root[3] = {0.08f, 0.05f, 0.035f}, tip[3] = {0.25f, 0.17f, 0.11f}; float shift = 0.1f, gloss = 80, shine = 0.4f; };
+void setHair(const std::vector<float>& pos, const std::vector<int>& offsets, const HairLook& look);
 // a picture of the view at any size (ss: supersampling, 1..4), straight into rgba (top row first)
 bool renderImage(int w, int h, int ss, std::vector<unsigned char>& rgba);
 }

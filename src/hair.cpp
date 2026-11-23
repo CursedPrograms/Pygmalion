@@ -2,11 +2,16 @@
 // The tools are Blender 4.0's procedural hair node groups (GPL-2.0-or-later), ported node graph by node graph; each
 // one's sliders come from hair_tools.inc (generated from Blender's own asset file).
 #include "hair.h"
+#include "human.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <unordered_map>
+#include <fstream>
+#include <sstream>
+#include <cstdio>
+#include "json.h"
 
 namespace Hair {
 
@@ -34,6 +39,7 @@ uint32_t hash(uint32_t kx, uint32_t ky, uint32_t kz) {
     c += kz; b += ky; a += kx; finalMix(a, b, c); return c;
 }
 float hashFloat(uint32_t kx, uint32_t ky, uint32_t kz) { return (float)hash(kx, ky, kz) / (float)0xFFFFFFFFu; }
+float hashFloat2(uint32_t kx, uint32_t ky) { return (float)hash(kx, ky) / (float)0xFFFFFFFFu; }
 
 // ---------- curves and surface ----------
 void Curves::clear() { *this = Curves(); }
@@ -224,9 +230,208 @@ static void generate(const Tool& t, Curves& c, const Surface& s, bool viewport) 
     }
 }
 
+// ---------- Blender's helpers ----------
+float shapeRange(float value, float min, float max, float shape, float base) {
+    if (std::fabs(shape) <= 1e-5f) return 1;                                // Shape 0: constant
+    const float x = (max != min) ? (value - min) / (max - min) : 0;         // Map Range (unclamped)
+    const float k = std::min(std::fabs(shape), 0.999999f);
+    const float b = std::max(base, 1.00001f);
+    float pp = std::fmod(k, 1.0f); if (pp > 0.5f) pp = 1.0f - pp;           // ping-pong with 0.5
+    const float m = std::max(1.0f - pp * (1.0f - 1.0f / b) * 2.0f, 1e-5f);
+    const float e = -std::log(m) / std::log(std::max(b, 1.000001f));
+    const bool flip = k > 0.5f ? !(shape < 0) : (shape < 0);
+    const float y = flip ? 1.0f - x : x;
+    const float p = std::pow(std::max(y, 0.0f), e);
+    const float r = k > 0.5f ? 1.0f - p : p;
+    return std::clamp(min + r * (max - min), std::min(min, max), std::max(min, max));
+}
+
+float randomFloat(int id, int seed, float min, float max) { return hashFloat2((uint32_t)seed, (uint32_t)id) * (max - min) + min; }
+void randomVector(int id, int seed, const float min[3], const float max[3], float out[3]) {
+    for (int k = 0; k < 3; ++k) out[k] = hashFloat((uint32_t)seed, (uint32_t)id, (uint32_t)k) * (max[k] - min[k]) + min[k];
+}
+int randomInt(int id, int seed, int min, int max) {
+    // Blender 4.0's Random Value (Integer): interpf(max, min, hash_to_float(id, seed)), rounded, all in float
+    const float v = hashFloat2((uint32_t)id, (uint32_t)seed);
+    const float x = (float)max * v + (float)min * (1.0f - v);
+    return (int)std::floor(x + 0.5f);
+}
+
+static inline void norm3(float* v) { const float l = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); if (l > 0) for (int k = 0; k < 3; ++k) v[k] /= l; }
+static inline void cross3(const float* a, const float* b, float* o) { o[0] = a[1] * b[2] - a[2] * b[1]; o[1] = a[2] * b[0] - a[0] * b[2]; o[2] = a[0] * b[1] - a[1] * b[0]; }
+static inline float dot3(const float* a, const float* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+static inline float len3(const float* a) { return std::sqrt(dot3(a, a)); }
+// v rotated round a unit axis by angle (Rodrigues)
+static void rotateAround(const float* v, const float* axis, float angle, float* o) {
+    const float c = std::cos(angle), s = std::sin(angle), d = dot3(axis, v);
+    float x[3]; cross3(axis, v, x);
+    for (int k = 0; k < 3; ++k) o[k] = v[k] * c + x[k] * s + axis[k] * d * (1 - c);
+}
+
+void curveFrames(const float* P, int n, std::vector<float>& T, std::vector<float>& N) {
+    T.assign((size_t)n * 3, 0.0f); N.assign((size_t)n * 3, 0.0f);
+    if (n == 0) return;
+    if (n == 1) { T[2] = 1; N[0] = 1; return; }
+    auto deltaDir = [&](int a, int b, float* out) { float d[3] = {P[b * 3] - P[a * 3], P[b * 3 + 1] - P[a * 3 + 1], P[b * 3 + 2] - P[a * 3 + 2]}; const float l = len3(d); if (l < 1e-9f) return false; for (int k = 0; k < 3; ++k) out[k] = d[k] / l; return true; };
+    int first = -1;
+    for (int i = 0; i + 1 < n; ++i) if (deltaDir(i, i + 1, &T[i * 3])) { first = i; break; }
+    if (first < 0) { for (int i = 0; i < n; ++i) T[i * 3 + 2] = 1; }
+    else {
+        for (int i = 0; i < first; ++i) std::memcpy(&T[i * 3], &T[first * 3], 12);
+        float prev[3]; std::memcpy(prev, &T[first * 3], 12); bool prevEqual = false;
+        for (int i = first + 1; i < n - 1; ++i) {   // direction_bisect
+            float nd[3] = {P[(i + 1) * 3] - P[i * 3], P[(i + 1) * 3 + 1] - P[i * 3 + 1], P[(i + 1) * 3 + 2] - P[i * 3 + 2]};
+            const float nl = len3(nd); const bool wasEqual = prevEqual; prevEqual = nl < 1e-9f;
+            float* t = &T[i * 3];
+            if (prevEqual) { std::memcpy(t, prev, 12); continue; }
+            float pd[3]; std::memcpy(pd, prev, 12);
+            for (int k = 0; k < 3; ++k) prev[k] = nd[k] / nl;
+            if (wasEqual) { std::memcpy(t, prev, 12); continue; }
+            float sum[3] = {pd[0] + prev[0], pd[1] + prev[1], pd[2] + prev[2]};
+            const float sl = len3(sum);
+            if (sl < 0.6627619f) {
+                if (sl < 2e-7f) { std::memcpy(t, prev, 12); continue; }
+                float bn[3], nm[3] = {prev[0] - pd[0], prev[1] - pd[1], prev[2] - pd[2]};
+                cross3(prev, pd, bn); cross3(bn, nm, t); norm3(t); continue;
+            }
+            for (int k = 0; k < 3; ++k) t[k] = sum[k] / sl;
+        }
+        if (!deltaDir(n - 2, n - 1, &T[(n - 1) * 3])) std::memcpy(&T[(n - 1) * 3], prev, 12);
+    }
+    // minimum twist normals
+    const float* t0 = &T[0];
+    if (std::fabs(t0[0]) + std::fabs(t0[1]) < 1e-4f) { N[0] = 1; N[1] = 0; N[2] = 0; }
+    else { N[0] = t0[1]; N[1] = -t0[0]; N[2] = 0; norm3(&N[0]); }
+    for (int i = 1; i < n; ++i) {
+        const float* a = &T[(i - 1) * 3]; const float* b = &T[i * 3];
+        std::memcpy(&N[i * 3], &N[(i - 1) * 3], 12);
+        if (len3(a) == 0 || len3(b) == 0) continue;
+        const float ang = std::acos(std::clamp(dot3(a, b), -1.0f, 1.0f));
+        if (ang == 0) continue;
+        float ax[3]; cross3(a, b, ax); if (len3(ax) == 0) continue; norm3(ax);
+        rotateAround(&N[(i - 1) * 3], ax, ang, &N[i * 3]); norm3(&N[i * 3]);
+    }
+}
+
+// a curve's spline parameter (Factor): its length so far over its whole length
+static void splineFactor(const float* P, int n, std::vector<float>& f) {
+    f.assign(n, 0.0f); float total = 0;
+    for (int i = 1; i < n; ++i) { const float d[3] = {P[i * 3] - P[(i - 1) * 3], P[i * 3 + 1] - P[(i - 1) * 3 + 1], P[i * 3 + 2] - P[(i - 1) * 3 + 2]}; total += len3(d); f[i] = total; }
+    if (total > 0) for (float& x : f) x /= total;
+}
+
+void restoreSegmentLength(Curves& c, const std::vector<float>& ref, float factor, float pin, const std::vector<char>* sel) {
+    if (factor <= 0) return;
+    for (int ci = 0; ci < c.curveCount(); ++ci) {
+        const int a = c.first(ci), n = c.count(ci);
+        std::vector<float> cur(c.pos.begin() + a * 3, c.pos.begin() + (a + n) * 3), out = cur;
+        for (int i = 1; i < n; ++i) {
+            if (sel && !(*sel)[a + i]) { for (int k = 0; k < 3; ++k) out[i * 3 + k] = out[(i - 1) * 3 + k] + (cur[i * 3 + k] - cur[(i - 1) * 3 + k]); continue; }
+            float d[3] = {cur[i * 3] - cur[(i - 1) * 3], cur[i * 3 + 1] - cur[(i - 1) * 3 + 1], cur[i * 3 + 2] - cur[(i - 1) * 3 + 2]};
+            const float l = len3(d); if (l > 0) for (float& x : d) x /= l;
+            const float* r0 = &ref[(a + i - 1) * 3]; const float* r1 = &ref[(a + i) * 3];
+            const float rd[3] = {r1[0] - r0[0], r1[1] - r0[1], r1[2] - r0[2]};
+            const float L = l + (len3(rd) - l) * std::clamp(factor, 0.0f, 1.0f);
+            for (int k = 0; k < 3; ++k) out[i * 3 + k] = out[(i - 1) * 3 + k] + d[k] * L;
+        }
+        if (pin > 0) {   // keep the point at parameter pin where the reference had it
+            std::vector<float> fr, fo; splineFactor(&ref[a * 3], n, fr); splineFactor(out.data(), n, fo);
+            auto sample = [&](const float* P, const std::vector<float>& f, float t, float* o) {
+                int j = 1; while (j < n - 1 && f[j] < t) ++j;
+                const float span = f[j] - f[j - 1], u = span > 0 ? (t - f[j - 1]) / span : 0;
+                for (int k = 0; k < 3; ++k) o[k] = P[(j - 1) * 3 + k] + (P[j * 3 + k] - P[(j - 1) * 3 + k]) * u;
+            };
+            float pr[3], po[3]; sample(&ref[a * 3], fr, pin, pr); sample(out.data(), fo, pin, po);
+            for (int i = 0; i < n; ++i) for (int k = 0; k < 3; ++k) out[i * 3 + k] += pr[k] - po[k];
+        }
+        std::copy(out.begin(), out.end(), c.pos.begin() + a * 3);
+    }
+}
+
+// Frizz Hair Curves: each point pushed a random distance in its curve's frame (along, across, out), the offsets added
+// up along the curve (Cumulative Offset) or not, measured from the root so it stays, faded by Shape; Preserve Length
+// then gives each segment its old length back.
+static void frizz(const Tool& t, Curves& c, const Surface&, bool) {
+    const float factor = t.get("Factor"), dist = t.get("Distance"), shape = t.get("Shape");
+    if (factor == 0) return;
+    const bool cumulative = t.getb("Cumulative Offset"), preserve = t.getb("Preserve Length");
+    const int hseed = randomInt(t.geti("Seed"), 64785, -1073741823, 1073741823);   // Blender's "Hash Seed"
+    const std::vector<float> before = c.pos;
+    const float lo[3] = {-1, -1, -1}, hi[3] = {1, 1, 1};
+    std::vector<float> T, N, F, off;
+    for (int ci = 0; ci < c.curveCount(); ++ci) {
+        const int a = c.first(ci), n = c.count(ci);
+        curveFrames(&before[a * 3], n, T, N);
+        splineFactor(&before[a * 3], n, F);
+        off.assign((size_t)n * 3, 0.0f);
+        for (int i = 0; i < n; ++i) {
+            float r[3]; randomVector(a + i, hseed, lo, hi, r);
+            const float* tg = &T[i * 3]; const float* nm = &N[i * 3]; float bi[3]; cross3(tg, nm, bi);
+            for (int k = 0; k < 3; ++k) off[i * 3 + k] = (tg[k] * r[0] + bi[k] * r[1] + nm[k] * r[2]) * (dist * factor);
+        }
+        float lead[3] = {0, 0, 0};
+        for (int i = 0; i < n; ++i) {
+            float v[3];
+            if (cumulative) {   // (leading + trailing - the root's own) / 2
+                float trail[3] = {lead[0], lead[1], lead[2]};
+                for (int k = 0; k < 3; ++k) lead[k] += off[i * 3 + k];
+                for (int k = 0; k < 3; ++k) v[k] = 0.5f * (lead[k] + trail[k] - off[k]);
+            } else for (int k = 0; k < 3; ++k) v[k] = off[i * 3 + k] - off[k];
+            const float s = shapeRange(F[i], 0, 1, shape, 2);
+            for (int k = 0; k < 3; ++k) c.pos[(a + i) * 3 + k] += v[k] * s;
+        }
+    }
+    if (preserve) restoreSegmentLength(c, before, 1.0f);
+}
+
+// ---------- tests against Blender's own results ----------
+static bool readJson(const std::string& path, Json::Value& v) {
+    std::ifstream in(path, std::ios::binary); if (!in) return false;
+    std::stringstream ss; ss << in.rdbuf(); const std::string t = ss.str(); size_t i = 0;
+    return Json::parse(t, i, v);
+}
+int selfTest(const std::string& folder) {
+    int fails = 0, checks = 0;
+    auto report = [&](const std::string& what, double err, double tol) { ++checks; const bool ok = err <= tol; if (!ok) ++fails; std::printf("%s  %-48s max error %.2g\n", ok ? "PASS" : "FAIL", what.c_str(), err); };
+    Json::Value v;
+    if (readJson(folder + "/shape_range.json", v) && v.type == Json::Value::ARR) {
+        for (const auto& r : v.a) {
+            const float shape = (float)r.num("shape"), base = (float)r.num("base"); double err = 0;
+            const Json::Value* vals = r.get("v"); if (!vals) continue;
+            for (size_t i = 0; i < vals->a.size(); ++i) err = std::max(err, std::fabs(vals->a[i].n - shapeRange(i / 100.0f, 0, 1, shape, base)));
+            char nm[64]; std::snprintf(nm, sizeof nm, "shape_range shape %.2f base %.0f", shape, base); report(nm, err, 1e-4);
+        }
+    } else { std::printf("FAIL  %s/shape_range.json missing\n", folder.c_str()); ++fails; }
+    const char* tools[][2] = {{"frizz.json", "Frizz Hair Curves"}};
+    for (auto& tl : tools) {
+        if (!readJson(folder + "/" + tl[0], v) || v.type != Json::Value::OBJ) { std::printf("FAIL  %s missing\n", tl[0]); ++fails; continue; }
+        Curves probe;
+        for (const auto& curve : v.get("probe")->a) {
+            const int ci = probe.addCurve((int)curve.a.size());
+            for (size_t i = 0; i < curve.a.size(); ++i) for (int k = 0; k < 3; ++k) probe.pos[(probe.first(ci) + i) * 3 + k] = (float)curve.a[i].a[k].n;
+        }
+        for (const auto& res : v.get("results")->a) {
+            Tool t = makeTool(tl[1]);
+            for (const auto& kv : res.get("inputs")->o) {
+                const float x = kv.second.type == Json::Value::BOOL ? (kv.second.b ? 1.0f : 0.0f) : (float)kv.second.n;
+                t.set(kv.first.c_str(), x);
+            }
+            Groom g; g.base = probe; g.stack.push_back(t);
+            evaluate(g, Surface(), false);
+            const Json::Value* pos = res.get("pos"); double err = 0;
+            if ((int)pos->a.size() != g.result.pointCount()) err = 1e9;
+            else for (size_t i = 0; i < pos->a.size(); ++i) for (int k = 0; k < 3; ++k) err = std::max(err, std::fabs(pos->a[i].a[k].n - g.result.pos[i * 3 + k]));
+            report(std::string(tl[1]) + ": " + res.str("name"), err, 1e-4);
+        }
+    }
+    std::printf("%d checks, %d failed\n", checks, fails);
+    return fails;
+}
+
 using ToolFn = void (*)(const Tool&, Curves&, const Surface&, bool);
 static ToolFn toolFn(const std::string& type) {
     if (type == "Generate Hair Curves") return generate;
+    if (type == "Frizz Hair Curves") return frizz;
     return nullptr;   // not ported yet: passes the hair through unchanged
 }
 
@@ -237,6 +442,77 @@ void evaluate(Groom& g, const Surface& s, bool viewport) {
     for (const auto& t : g.stack) {
         if (!t.on) continue;
         if (ToolFn f = toolFn(t.type)) f(t, g.result, s, viewport);
+    }
+}
+
+void surfaceFromBody(const Human::Body& b, int growOn, Surface& s) {
+    const std::vector<float>& P = b.shown.empty() ? b.pos : b.shown;
+    const int nv = (int)P.size() / 3;
+    s.pos = P;
+    s.tri = b.tri;
+    // per vertex normals (area weighted) and uvs (a vertex's first corner)
+    s.nrm.assign(P.size(), 0.0f);
+    for (size_t t = 0; t + 2 < s.tri.size(); t += 3) {
+        const float* a = &P[s.tri[t] * 3]; const float* bb = &P[s.tri[t + 1] * 3]; const float* c = &P[s.tri[t + 2] * 3];
+        const float e1[3] = {bb[0] - a[0], bb[1] - a[1], bb[2] - a[2]}, e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+        const float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+        for (int k = 0; k < 3; ++k) for (int d = 0; d < 3; ++d) s.nrm[s.tri[t + k] * 3 + d] += n[d];
+    }
+    for (int v = 0; v < nv; ++v) {
+        float* n = &s.nrm[v * 3]; const float l = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        if (l > 0) for (int d = 0; d < 3; ++d) n[d] /= l;
+    }
+    s.uv.assign((size_t)nv * 2, 0.0f);
+    if (b.triUv.size() == b.tri.size() && !b.uv.empty()) {
+        std::vector<char> done(nv, 0);
+        for (size_t i = 0; i < b.tri.size(); ++i) {
+            const int v = b.tri[i], u = b.triUv[i];
+            if (done[v] || u < 0 || u * 2 + 1 >= (int)b.uv.size()) continue;
+            s.uv[v * 2] = b.uv[u * 2]; s.uv[v * 2 + 1] = b.uv[u * 2 + 1]; done[v] = 1;
+        }
+    }
+    s.mask.clear();
+    if (growOn == 2) return;
+    s.mask.assign(nv, 0.0f);
+    if (growOn == 1) {   // the body vertices the worn MakeHuman hairstyle is fitted to
+        for (const auto& p : b.proxies) {
+            if (p.kind != "hair") continue;
+            for (size_t i = 0; i < p.ref.size(); ++i) if (p.ref[i] >= 0 && p.ref[i] < nv && p.w[i] > 0.05f) s.mask[p.ref[i]] = 1;
+        }
+        return;
+    }
+    // the scalp, from MakeHuman's joint markers: above the brows at the front, above the ears at the sides and back,
+    // within the head; a soft edge (the hairline) so the density thins out rather than stops
+    auto centre = [&](const char* name, float out[3]) {
+        out[0] = out[1] = out[2] = 0;
+        auto it = b.joints.find(name);
+        if (it == b.joints.end() || it->second.empty()) return false;
+        for (int v : it->second) for (int d = 0; d < 3; ++d) out[d] += P[v * 3 + d];
+        for (int d = 0; d < 3; ++d) out[d] /= (float)it->second.size();
+        return true;
+    };
+    float head[3], eyeL[3], eyeR[3], neck[3];
+    if (!centre("joint-head", head) || !centre("joint-l-eye", eyeL) || !centre("joint-r-eye", eyeR) || !centre("joint-neck", neck)) return;
+    float top = -1e30f;
+    float eyeY = (eyeL[1] + eyeR[1]) / 2, eyeZ = (eyeL[2] + eyeR[2]) / 2;
+    const float halfWidth = std::fabs(eyeL[0] - eyeR[0]);   // about half the head's width
+    for (int v = 0; v < nv; ++v) {
+        const float* q = &P[v * 3];
+        if (q[1] > neck[1] && std::fabs(q[0] - head[0]) < halfWidth * 2.2f && std::fabs(q[2] - head[2]) < halfWidth * 2.6f) top = std::max(top, q[1]);
+    }
+    if (top < eyeY) return;
+    const float H = top - eyeY;
+    auto smooth = [](float e0, float e1, float x) { const float t = std::clamp((x - e0) / (e1 - e0), 0.0f, 1.0f); return t * t * (3 - 2 * t); };
+    for (int v = 0; v < nv; ++v) {
+        const float* q = &P[v * 3]; const float* n = &s.nrm[v * 3];
+        if (q[1] < neck[1] || std::fabs(q[0] - head[0]) > halfWidth * 2.2f || q[2] - head[2] > halfWidth * 2.6f || head[2] - q[2] > halfWidth * 2.6f) continue;
+        // the hairline: high on the forehead, down to the ears at the sides, lower still at the nape
+        const float front = std::clamp((q[2] - head[2]) / std::max(eyeZ - head[2], 1e-3f), 0.0f, 1.0f);   // 1 at the face
+        const float side = std::clamp(std::fabs(q[0] - head[0]) / halfWidth - 0.6f, 0.0f, 1.0f);
+        const float line = eyeY + H * (0.42f * front * (1 - side) - 0.12f * side - 0.38f * (1 - front) * (q[2] < head[2] ? 1.0f : 0.0f));
+        float m = smooth(line, line + H * 0.08f, q[1]);
+        if (n[2] > 0.6f && q[1] < eyeY + H * 0.4f) m = 0;   // never the face
+        s.mask[v] = m;
     }
 }
 

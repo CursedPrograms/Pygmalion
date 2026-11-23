@@ -14,6 +14,7 @@
 #include "export.h"
 #include "mhscene.h"
 #include "hair.h"
+#include "hair_sim.h"
 #include "lang.h"
 #include "profile.h"
 #ifdef _WIN32
@@ -794,6 +795,27 @@ static void putOn(const std::string& f, const std::string& kind) {
 // ---------- strand hair (Geometries > Hair): Blender's hair tools as a stack, each with its sliders ----------
 static Hair::Groom groom;
 static bool strands = false, hairDirty = false;
+static HairSim::Simulation hairSim;            // TressFX physics on the groomed hair
+static HairSim::Settings hairSimSet;
+static bool hairPhysics = false;                // simulate live, every frame
+static int tfxPoints = 16, tfxUnits = 1;        // export: points per strand; 0 decimetres, 1 centimetres, 2 metres
+static bool tfxZUp = false;
+static bool settleOnBuild = false;              // tests: settle the physics as soon as the hair is built
+static std::string tfxTestOut;                  // tests: export a .tfx here once the hair is built
+static void showHair() {
+    Viewer::HairLook hl;
+    for (int c = 0; c < 3; ++c) { hl.root[c] = groom.rootColor[c]; hl.tip[c] = groom.tipColor[c]; }
+    hl.shift = groom.shift; hl.gloss = groom.gloss; hl.shine = groom.shine;
+    if (hairPhysics && !hairSim.empty()) Viewer::setHair(hairSim.positions(), hairSim.offsets(), hl);
+    else Viewer::setHair(groom.result.pos, groom.result.offsets, hl);
+}
+static void stepHair(float dt) {   // a frame of physics (the body may have moved: shaped, posed, animated)
+    if (!strands || !hairPhysics || hairSim.empty()) return;
+    Hair::Surface s; Hair::surfaceFromBody(body, groom.growOn, s);
+    hairSim.capsules = HairSim::bodyCapsules(body);
+    hairSim.step(s, hairSimSet, std::clamp(dt, 1.0f / 240.0f, 1.0f / 20.0f));
+    showHair();
+}
 static void rgbSliders(const char* id, float* c, float maxV, float lw);
 static void rebuildHair() {
     hairDirty = false;
@@ -801,10 +823,36 @@ static void rebuildHair() {
     PROF("rebuildHair");
     Hair::Surface s; Hair::surfaceFromBody(body, groom.growOn, s);
     Hair::evaluate(groom, s, true);
-    Viewer::HairLook hl;
-    for (int c = 0; c < 3; ++c) { hl.root[c] = groom.rootColor[c]; hl.tip[c] = groom.tipColor[c]; }
-    hl.shift = groom.shift; hl.gloss = groom.gloss; hl.shine = groom.shine;
-    Viewer::setHair(groom.result.pos, groom.result.offsets, hl);
+    if (hairPhysics) {
+        hairSim.reset(groom.result, s); hairSim.capsules = HairSim::bodyCapsules(body);
+        if (settleOnBuild) { hairSim.settle(s, hairSimSet); settleOnBuild = false; }
+    }
+    if (!tfxTestOut.empty()) {
+        std::string err; const bool ok = HairSim::exportTfx(groom.result, tfxTestOut, tfxPoints, 10.0f, false, err);
+        std::fprintf(stderr, "tfx test: %s %s\n", ok ? "wrote" : "failed", ok ? tfxTestOut.c_str() : err.c_str());
+        tfxTestOut.clear();
+    }
+    showHair();
+}
+static void exportTressFX() {
+    std::string err;
+    if (groom.result.curveCount() == 0) { say(T("No strands to export")); return; }
+    const std::string p = fileDialog(true, L"TressFX hair (*.tfx)\0*.tfx\0\0", L"tfx", homeDir() + "\\hair.tfx");
+    if (p.empty()) return;
+    const float scale = tfxUnits == 0 ? 1.0f : tfxUnits == 1 ? 10.0f : 0.1f;
+    const Hair::Curves& c = hairPhysics && !hairSim.empty() ? groom.result : groom.result;   // the groomed shape is the rest shape
+    if (!HairSim::exportTfx(c, p, tfxPoints, scale, tfxZUp, err)) { say(err); return; }
+    // the .tfxbone beside it, from the chosen skeleton's weights (or the default one's)
+    const Skel::Skeleton& sk = !chosen.empty() ? chosen : rig;
+    if (!sk.empty() && sk.hasWeights) {
+        std::vector<std::string> names; for (const auto& b : sk.bones) names.push_back(b.name);
+        std::vector<std::vector<std::pair<int, float>>> vw(body.pos.size() / 3);
+        for (size_t bi = 0; bi < sk.weights.size(); ++bi) for (const auto& w : sk.weights[bi]) if (w.first < (int)vw.size()) vw[w.first].push_back({(int)bi, w.second});
+        Hair::Surface s; Hair::surfaceFromBody(body, groom.growOn, s);
+        const std::string bp = fs::u8path(p).replace_extension(".tfxbone").u8string();
+        if (!HairSim::exportTfxBone(c, bp, names, vw, s, err)) { say(err); return; }
+        say("Saved " + p + " and its .tfxbone");
+    } else say("Saved " + p + T(" (no skeleton chosen: no .tfxbone)"));
 }
 static Hair::Tool startingGenerate() {   // Generate Hair Curves with numbers for a person (Blender's are for a metre-sized object)
     Hair::Tool g = Hair::makeTool("Generate Hair Curves");
@@ -887,6 +935,45 @@ static void strandsUi(float lw) {
         ImGui::EndCombo();
     }
     ImGui::TextDisabled("%s", (std::to_string(groom.result.curveCount()) + " " + T("strands") + ", " + std::to_string(groom.result.pointCount()) + " " + T("points")).c_str());
+    // physics: TressFX's simulation
+    groupBox(T("Physics (TressFX)"));
+    if (ImGui::Checkbox(T("Simulate"), &hairPhysics)) hairDirty = true;
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("Gravity, wind and the body's movement, every frame: the hair hangs, swings with poses and animations, and keeps off the head and shoulders"));
+    if (hairPhysics) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton(T("Settle"))) { Hair::Surface s; Hair::surfaceFromBody(body, groom.growOn, s); hairSim.capsules = HairSim::bodyCapsules(body); hairSim.settle(s, hairSimSet); showHair(); }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("Let the hair fall and come to rest"));
+        ImGui::SameLine();
+        if (ImGui::SmallButton(T("Reset"))) hairDirty = true;
+        HairSim::Settings& h = hairSimSet;
+        auto sl = [&](const char* id, float* v, float lo, float hi, const char* fmt, const char* tipText, ImGuiSliderFlags fl = 0) {
+            ImGui::SetNextItemWidth(lw); ImGui::SliderFloat(id, v, lo, hi, T(fmt), fl);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", T(tipText));
+        };
+        sl("##hg", &h.gravity, 0, 300, "Gravity %.1f", "Pull down (98.2 is the Earth's, in decimetres)");
+        sl("##hd", &h.damping, 0, 1, "Damping %.3f", "How fast swinging dies down");
+        sl("##hgs", &h.globalStiffness, 0, 1, "Global stiffness %.3f", "Pull back toward the groomed shape");
+        sl("##hgr", &h.globalRange, 0, 1, "Global range %.2f", "How far from the root the pull reaches (part of the strand)");
+        sl("##hls", &h.localStiffness, 0, 1, "Local stiffness %.2f", "How well each strand keeps its own curls and bends");
+        sl("##hv", &h.vsp, 0, 1, "Follow the body %.2f", "Velocity shock propagation: how much the head's movement carries down the strands");
+        sl("##hva", &h.vspAccelThreshold, 0, 10, "Jolt threshold %.2f", "Above this jolt the strands follow the body completely");
+        ImGui::SetNextItemWidth(lw); ImGui::SliderInt("##hli", &h.lengthIterations, 1, 10, T("Length passes %d"));
+        ImGui::SetNextItemWidth(lw); ImGui::SliderInt("##hlo", &h.localIterations, 0, 10, T("Shape passes %d"));
+        sl("##hws", &h.windStrength, 0, 50, "Wind %.1f", "Wind strength");
+        if (h.windStrength > 0) for (int k = 0; k < 3; ++k) { static const char* ax[] = {"Wind from X %.2f", "Wind from Y %.2f", "Wind from Z %.2f"}; ImGui::PushID(k); sl("##hw", &h.wind[k], -1, 1, ax[k], "Wind direction"); ImGui::PopID(); }
+        ImGui::SetNextItemWidth(lw); ImGui::SliderInt("##hss", &h.substeps, 1, 8, T("Steps a frame %d"));
+        ImGui::Checkbox(T("Keep off the head and shoulders"), &h.collide);
+    }
+    groupBox(T("Export TressFX"));
+    static const char* PTS[] = {"4", "8", "16", "32", "64"};
+    int pi = 0; for (int k = 0; k < 5; ++k) if (std::atoi(PTS[k]) == tfxPoints) pi = k;
+    ImGui::SetNextItemWidth(lw); if (ImGui::Combo("##tp", &pi, PTS, 5)) tfxPoints = std::atoi(PTS[pi]);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("Points per strand (TressFX takes 4, 8, 16, 32 or 64)"));
+    static const char* UN[] = {"Decimetres (as Pygmalion)", "Centimetres (Unreal, Maya)", "Metres (Unity, Godot, Blender)"};
+    ImGui::SetNextItemWidth(lw); ImGui::Combo("##tu", &tfxUnits, UN, 3);
+    ImGui::Checkbox(T("Z up (Unreal)"), &tfxZUp);
+    if (ImGui::Button(T("Export .tfx..."), ImVec2(lw, 0))) exportTressFX();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("TressFX hair (.tfx) and, with a skeleton chosen, its bone weights (.tfxbone): for the TressFX plugins for Demiurge, Godot, Unity and Unreal"));
     if (hairDirty) rebuildHair();
 }
 static void geometriesLeft(const std::string& t, float lw) {
@@ -4016,9 +4103,10 @@ static void frame() {
         repose();
         { const bool want = cat == CAT_UTILITIES && task[CAT_UTILITIES] == "Skeleton Debug"; if (want || dbgActive) { if (!want) dbgActive = false; skeletonDebugUpdate(); } }
         Viewer::update(body);
-        if (strands) rebuildHair();   // the hair follows the body's shape and pose
+        if (strands && !hairPhysics) rebuildHair();   // the hair follows the body's shape and pose (with physics on, the simulation follows it)
         dirty = false;
     }
+    stepHair(ImGui::GetIO().DeltaTime);   // a frame of hair physics, when it's on
     const ImVec2 a = ImGui::GetCursorScreenPos(), size = ImGui::GetContentRegionAvail();
     viewW = (int)size.x; viewH = (int)size.y;
     ImGui::InvisibleButton("v", size, ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight | ImGuiButtonFlags_MouseButtonMiddle);
@@ -4092,6 +4180,8 @@ int main(int argc, char** argv) {
         else if (args[i] == "--script" && i + 1 < args.size()) startScript = args[++i];
         else if (args[i] == "--socket") socketArg = true;
         else if (args[i] == "--hair-test" && i + 1 < args.size()) { std::exit(Hair::selfTest(args[i + 1]) ? 1 : 0); }   // tests: the hair tools against Blender
+        else if (args[i] == "--hair-physics") { hairPhysics = true; settleOnBuild = true; }   // tests: physics on, settled before the shot
+        else if (args[i] == "--tfx-out" && i + 1 < args.size()) tfxTestOut = args[++i];   // tests: export the hair as .tfx there
         else if (args[i] == "--strands-demo") {   // tests: a styled head of hair (Generate, Clump, Curl, Noise)
             strands = true; groom.stack.push_back(startingGenerate());
             Hair::Tool cl = Hair::makeTool("Clump Hair Curves"); cl.set("Guide Distance", 0.25f); cl.set("Shape", 0.3f); groom.stack.push_back(cl);

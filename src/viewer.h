@@ -45,6 +45,14 @@ struct Look {
     bool sceneSkin = false;                         // light MakeHuman's litsphere skin by the scene too
     float turnSpeed = 1, moveSpeed = 1, zoomSpeed = 1;   // Settings > Mouse
     bool invertTurn = false, invertZoom = false;
+    // Subsurface scattering on the skin (Jimenez's separable SSS: the lit skin blurred along the surface by a skin
+    // diffusion profile, red reaching furthest), and light through thin parts (ears, nostrils) when lit from behind.
+    bool sss = true;
+    float sssWidth = 0.012f;                         // how far light travels under the skin (world units: decimetres)
+    float sssStrength[3] = {0.48f, 0.41f, 0.28f};    // how much each channel scatters
+    float sssFalloff[3] = {1.0f, 0.37f, 0.3f};       // how far each channel scatters, relative to the width
+    float translucency = 0.35f;                      // light through thin parts from behind
+    float translucencyColor[3] = {0.9f, 0.25f, 0.15f};   // blood under the skin
 };
 Look& look();
 // look at a point from a direction (yaw 0: the front; pi/2: the person's left side), from dist away

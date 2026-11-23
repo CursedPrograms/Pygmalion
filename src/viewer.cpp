@@ -43,6 +43,7 @@ GLF(void, glUniform4f, (GLint, GLfloat, GLfloat, GLfloat, GLfloat))
 GLF(void, glDisableVertexAttribArray, (GLuint))
 GLF(void, glVertexAttrib1f, (GLuint, GLfloat))
 GLF(void, glUniform3fv, (GLint, GLsizei, const GLfloat*))
+GLF(void, glUniform4fv, (GLint, GLsizei, const GLfloat*))
 GLF(void, glUniform2f, (GLint, GLfloat, GLfloat))
 GLF(void, glGenVertexArrays, (GLsizei, GLuint*))
 GLF(void, glBindVertexArray, (GLuint))
@@ -73,6 +74,8 @@ GLF(void, glActiveTexture, (GLenum))
 #define GL_DEPTH_ATTACHMENT 0x8D00
 #define GL_DEPTH_COMPONENT24 0x81A6
 #define GL_TEXTURE0 0x84C0
+#define GL_RGBA16F 0x881A
+#define GL_HALF_FLOAT 0x140B
 #ifndef GL_CLAMP_TO_EDGE
 #define GL_CLAMP_TO_EDGE 0x812F
 #endif
@@ -105,7 +108,42 @@ static GLuint progBg = 0, bgVao = 0, bgTex = 0; static std::string bgLoaded;
 static GLuint progPlane = 0;   // MakeHuman's side backgrounds: a textured quad in the scene
 static std::vector<float> boneSegs;
 static GLuint lit[3] = {0, 0, 0}, litEye = 0, lit_standard = 0;
-static GLuint fbo = 0, fboTex = 0, fboDepth = 0; static int fbW = 0, fbH = 0;
+static GLuint fbo = 0, fboTex = 0, fboDepth = 0; static int fbW = 0, fbH = 0;   // fboDepth: a depth texture (SSS reads it)
+// subsurface scattering: the skin drawn alone (sssTex, sharing the view's depth), blurred across (sssTmp), then down (sssOut)
+static GLuint progSssBlur = 0, progSssComp = 0, sssFbo = 0, sssTex = 0, sssTmpFbo = 0, sssTmp = 0, sssOutFbo = 0, sssOut = 0;
+static int sssW = 0, sssH = 0;
+
+// Jimenez's SeparableSSS::calculateKernel: 25 samples of a skin diffusion profile (d'Eon's sum of Gaussians, each
+// channel stretched by its falloff), offsets packed closer near the centre; the centre first, each channel summing to
+// 1, mixed with the unblurred skin by strength. Out: rgb weight and offset (-3..3) per sample.
+static void sssKernel(const float strength[3], const float falloff[3], float out[25][4]) {
+    const int N = 25; const float RANGE = 3, EXPONENT = 2;
+    auto gaussian = [&](float variance, float r, int c) { const float rr = r / (0.001f + falloff[c]); return std::exp(-(rr * rr) / (2 * variance)) / (2 * 3.14159265f * variance); };
+    auto profile = [&](float r, int c) {
+        return 0.100f * gaussian(0.0484f, r, c) + 0.118f * gaussian(0.187f, r, c) + 0.113f * gaussian(0.567f, r, c)
+             + 0.358f * gaussian(1.99f, r, c) + 0.078f * gaussian(7.41f, r, c);   // the first was dropped by Jimenez: it is the unblurred centre
+    };
+    float k[N][4];
+    const float step = 2 * RANGE / (N - 1);
+    for (int i = 0; i < N; ++i) { const float o = -RANGE + i * step, sg = o < 0 ? -1.0f : 1.0f; k[i][3] = RANGE * sg * std::fabs(std::pow(o, EXPONENT)) / std::pow(RANGE, EXPONENT); }
+    for (int i = 0; i < N; ++i) {
+        float area = 0;
+        if (i > 0) area += std::fabs(k[i][3] - k[i - 1][3]);
+        if (i < N - 1) area += std::fabs(k[i][3] - k[i + 1][3]);
+        area /= 2;
+        for (int c = 0; c < 3; ++c) k[i][c] = area * profile(k[i][3], c);
+    }
+    // the centre sample first
+    float centre[4]; std::memcpy(centre, k[N / 2], sizeof centre);
+    for (int i = N / 2; i > 0; --i) std::memcpy(k[i], k[i - 1], sizeof k[i]);
+    std::memcpy(k[0], centre, sizeof centre);
+    float sum[3] = {0, 0, 0};
+    for (int i = 0; i < N; ++i) for (int c = 0; c < 3; ++c) sum[c] += k[i][c];
+    for (int i = 0; i < N; ++i) for (int c = 0; c < 3; ++c) k[i][c] /= sum[c] > 0 ? sum[c] : 1;
+    for (int c = 0; c < 3; ++c) k[0][c] = (1 - strength[c]) + strength[c] * k[0][c];
+    for (int i = 1; i < N; ++i) for (int c = 0; c < 3; ++c) k[i][c] *= strength[c];
+    std::memcpy(out, k, sizeof k);
+}
 static float eth[3] = {1 / 3.0f, 1 / 3.0f, 1 / 3.0f};
 static float target[3] = {0, 8.5f, 0}, height = 17, bodyMid = 8.5f;
 static bool framed = false;
@@ -137,7 +175,7 @@ static GLuint textureLoad(const std::string& path) {
 bool init(const std::string& data) {
 #define L(name) name##_ = (PFN_##name)SDL_GL_GetProcAddress(#name); if (!name##_) return false;
     L(glCreateShader) L(glShaderSource) L(glCompileShader) L(glCreateProgram) L(glAttachShader) L(glLinkProgram) L(glUseProgram)
-    L(glGetUniformLocation) L(glUniformMatrix4fv) L(glUniform1i) L(glUniform1f) L(glUniform3f) L(glUniform4f) L(glDisableVertexAttribArray) L(glVertexAttrib1f) L(glUniform3fv) L(glUniform2f) L(glGenVertexArrays) L(glBindVertexArray)
+    L(glGetUniformLocation) L(glUniformMatrix4fv) L(glUniform1i) L(glUniform1f) L(glUniform3f) L(glUniform4f) L(glDisableVertexAttribArray) L(glVertexAttrib1f) L(glUniform3fv) L(glUniform4fv) L(glUniform2f) L(glGenVertexArrays) L(glBindVertexArray)
     L(glGenBuffers) L(glBindBuffer) L(glBufferData) L(glEnableVertexAttribArray) L(glVertexAttribPointer) L(glGenFramebuffers)
     L(glBindFramebuffer) L(glFramebufferTexture2D) L(glGenRenderbuffers) L(glBindRenderbuffer) L(glRenderbufferStorage)
     L(glFramebufferRenderbuffer) L(glGenerateMipmap) L(glActiveTexture)
@@ -162,7 +200,13 @@ vec3 lit(vec3 n, vec3 c) {                               // the scene's lights o
   return c * d + sp * shine;
 }
 void shade();
-void main() { shade(); o.rgb *= light * lcol * tint; }
+uniform float transl; uniform vec3 translCol;
+vec3 through(vec3 n) {                                   // light through thin skin from behind (Barre-Brisebois)
+  vec3 t = vec3(0);
+  for (int i = 0; i < nl; ++i) { vec3 h = normalize(ldir[i] + n * 0.3); t += lrgb[i] * pow(max(dot(vec3(0, 0, 1), -h), 0.0), 4.0); }
+  return t * translCol * transl;
+}
+void main() { shade(); if (transl > 0.0) o.rgb += through(normalize(gl_FrontFacing ? N : -N)); o.rgb *= light * lcol * tint; }
 void shade() {
   vec3 n = normalize(N); if (!gl_FrontFacing) n = -n;
   vec2 uv = n.xy * 0.495 + 0.5;                          // MakeHuman's litsphere lookup
@@ -210,6 +254,7 @@ uniform float edgefalloff, xrayIntensity;
 uniform vec3 sceneAmb, l0pos, l0col, l0spec;
 uniform int nl; uniform vec3 lpos[8], lrgb[8], lspec[8];
 uniform float light; uniform vec3 lcol, tint;
+uniform float transl; uniform vec3 translCol;
 vec3 viewNormal() {
   vec3 n = normalize(vN); if (!gl_FrontFacing) n = -n;
   if (dNormal == 1) {             // the normal map, tangent to view space
@@ -295,6 +340,11 @@ void main() {
   }
   o = shadeIt();
   if (cutout == 1 && o.a < 0.4) discard;
+  if (transl > 0.0) {                                    // light through thin skin from behind (Barre-Brisebois)
+    vec3 n = normalize(gl_FrontFacing ? vN : -vN), E = normalize(-vV), t = vec3(0);
+    for (int i = 0; i < nl; ++i) { vec3 h = normalize(normalize(lpos[i] - vV) + n * 0.3); t += lrgb[i] * pow(max(dot(E, -h), 0.0), 4.0); }
+    o.rgb += t * translCol * transl;
+  }
   if (blend == 0) o.a = 1.0; else if (sh != 6) o.a *= mDiffuse.a;
   o.rgb *= light * lcol * tint;
   if (weightView == 2) o.rgb = mix(o.rgb, vec3(1.0), clamp(vW, 0.0, 1.0) * 0.3);   // the part being edited: white at 30%
@@ -326,6 +376,32 @@ out vec4 o; uniform vec3 col; void main() { o = vec4(col, 1); })");
     lit_standard = texture((ls / "lit_standard_skin.png").u8string());
     if (!lit_standard) lit_standard = lit[2];
 
+    // subsurface scattering (Jorge Jimenez, Separable Subsurface Scattering, 2015): the skin layer blurred along the
+    // surface, horizontally then vertically, by a skin diffusion profile; samples across a depth step count less
+    const char* fullVs = R"(#version 330
+out vec2 T; void main() { vec2 p = vec2((gl_VertexID & 1) * 2 - 1, (gl_VertexID >> 1) * 2 - 1); T = p * 0.5 + 0.5; gl_Position = vec4(p, 0, 1); })";
+    progSssBlur = make(fullVs, R"(#version 330
+in vec2 T; out vec4 o;
+uniform sampler2D col, dep; uniform vec2 dir; uniform vec4 kernel[25]; uniform float width, proj, zn, zf; uniform int ortho;
+float lin(float d) { return ortho == 1 ? zn + d * (zf - zn) : 2.0 * zn * zf / (zf + zn - (d * 2.0 - 1.0) * (zf - zn)); }
+void main() {
+  vec4 m = texture(col, T);
+  if (m.a == 0.0) { o = m; return; }                     // not skin
+  float dm = lin(texture(dep, T).r);
+  vec2 stepUv = width * proj / (ortho == 1 ? 1.0 : dm) * dir / 3.0;
+  vec3 sum = m.rgb * kernel[0].rgb;
+  for (int i = 1; i < 25; ++i) {
+    vec2 q = T + kernel[i].a * stepUv;
+    vec4 c = texture(col, q);
+    if (c.a == 0.0) c.rgb = m.rgb;                        // off the skin: as if it were the centre
+    float s = clamp(300.0 * proj * width * abs(dm - lin(texture(dep, q).r)), 0.0, 1.0);   // follow the surface
+    sum += kernel[i].rgb * mix(c.rgb, m.rgb, s);
+  }
+  o = vec4(sum, 1.0);
+})");
+    progSssComp = make(fullVs, R"(#version 330
+in vec2 T; out vec4 o; uniform sampler2D blurred, mask;
+void main() { float a = texture(mask, T).a; if (a == 0.0) discard; o = vec4(texture(blurred, T).rgb, 1.0); })");
     glGenVertexArrays_(1, &gridVao); glGenBuffers_(1, &gridVbo);
     return prog != 0;
 }
@@ -681,15 +757,17 @@ unsigned render(int w, int h, bool hovered) {
     }
     const float ty = target[1];
     if (w != fbW || h != fbH) {
-        if (!fbo) { glGenFramebuffers_(1, &fbo); glGenTextures(1, &fboTex); glGenRenderbuffers_(1, &fboDepth); }
+        if (!fbo) { glGenFramebuffers_(1, &fbo); glGenTextures(1, &fboTex); glGenTextures(1, &fboDepth); }
         glBindTexture(GL_TEXTURE_2D, fboTex);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glBindRenderbuffer_(GL_RENDERBUFFER, fboDepth);
-        glRenderbufferStorage_(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
+        glBindTexture(GL_TEXTURE_2D, fboDepth);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, w, h, 0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glBindFramebuffer_(GL_FRAMEBUFFER, fbo);
         glFramebufferTexture2D_(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fboTex, 0);
-        glFramebufferRenderbuffer_(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, fboDepth);
+        glFramebufferTexture2D_(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, fboDepth, 0);
         fbW = w; fbH = h;
     }
     glBindFramebuffer_(GL_FRAMEBUFFER, fbo);
@@ -840,6 +918,8 @@ unsigned render(int w, int h, bool hovered) {
         glUniform1i_(U("dDiffuse"), g.dDiffuse); glUniform1i_(U("dNormal"), g.dNormal); glUniform1i_(U("dAo"), g.dAo); glUniform1i_(U("dAlpha"), g.dAlpha);
         glUniform1i_(U("autoSkin"), g.autoSkin); glUniform1i_(U("shadeless"), g.shadeless); glUniform1i_(U("cutout"), pt.cutout ? 1 : 0); glUniform1i_(U("blend"), g.blend);
         glUniform3f_(U("tint"), pt.tint[0], pt.tint[1], pt.tint[2]);
+        glUniform1f_(U("transl"), &pt == &bodyPart && lk.shading != 1 ? lk.translucency : 0.0f);
+        glUniform3f_(U("translCol"), lk.translucencyColor[0], lk.translucencyColor[1], lk.translucencyColor[2]);
         const float d4[4] = {g.diff[0], g.diff[1], g.diff[2], g.diff[3]};
         glUniform3f_(U("mAmbient"), g.amb[0], g.amb[1], g.amb[2]); glUniform3f_(U("mEmissive"), g.emis[0], g.emis[1], g.emis[2]);
         glUniform4f_(U("mDiffuse"), d4[0], d4[1], d4[2], d4[3]); glUniform4f_(U("mSpecular"), g.spec[0], g.spec[1], g.spec[2], g.spec[3]);
@@ -879,6 +959,8 @@ unsigned render(int w, int h, bool hovered) {
         glUniform1i_(uHas, pt.tex ? 1 : 0);
         glUniform1i_(uCut, pt.cutout && pt.tex ? 1 : 0);
         glUniform3f_(glGetUniformLocation_(prog, "tint"), pt.tint[0], pt.tint[1], pt.tint[2]);
+        glUniform1f_(glGetUniformLocation_(prog, "transl"), &pt == &bodyPart && !clay ? lk.translucency : 0.0f);
+        glUniform3f_(glGetUniformLocation_(prog, "translCol"), lk.translucencyColor[0], lk.translucencyColor[1], lk.translucencyColor[2]);
         glBindVertexArray_(pt.vao);
         glDrawArrays(GL_TRIANGLES, 0, pt.count);
         if (lines) {
@@ -892,6 +974,59 @@ unsigned render(int w, int h, bool hovered) {
         }
     };
     draw(bodyPart, lk.wire);
+    // subsurface scattering: the skin alone into its own layer (the view's depth shared, so only where it shows),
+    // blurred across then down, and put back over the skin before anything else (clothes, brows, hair) is drawn
+    if (lk.sss && progSssBlur && progSssComp && lk.shading != 1 && !lk.wire && bodyPart.count && lk.sssWidth > 0) {
+        PROF("Viewer::sss");
+        if (w != sssW || h != sssH) {
+            if (!sssFbo) { glGenFramebuffers_(1, &sssFbo); glGenFramebuffers_(1, &sssTmpFbo); glGenFramebuffers_(1, &sssOutFbo); glGenTextures(1, &sssTex); glGenTextures(1, &sssTmp); glGenTextures(1, &sssOut); }
+            const GLuint texs[3] = {sssTex, sssTmp, sssOut}, fbos[3] = {sssFbo, sssTmpFbo, sssOutFbo};
+            for (int i = 0; i < 3; ++i) {
+                glBindTexture(GL_TEXTURE_2D, texs[i]);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w, h, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glBindFramebuffer_(GL_FRAMEBUFFER, fbos[i]);
+                glFramebufferTexture2D_(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texs[i], 0);
+            }
+            glBindFramebuffer_(GL_FRAMEBUFFER, sssFbo);
+            glFramebufferTexture2D_(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, fboDepth, 0);
+            sssW = w; sssH = h;
+        }
+        glBindFramebuffer_(GL_FRAMEBUFFER, sssFbo);
+        glClearColor(0, 0, 0, 0); glClear(GL_COLOR_BUFFER_BIT);
+        glDepthFunc(GL_LEQUAL); glDepthMask(GL_FALSE);
+        draw(bodyPart, false);
+        glDepthMask(GL_TRUE); glDepthFunc(GL_LESS);
+        float k[25][4]; sssKernel(lk.sssStrength, lk.sssFalloff, k);
+        glDisable(GL_DEPTH_TEST);
+        glUseProgram_(progSssBlur);
+        auto B = [&](const char* nm) { return glGetUniformLocation_(progSssBlur, nm); };
+        glUniform4fv_(B("kernel"), 25, &k[0][0]);
+        glUniform1f_(B("width"), lk.sssWidth);
+        glUniform1f_(B("proj"), lk.ortho ? t / lk.dist : t);   // world units to the screen's -1..1 at depth 1 (ortho: everywhere)
+        glUniform1f_(B("zn"), n); glUniform1f_(B("zf"), fr); glUniform1i_(B("ortho"), lk.ortho ? 1 : 0);
+        glUniform1i_(B("col"), 0); glUniform1i_(B("dep"), 1);
+        glActiveTexture_(GL_TEXTURE0 + 1); glBindTexture(GL_TEXTURE_2D, fboDepth);
+        glBindVertexArray_(bgVao);
+        // across (the screen's -1..1 is 0..1 in uv, and narrower by the aspect), then down
+        glBindFramebuffer_(GL_FRAMEBUFFER, sssTmpFbo);
+        glActiveTexture_(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, sssTex);
+        glUniform2f_(B("dir"), 0.5f / a, 0); glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glBindFramebuffer_(GL_FRAMEBUFFER, sssOutFbo);
+        glBindTexture(GL_TEXTURE_2D, sssTmp);
+        glUniform2f_(B("dir"), 0, 0.5f); glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        // back over the skin
+        glBindFramebuffer_(GL_FRAMEBUFFER, fbo);
+        glUseProgram_(progSssComp);
+        glUniform1i_(glGetUniformLocation_(progSssComp, "blurred"), 0); glUniform1i_(glGetUniformLocation_(progSssComp, "mask"), 1);
+        glActiveTexture_(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, sssOut);
+        glActiveTexture_(GL_TEXTURE0 + 1); glBindTexture(GL_TEXTURE_2D, sssTex);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glActiveTexture_(GL_TEXTURE0);
+        glEnable(GL_DEPTH_TEST);
+        glUseProgram_(prog);
+    }
     for (const Part& pt : parts) draw(pt, lk.wire && pt.mode != 1 && !pt.cutout);
     if (lk.bones && !boneSegs.empty()) {
         glDisable(GL_DEPTH_TEST);

@@ -1743,6 +1743,9 @@ static bool saveScene(const std::string& path) {
     if (!o) return false;
     o << "{\n  \"ambient\": [" << lk.ambient[0] << ", " << lk.ambient[1] << ", " << lk.ambient[2] << "],\n  \"shine\": " << lk.shine
       << ",\n  \"shininess\": " << lk.shininess << ",\n  \"brightness\": " << lk.light << ",\n  \"skinLit\": " << (lk.sceneSkin ? "true" : "false")
+      << ",\n  \"sss\": " << (lk.sss ? "true" : "false") << ", \"sssWidth\": " << lk.sssWidth << ", \"sssStrength\": [" << lk.sssStrength[0] << ", " << lk.sssStrength[1] << ", " << lk.sssStrength[2]
+      << "], \"sssFalloff\": [" << lk.sssFalloff[0] << ", " << lk.sssFalloff[1] << ", " << lk.sssFalloff[2] << "], \"translucency\": " << lk.translucency
+      << ", \"translucencyColour\": [" << lk.translucencyColor[0] << ", " << lk.translucencyColor[1] << ", " << lk.translucencyColor[2] << "]"
       << ",\n  \"background\": [" << lk.bg[0] << ", " << lk.bg[1] << ", " << lk.bg[2] << "],\n  \"lights\": [";
     for (size_t i = 0; i < lk.lights.size(); ++i) {
         const auto& L = lk.lights[i];
@@ -1771,6 +1774,8 @@ static bool loadScene(const std::string& path, std::string& err) {
     three(v.get("ambient"), lk.ambient); three(v.get("background"), lk.bg);
     lk.shine = (float)v.num("shine", lk.shine); lk.shininess = (float)v.num("shininess", lk.shininess); lk.light = (float)v.num("brightness", lk.light);
     lk.sceneSkin = flag(v.get("skinLit"), false);
+    lk.sss = flag(v.get("sss"), lk.sss); lk.sssWidth = (float)v.num("sssWidth", lk.sssWidth); lk.translucency = (float)v.num("translucency", lk.translucency);
+    three(v.get("sssStrength"), lk.sssStrength); three(v.get("sssFalloff"), lk.sssFalloff); three(v.get("translucencyColour"), lk.translucencyColor);
     lk.skybox = v.str("skybox");
     sceneFile = path; sceneModified = false;
     if (const Json::Value* ls = v.get("lights")) {
@@ -1920,6 +1925,29 @@ static void renderingLeft(const std::string& t, float lw) {
         ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##shn", &lk.shininess, 2, 128, T("Sharpness %.0f"), ImGuiSliderFlags_Logarithmic);
         ImGui::Checkbox(T("Light the skin by the scene"), &lk.sceneSkin);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("MakeHuman's skin has its light painted in (a litsphere). On, the scene's lights shade it instead."));
+        groupBox(T("Subsurface scattering"));
+        ImGui::Checkbox(T("Light under the skin"), &lk.sss);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("Skin lets light in and spreads it before it comes out again: shadows soften and turn red at their edges. Separable subsurface scattering (Jimenez), in the view and in renders."));
+        ImGui::BeginDisabled(!lk.sss);
+        float mm = lk.sssWidth * 100;   // decimetres to millimetres
+        ImGui::SetNextItemWidth(lw); if (ImGui::SliderFloat("##sssw", &mm, 0, 10, T("Scatter distance %.1f mm"))) lk.sssWidth = mm / 100;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("How far light travels under the skin before it comes out (real skin: about 1 to 3 mm)"));
+        if (ImGui::TreeNode(T("Per colour"))) {
+            static const char* ch[] = {"Red", "Green", "Blue"};
+            for (int c = 0; c < 3; ++c) {
+                ImGui::PushID(c);
+                ImGui::SetNextItemWidth(lw - 20); ImGui::SliderFloat("##st", &lk.sssStrength[c], 0, 1, (std::string(T(ch[c])) + " " + T("strength %.2f")).c_str());
+                ImGui::SetNextItemWidth(lw - 20); ImGui::SliderFloat("##fo", &lk.sssFalloff[c], 0.01f, 1, (std::string(T(ch[c])) + " " + T("reach %.2f")).c_str());
+                ImGui::PopID();
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("Strength: how much of that colour scatters. Reach: how far, against the distance above (red goes furthest in skin)."));
+            if (ImGui::SmallButton(T("Skin defaults"))) { const float s[3] = {0.48f, 0.41f, 0.28f}, f[3] = {1.0f, 0.37f, 0.3f}; for (int c = 0; c < 3; ++c) { lk.sssStrength[c] = s[c]; lk.sssFalloff[c] = f[c]; } lk.sssWidth = 0.012f; }
+            ImGui::TreePop();
+        }
+        ImGui::EndDisabled();
+        ImGui::SetNextItemWidth(lw); ImGui::SliderFloat("##tr", &lk.translucency, 0, 2, T("Light through from behind %.2f"));
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(T("Thin parts (ears, nostrils, fingers) glow when a light is behind them"));
+        if (lk.translucency > 0 && ImGui::TreeNode(T("Its colour"))) { rgbSliders("tc", lk.translucencyColor, 1, lw - 20); ImGui::TreePop(); }
         int drop = -1;
         for (size_t i = 0; i < lk.lights.size(); ++i) {
             auto& L = lk.lights[i];
@@ -3961,7 +3989,8 @@ int main(int argc, char** argv) {
         else if (args[i] == "--yaw" && i + 1 < args.size()) startYaw = (float)atof(args[++i].c_str());
         else if (args[i] == "--unit" && i + 1 < args.size()) startUnits.push_back(args[++i]);
         else if (args[i] == "--script" && i + 1 < args.size()) startScript = args[++i];
-        else if (args[i] == "--socket") socketArg = true;   // the socket server on for this run (Utilities > Socket)
+        else if (args[i] == "--socket") socketArg = true;
+        else if (args[i] == "--no-sss") Viewer::look().sss = false, Viewer::look().translucency = 0;   // tests: the skin without subsurface scattering   // the socket server on for this run (Utilities > Socket)
         else file = args[i];
     }
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) return 1;

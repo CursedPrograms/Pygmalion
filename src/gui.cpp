@@ -4092,6 +4092,13 @@ int main(int argc, char** argv) {
         else if (args[i] == "--script" && i + 1 < args.size()) startScript = args[++i];
         else if (args[i] == "--socket") socketArg = true;
         else if (args[i] == "--hair-test" && i + 1 < args.size()) { std::exit(Hair::selfTest(args[i + 1]) ? 1 : 0); }   // tests: the hair tools against Blender
+        else if (args[i] == "--strands-demo") {   // tests: a styled head of hair (Generate, Clump, Curl, Noise)
+            strands = true; groom.stack.push_back(startingGenerate());
+            Hair::Tool cl = Hair::makeTool("Clump Hair Curves"); cl.set("Guide Distance", 0.25f); cl.set("Shape", 0.3f); groom.stack.push_back(cl);
+            Hair::Tool cu = Hair::makeTool("Curl Hair Curves"); cu.set("Radius", 0.06f); cu.set("Frequency", 1.2f); cu.set("Curl Start", 0.2f); groom.stack.push_back(cu);
+            Hair::Tool no = Hair::makeTool("Hair Curves Noise"); no.set("Distance", 0.02f); groom.stack.push_back(no);
+            hairDirty = true;
+        }
         else if (args[i] == "--strands") { strands = true; groom.stack.push_back(startingGenerate()); hairDirty = true; }   // tests: strand hair on
         else if (args[i] == "--no-sss") Viewer::look().sss = false, Viewer::look().translucency = 0;   // tests: the skin without subsurface scattering   // the socket server on for this run (Utilities > Socket)
         else file = args[i];

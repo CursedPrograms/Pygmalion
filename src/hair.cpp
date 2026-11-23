@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <unordered_map>
+#include <array>
 #include <fstream>
 #include <sstream>
 #include <cstdio>
@@ -716,6 +717,142 @@ static void trim(const Tool& t, Curves& c, const Surface&, bool) {
     if (!uniform) redistributeImpl(c, 1.0f, false);
 }
 
+// ---------- guides (Create Guide Index Map) ----------
+// Every curve's root is a candidate guide, kept at random by Guide Mask (seed 568746); candidates closer than Guide
+// Distance are merged into one at their average place (Blender merges in its k-d tree's order; this merges in index
+// order, so with a distance the chosen guides can differ); each merged guide is the curve whose root is nearest it,
+// and each curve follows the guide nearest its root.
+static std::vector<int> createGuideMap(const Curves& c, float distance, float mask) {
+    const int nc = c.curveCount();
+    std::vector<int> cand;
+    for (int ci = 0; ci < nc; ++ci) if (randomFloat(ci, 568746, 0, 1) < mask) cand.push_back(ci);
+    std::vector<int> guideOf(nc, -1);
+    if (cand.empty()) return guideOf;
+    auto root = [&](int ci) { return c.p(c.first(ci)); };
+    std::vector<std::array<float, 3>> gpos; std::vector<int> gcurve;
+    if (distance > 0) {
+        std::vector<int> group(cand.size(), -1);
+        for (size_t i = 0; i < cand.size(); ++i) {
+            if (group[i] >= 0) continue;
+            group[i] = (int)gpos.size();
+            std::array<float, 3> sum = {root(cand[i])[0], root(cand[i])[1], root(cand[i])[2]}; int cnt = 1;
+            for (size_t j = i + 1; j < cand.size(); ++j) {
+                if (group[j] >= 0) continue;
+                const float* a = root(cand[i]); const float* b = root(cand[j]);
+                const float d[3] = {a[0] - b[0], a[1] - b[1], a[2] - b[2]};
+                if (len3(d) <= distance) { group[j] = group[i]; for (int k = 0; k < 3; ++k) sum[k] += b[k]; ++cnt; }
+            }
+            for (float& s : sum) s /= (float)cnt;
+            gpos.push_back(sum);
+        }
+    } else for (int ci : cand) gpos.push_back({root(ci)[0], root(ci)[1], root(ci)[2]});
+    auto nearestRoot = [&](const float* p) {   // among all curves' roots
+        int best = 0; float bd = 1e30f;
+        for (int ci = 0; ci < nc; ++ci) { const float* r = root(ci); const float d[3] = {r[0] - p[0], r[1] - p[1], r[2] - p[2]}; const float l = dot3(d, d); if (l < bd) { bd = l; best = ci; } }
+        return best;
+    };
+    for (const auto& g : gpos) gcurve.push_back(nearestRoot(g.data()));
+    for (int ci = 0; ci < nc; ++ci) {
+        int best = 0; float bd = 1e30f;
+        for (size_t g = 0; g < gpos.size(); ++g) { const float* r = root(ci); const float d[3] = {r[0] - gpos[g][0], r[1] - gpos[g][1], r[2] - gpos[g][2]}; const float l = dot3(d, d); if (l < bd) { bd = l; best = (int)g; } }
+        guideOf[ci] = gcurve[best];
+    }
+    return guideOf;
+}
+// The guide each curve follows, as Blender's guide tools pick it: the Guide Index slider if set, else the existing guide
+// map (with Existing Guide Map on), else a new one from Guide Distance and Guide Mask. Stored on the curves.
+static std::vector<int> guidesFor(const Tool& t, Curves& c) {
+    const int nc = c.curveCount();
+    std::vector<int> g(nc, -1);
+    const int fixed = t.geti("Guide Index");
+    if (fixed != -987654) { for (int ci = 0; ci < nc; ++ci) g[ci] = std::clamp(fixed, 0, nc - 1); return g; }
+    bool have = t.getb("Existing Guide Map");
+    if (have) for (int ci = 0; ci < nc && have; ++ci) have = ci < (int)c.guideIndex.size() && c.guideIndex[ci] >= 0;
+    if (have) return c.guideIndex;
+    g = createGuideMap(c, t.get("Guide Distance"), t.get("Guide Mask"));
+    c.guideIndex = g;
+    c.guideMask.assign(nc, 0); for (int ci = 0; ci < nc; ++ci) if (g[ci] == ci) c.guideMask[ci] = 1;
+    return g;
+}
+
+// Subdivide Curve on poly curves: cuts new points evenly in every segment; per-curve data kept
+static Curves subdivide(const Curves& c, int cuts) {
+    if (cuts <= 0) return c;
+    Curves o = c; o.offsets.assign(1, 0); o.pos.clear(); o.radius.clear();
+    for (int ci = 0; ci < c.curveCount(); ++ci) {
+        const int a = c.first(ci), n = c.count(ci);
+        for (int i = 0; i < n; ++i) {
+            o.pos.insert(o.pos.end(), c.p(a + i), c.p(a + i) + 3); o.radius.push_back(c.radius[a + i]);
+            if (i == n - 1) break;
+            for (int k = 1; k <= cuts; ++k) {
+                const float u = (float)k / (cuts + 1);
+                for (int j = 0; j < 3; ++j) o.pos.push_back(c.pos[(a + i) * 3 + j] + (c.pos[(a + i + 1) * 3 + j] - c.pos[(a + i) * 3 + j]) * u);
+                o.radius.push_back(c.radius[a + i] + (c.radius[a + i + 1] - c.radius[a + i]) * u);
+            }
+        }
+        o.offsets.push_back((int)o.pos.size() / 3);
+    }
+    return o;
+}
+
+// Sample Curve (by length) on a poly curve: position, and tangent and normal mixed between the two points and normalized
+struct PolySampler {
+    const float* P = nullptr; int n = 0; std::vector<float> L, T, N; float total = 0;
+    void build(const float* p, int count) { P = p; n = count; total = cumLengths(P, n, L); curveFrames(P, n, T, N); }
+    void at(float len, float* pos, float* tan, float* nrm) const {
+        if (n == 1) { std::memcpy(pos, P, 12); std::memcpy(tan, &T[0], 12); std::memcpy(nrm, &N[0], 12); return; }
+        len = std::clamp(len, 0.0f, total);
+        int j = 1; while (j < n - 1 && L[j] < len) ++j;
+        const float span = L[j] - L[j - 1], u = span > 0 ? (len - L[j - 1]) / span : 0;
+        for (int k = 0; k < 3; ++k) {
+            pos[k] = P[(j - 1) * 3 + k] + (P[j * 3 + k] - P[(j - 1) * 3 + k]) * u;
+            tan[k] = T[(j - 1) * 3 + k] + (T[j * 3 + k] - T[(j - 1) * 3 + k]) * u;
+            nrm[k] = N[(j - 1) * 3 + k] + (N[j * 3 + k] - N[(j - 1) * 3 + k]) * u;
+        }
+        norm3(tan); norm3(nrm);
+    }
+};
+
+static float smootherStep(float e0, float e1, float x) {   // Map Range's Smoother Step, clamped
+    float t = std::clamp((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * t * (t * (t * 6 - 15) + 10);
+}
+
+// Curl Hair Curves: each curve, subdivided, wound round its guide: placed on the guide at the same length and offset
+// in a circle in the guide's frame (Radius, from Factor Start to Factor End along it), the angle growing with the
+// length (Frequency) plus a random turn per guide and per curve; blended in from the root up to Curl Start.
+static void curl(const Tool& t, Curves& c, const Surface&, bool) {
+    const std::vector<int> guide = guidesFor(t, c);
+    const Curves orig = c;
+    const int cuts = (int)std::pow(2.0f, (float)std::max(0, t.geti("Subdivision"))) - 1;
+    Curves s = subdivide(c, cuts);
+    const float factor = t.get("Factor"), start = t.get("Curl Start"), radius = t.get("Radius");
+    const float fs = t.get("Factor Start"), fe = t.get("Factor End"), freq = t.get("Frequency"), rnd = t.get("Random Offset");
+    const int hseed = randomInt(t.geti("Seed"), 91487, -1073741823, 1073741823);
+    std::vector<PolySampler> guides(orig.curveCount());
+    std::vector<char> built(orig.curveCount(), 0);
+    std::vector<float> L, F;
+    for (int ci = 0; ci < s.curveCount(); ++ci) {
+        const int a = s.first(ci), n = s.count(ci), gi = guide[ci] >= 0 ? guide[ci] : ci;
+        if (!built[gi]) { guides[gi].build(orig.p(orig.first(gi)), orig.count(gi)); built[gi] = 1; }
+        const std::vector<float> P(s.pos.begin() + a * 3, s.pos.begin() + (a + n) * 3);
+        cumLengths(P.data(), n, L); splineFactor(P.data(), n, F);
+        const float turn = randomFloat(orig.first(gi), hseed, 0, 3.9f) + randomFloat(a, hseed, 0, 1) * rnd;
+        float phase = 0;
+        for (int i = 0; i < n; ++i) {
+            if (i > 0) phase += (L[i] - L[i - 1]) * freq * 3;
+            const float ph = (phase + turn) * 6.2831854820251465f;
+            const float r = radius * (fs + (fe - fs) * std::clamp(F[i], 0.0f, 1.0f));
+            const float vx = std::sin(ph) * r, vy = std::cos(ph) * r;
+            float gp[3], gt[3], gn[3]; guides[gi].at(L[i], gp, gt, gn);
+            float gb[3]; cross3(gt, gn, gb);
+            const float blend = std::sqrt(smootherStep(-1e-5f, start, F[i])) * factor;
+            for (int k = 0; k < 3; ++k) s.pos[(a + i) * 3 + k] += ((gp[k] - P[i * 3 + k]) + gn[k] * vx + gb[k] * vy) * blend;
+        }
+    }
+    c = s;
+}
+
 // ---------- tests against Blender's own results ----------
 static bool readJson(const std::string& path, Json::Value& v) {
     v = Json::Value();
@@ -735,7 +872,7 @@ int selfTest(const std::string& folder) {
             char nm[64]; std::snprintf(nm, sizeof nm, "shape_range shape %.2f base %.0f", shape, base); report(nm, err, 1e-4);
         }
     } else { std::printf("FAIL  %s/shape_range.json missing\n", folder.c_str()); ++fails; }
-    const char* tools[][2] = {{"frizz.json", "Frizz Hair Curves"}, {"smooth.json", "Smooth Hair Curves"}, {"rotate.json", "Rotate Hair Curves"}, {"trim.json", "Trim Hair Curves"}, {"redistribute.json", "Redistribute Curve Points"}, {"noise.json", "Hair Curves Noise"}};
+    const char* tools[][2] = {{"frizz.json", "Frizz Hair Curves"}, {"smooth.json", "Smooth Hair Curves"}, {"rotate.json", "Rotate Hair Curves"}, {"trim.json", "Trim Hair Curves"}, {"redistribute.json", "Redistribute Curve Points"}, {"noise.json", "Hair Curves Noise"}, {"curl.json", "Curl Hair Curves"}};
     for (auto& tl : tools) {
         if (!readJson(folder + "/" + tl[0], v) || v.type != Json::Value::OBJ) { std::printf("FAIL  %s missing\n", tl[0]); ++fails; continue; }
         Curves probe;
@@ -775,6 +912,7 @@ static ToolFn toolFn(const std::string& type) {
     if (type == "Generate Hair Curves") return generate;
     if (type == "Frizz Hair Curves") return frizz;
     if (type == "Hair Curves Noise") return curvesNoise;
+    if (type == "Curl Hair Curves") return curl;
     if (type == "Smooth Hair Curves") return smooth;
     if (type == "Rotate Hair Curves") return rotateCurves;
     if (type == "Trim Hair Curves") return trim;

@@ -853,6 +853,58 @@ static void curl(const Tool& t, Curves& c, const Surface&, bool) {
     c = s;
 }
 
+// Clump Hair Curves: each curve pulled toward its guide at the same place along it (Shape, Factor), keeping its root's
+// offset from the guide's root in the guide's frame and shrinking it toward the tip; Tip Spread scatters the tips at
+// random per curve, Clump Offset moves each clump at random; Distance Threshold / Falloff spare curves far from their
+// guide; Preserve Length after.
+static void clump(const Tool& t, Curves& c, const Surface&, bool) {
+    const std::vector<int> guide = guidesFor(t, c);
+    const float factor = t.get("Factor"), shape = t.get("Shape"), spread = t.get("Tip Spread"), coff = t.get("Clump Offset");
+    const float thr = t.get("Distance Threshold"), fall = t.get("Distance Falloff");
+    const int hseed = randomInt(t.geti("Seed"), 148762, -1073741823, 1073741823);
+    const float lo[3] = {-1, -1, -1}, hi[3] = {1, 1, 1};
+    const Curves orig = c;
+    std::vector<PolySampler> gs(orig.curveCount()); std::vector<char> built(orig.curveCount(), 0);
+    std::vector<float> F;
+    for (int ci = 0; ci < c.curveCount(); ++ci) {
+        const int a = c.first(ci), n = c.count(ci), gi = guide[ci] >= 0 ? guide[ci] : ci;
+        if (!built[gi]) { gs[gi].build(orig.p(orig.first(gi)), orig.count(gi)); built[gi] = 1; }
+        const PolySampler& G = gs[gi];
+        const float* P = orig.p(a);
+        splineFactor(P, n, F);
+        // the root's offset from the guide's root, in the guide root's frame
+        const float* gr = orig.p(orig.first(gi));
+        const float d[3] = {P[0] - gr[0], P[1] - gr[1], P[2] - gr[2]};
+        float p0[3], t0[3], n0[3]; G.at(0, p0, t0, n0); float b0[3]; cross3(t0, n0, b0);
+        const float lx = dot3(n0, d), ly = dot3(b0, d);
+        // tip spread (per curve) and clump offset (per guide), in the guide tip's frame
+        float pt[3], tt[3], nt[3]; G.at(G.total, pt, tt, nt); float bt[3]; cross3(tt, nt, bt);
+        float extra[3] = {0, 0, 0};
+        if (spread != 0) { float r[3]; randomVector(a, hseed, lo, hi, r); for (int k = 0; k < 3; ++k) extra[k] += (nt[k] * r[0] + bt[k] * r[1] + tt[k] * r[2]) * spread; }
+        if (coff != 0) { float r[3]; randomVector(orig.first(gi), hseed, lo, hi, r); for (int k = 0; k < 3; ++k) extra[k] += (nt[k] * r[0] + bt[k] * r[1]) * coff; }
+        // how much this curve clumps, by its root's distance from the guide's
+        const float dist = len3(d);
+        float near;
+        if (thr != 0 && fall == 0) near = dist <= thr ? 1.0f : 0.0f;
+        else {
+            const float span = fall;   // Map Range smooth step from Threshold to Threshold + Falloff, 1 to 0
+            float u = span != 0 ? std::clamp((dist - thr) / span, 0.0f, 1.0f) : 0.0f;
+            u = u * u * (3 - 2 * u);
+            near = 1.0f - u;
+        }
+        for (int i = 0; i < n; ++i) {
+            const float s = shapeRange(F[i], 0, 1, shape, 2);
+            float gp[3], gt[3], gn[3]; G.at(F[i] * G.total, gp, gt, gn); float gb[3]; cross3(gt, gn, gb);
+            const float m = std::clamp(s * factor * near, 0.0f, 1.0f);
+            for (int k = 0; k < 3; ++k) {
+                const float target = gp[k] + (gn[k] * lx + gb[k] * ly) * (1 - s) + extra[k] * s;
+                c.pos[(a + i) * 3 + k] = P[i * 3 + k] + (target - P[i * 3 + k]) * m;
+            }
+        }
+    }
+    if (t.getb("Preserve Length")) restoreSegmentLength(c, orig.pos, 1.0f);
+}
+
 // ---------- tests against Blender's own results ----------
 static bool readJson(const std::string& path, Json::Value& v) {
     v = Json::Value();
@@ -872,7 +924,7 @@ int selfTest(const std::string& folder) {
             char nm[64]; std::snprintf(nm, sizeof nm, "shape_range shape %.2f base %.0f", shape, base); report(nm, err, 1e-4);
         }
     } else { std::printf("FAIL  %s/shape_range.json missing\n", folder.c_str()); ++fails; }
-    const char* tools[][2] = {{"frizz.json", "Frizz Hair Curves"}, {"smooth.json", "Smooth Hair Curves"}, {"rotate.json", "Rotate Hair Curves"}, {"trim.json", "Trim Hair Curves"}, {"redistribute.json", "Redistribute Curve Points"}, {"noise.json", "Hair Curves Noise"}, {"curl.json", "Curl Hair Curves"}};
+    const char* tools[][2] = {{"frizz.json", "Frizz Hair Curves"}, {"smooth.json", "Smooth Hair Curves"}, {"rotate.json", "Rotate Hair Curves"}, {"trim.json", "Trim Hair Curves"}, {"redistribute.json", "Redistribute Curve Points"}, {"noise.json", "Hair Curves Noise"}, {"curl.json", "Curl Hair Curves"}, {"clump.json", "Clump Hair Curves"}};
     for (auto& tl : tools) {
         if (!readJson(folder + "/" + tl[0], v) || v.type != Json::Value::OBJ) { std::printf("FAIL  %s missing\n", tl[0]); ++fails; continue; }
         Curves probe;
@@ -913,6 +965,7 @@ static ToolFn toolFn(const std::string& type) {
     if (type == "Frizz Hair Curves") return frizz;
     if (type == "Hair Curves Noise") return curvesNoise;
     if (type == "Curl Hair Curves") return curl;
+    if (type == "Clump Hair Curves") return clump;
     if (type == "Smooth Hair Curves") return smooth;
     if (type == "Rotate Hair Curves") return rotateCurves;
     if (type == "Trim Hair Curves") return trim;

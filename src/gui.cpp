@@ -2835,6 +2835,7 @@ static bool runCommand(const std::string& line0, std::string& err, const std::fu
     else if (cmd == "bones") { showBones = rest != "off"; Viewer::look().bones = showBones; }
     else if (cmd == "smooth") Viewer::look().smooth = rest != "off";
     else if (cmd == "camera") {   // a MakeHuman view (face, frontView, leftView...), or MHScript's camera calls
+        Human::apply(body); Viewer::update(body);   // frame the body as the script has shaped it so far
         Viewer::Look& lk = Viewer::look(); float at[3]; Viewer::viewTarget(at);
         std::istringstream cs(rest); std::string sub; cs >> sub; float x = 0, y = 0, z = 0; int given = 0; if (cs >> x) { ++given; if (cs >> y) { ++given; if (cs >> z) ++given; } }
         const float DEGS = 57.29578f, home = Viewer::bodyHeight() * 1.7f;

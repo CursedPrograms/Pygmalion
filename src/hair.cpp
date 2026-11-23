@@ -384,8 +384,86 @@ static void frizz(const Tool& t, Curves& c, const Surface&, bool) {
     if (preserve) restoreSegmentLength(c, before, 1.0f);
 }
 
+// Blender's Blur Attribute on curves: each point mixed with its neighbours along the curve, the neighbours weighted by
+// the point's own weight, iterations times
+static void blurOnCurves(const Curves& c, std::vector<float>& v, const std::vector<float>& w, int iterations) {
+    std::vector<float> src;
+    for (int it = 0; it < iterations; ++it) {
+        src = v;
+        for (int ci = 0; ci < c.curveCount(); ++ci) {
+            const int a = c.first(ci), n = c.count(ci);
+            if (n < 2) continue;
+            for (int i = 0; i < n; ++i) {
+                const int p = a + i; const float wi = w[p];
+                float sum[3] = {src[p * 3], src[p * 3 + 1], src[p * 3 + 2]}; float tot = 1;
+                if (i > 0) { for (int k = 0; k < 3; ++k) sum[k] += src[(p - 1) * 3 + k] * wi; tot += wi; }
+                if (i < n - 1) { for (int k = 0; k < 3; ++k) sum[k] += src[(p + 1) * 3 + k] * wi; tot += wi; }
+                for (int k = 0; k < 3; ++k) v[p * 3 + k] = tot > 0 ? sum[k] / tot : src[p * 3 + k];
+            }
+        }
+    }
+}
+
+// Smooth Hair Curves: the points blurred along each curve (Blur Attribute), weighted by Weight and Shape (base e),
+// never the root, the tip only without Lock Tips; mixed in by Amount; Preserve Length gives the lengths back.
+static void smooth(const Tool& t, Curves& c, const Surface&, bool) {
+    const float amount = t.get("Amount"), weight = t.get("Weight"), shape = t.get("Shape");
+    const int iterations = std::max(0, t.geti("Iterations"));
+    const bool lockTips = t.getb("Lock Tips"), preserve = t.getb("Preserve Length");
+    const bool active = amount != 0 && weight > 0;
+    if (!active || iterations == 0) return;
+    const std::vector<float> before = c.pos;
+    std::vector<float> w(c.pointCount(), 0.0f), F; std::vector<char> sel(c.pointCount(), 0);
+    for (int ci = 0; ci < c.curveCount(); ++ci) {
+        const int a = c.first(ci), n = c.count(ci);
+        splineFactor(&before[a * 3], n, F);
+        for (int i = 0; i < n; ++i) {
+            const bool s = !(i == n - 1 && lockTips);
+            sel[a + i] = s;
+            w[a + i] = weight * (s ? 1.0f : 0.0f) * shapeRange(F[i], 0, 1, shape, 2.7182817f) * (i == 0 ? 0.0f : 1.0f);
+        }
+    }
+    std::vector<float> blurred = before;
+    blurOnCurves(c, blurred, w, iterations);
+    for (int ci = 0; ci < c.curveCount(); ++ci) {
+        const int a = c.first(ci), n = c.count(ci);
+        float rootFix[3]; for (int k = 0; k < 3; ++k) rootFix[k] = before[a * 3 + k] - blurred[a * 3 + k];
+        for (int i = 0; i < n; ++i) {
+            const int p = a + i; if (!sel[p]) continue;
+            for (int k = 0; k < 3; ++k) c.pos[p * 3 + k] += ((blurred[p * 3 + k] - rootFix[k]) - before[p * 3 + k]) * amount;
+        }
+    }
+    if (preserve) restoreSegmentLength(c, before, 1.0f);
+}
+
+// Straighten Hair Curves: each point pulled toward the straight line from root to tip, at its place along the curve,
+// by Amount times Shape (base e), at most all the way; Preserve Length gives the lengths back. Not checked against
+// Blender: its 4.0.2 asset mixes the root with the root (both Mix inputs read Curve Root), so it collapses every curve
+// onto its root at the defaults and does nothing at Amount 0.5; this is what the tool says it does.
+static void straighten(const Tool& t, Curves& c, const Surface&, bool) {
+    const float amount = t.get("Amount"), shape = t.get("Shape");
+    if (amount == 0) return;
+    const std::vector<float> before = c.pos; std::vector<float> F;
+    for (int ci = 0; ci < c.curveCount(); ++ci) {
+        const int a = c.first(ci), n = c.count(ci);
+        if (n < 2) continue;
+        splineFactor(&before[a * 3], n, F);
+        const float* r = &before[a * 3]; const float* tip = &before[(a + n - 1) * 3];
+        for (int i = 0; i < n; ++i) {
+            const float m = std::min(amount * shapeRange(F[i], 0, 1, shape, 2.7182817f), 1.0f);
+            if (m == 0) continue;
+            for (int k = 0; k < 3; ++k) {
+                const float target = r[k] + (tip[k] - r[k]) * F[i];
+                c.pos[(a + i) * 3 + k] = before[(a + i) * 3 + k] + (target - before[(a + i) * 3 + k]) * m;
+            }
+        }
+    }
+    if (t.getb("Preserve Length")) restoreSegmentLength(c, before, 1.0f);
+}
+
 // ---------- tests against Blender's own results ----------
 static bool readJson(const std::string& path, Json::Value& v) {
+    v = Json::Value();
     std::ifstream in(path, std::ios::binary); if (!in) return false;
     std::stringstream ss; ss << in.rdbuf(); const std::string t = ss.str(); size_t i = 0;
     return Json::parse(t, i, v);
@@ -402,7 +480,7 @@ int selfTest(const std::string& folder) {
             char nm[64]; std::snprintf(nm, sizeof nm, "shape_range shape %.2f base %.0f", shape, base); report(nm, err, 1e-4);
         }
     } else { std::printf("FAIL  %s/shape_range.json missing\n", folder.c_str()); ++fails; }
-    const char* tools[][2] = {{"frizz.json", "Frizz Hair Curves"}};
+    const char* tools[][2] = {{"frizz.json", "Frizz Hair Curves"}, {"smooth.json", "Smooth Hair Curves"}};
     for (auto& tl : tools) {
         if (!readJson(folder + "/" + tl[0], v) || v.type != Json::Value::OBJ) { std::printf("FAIL  %s missing\n", tl[0]); ++fails; continue; }
         Curves probe;
@@ -432,6 +510,8 @@ using ToolFn = void (*)(const Tool&, Curves&, const Surface&, bool);
 static ToolFn toolFn(const std::string& type) {
     if (type == "Generate Hair Curves") return generate;
     if (type == "Frizz Hair Curves") return frizz;
+    if (type == "Smooth Hair Curves") return smooth;
+    if (type == "Straighten Hair Curves") return straighten;
     return nullptr;   // not ported yet: passes the hair through unchanged
 }
 

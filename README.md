@@ -45,6 +45,13 @@ MakeHuman's own layout, tab for tab:
   with its picture, the view turning to what each slider changes. Custom targets of your own as sliders, and Random.
 - **Geometries:** Clothes (several at once; the body under them is hidden), Eyes, Hair, Teeth, Topologies (low-poly
   bodies), Eyebrows, Eyelashes and Tongue, from MakeHuman's asset pack.
+- **Strand hair** (Geometries > Hair > Strands): real hair, strand by strand, grown on the scalp, where the worn
+  hairstyle sits, or anywhere. Blender's hair tools one after another, each with Blender's sliders: Generate, Frizz,
+  Smooth, Rotate, Trim, Redistribute, Noise, Curl, Clump and Straighten (each checked against Blender 4.0's own
+  results; the rest of Blender's hair tools are on their way), drawn with hair shading (Kajiya-Kay, two highlights),
+  root and tip colours. **TressFX physics** (AMD's simulation): gravity, wind, damping, shape stiffness, the head and
+  shoulders keep it off, and it follows poses and animations; Settle lets it fall. **Export TressFX** (.tfx and
+  .tfxbone) for TressFX in game engines.
 - **Materials:** every skin (young, middle-aged and old, each in several ethnicities), eye colours, and each worn
   thing's own materials.
 - **Pose/Animate:** four skeletons (default, without toes, game engine, CMU motion capture), 18 poses, 33 facial
@@ -52,7 +59,9 @@ MakeHuman's own layout, tab for tab:
   or Mixamo naming), Show the bones.
 - **Rendering:** pictures at any size up to 8K with anti-aliasing and a transparent background; MakeHuman's Scene:
   ambient light, shine and up to four lights (direction, colour, strength, fixed or turning with the view), five
-  ready-made scenes and your own saved as `.pygscene`; the background; an orthographic view.
+  ready-made scenes and your own saved as `.pygscene`; the background; an orthographic view. **Subsurface
+  scattering**: light spreads under the skin (red furthest) and glows through ears and fingers lit from behind, with
+  sliders for the distance, each colour and the glow.
 - **Exports:** Collada (`.dae`), FBX, glTF (`.glb`), OBJ, Ogre3D, STL, BVH and the UV map, with the skeleton, its
   weights and the textures, posed or not, feet on the ground, in any units. Collada, FBX and OBJ keep MakeHuman's
   four-sided faces and shared vertices (glTF, STL and Ogre3D only take triangles). Tested by importing into Blender.

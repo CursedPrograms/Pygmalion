@@ -119,6 +119,9 @@ const float* Tool::getv(const char* name) const {
     for (const auto& p : params) if (p.name == name) return p.v;
     return zero;
 }
+void Tool::setv(const char* name, const float v[3]) {
+    for (auto& p : params) if (p.name == name) { std::memcpy(p.v, v, sizeof p.v); return; }
+}
 void Tool::set(const char* name, float v) {
     for (auto& p : params) if (p.name == name) { p.v[0] = v; return; }
 }
@@ -253,7 +256,8 @@ void randomVector(int id, int seed, const float min[3], const float max[3], floa
 int randomInt(int id, int seed, int min, int max) {
     // Blender 4.0's Random Value (Integer): interpf(max, min, hash_to_float(id, seed)), rounded, all in float
     const float v = hashFloat2((uint32_t)id, (uint32_t)seed);
-    const float x = (float)max * v + (float)min * (1.0f - v);
+    // Blender's build fuses the multiply-adds: the sum comes out as if exact, rounded to float once
+    const float x = (float)((double)max * v + (double)min * (1.0 - (double)v));
     return (int)std::floor(x + 0.5f);
 }
 
@@ -461,6 +465,155 @@ static void straighten(const Tool& t, Curves& c, const Surface&, bool) {
     if (t.getb("Preserve Length")) restoreSegmentLength(c, before, 1.0f);
 }
 
+// a poly curve's cumulative lengths; and the point at a length along it (clamped to the curve, Sample Curve)
+static float cumLengths(const float* P, int n, std::vector<float>& L) {
+    L.assign(n, 0.0f);
+    for (int i = 1; i < n; ++i) { const float d[3] = {P[i * 3] - P[(i - 1) * 3], P[i * 3 + 1] - P[(i - 1) * 3 + 1], P[i * 3 + 2] - P[(i - 1) * 3 + 2]}; L[i] = L[i - 1] + len3(d); }
+    return n ? L[n - 1] : 0;
+}
+static void sampleAtLength(const float* P, int n, const std::vector<float>& L, float len, float* o) {
+    if (n == 1 || L[n - 1] <= 0) { std::memcpy(o, P, 12); return; }
+    len = std::clamp(len, 0.0f, L[n - 1]);
+    int j = 1; while (j < n - 1 && L[j] < len) ++j;
+    const float span = L[j] - L[j - 1], u = span > 0 ? (len - L[j - 1]) / span : 0;
+    for (int k = 0; k < 3; ++k) o[k] = P[(j - 1) * 3 + k] + (P[j * 3 + k] - P[(j - 1) * 3 + k]) * u;
+}
+
+// Blender's hair curves are Catmull-Rom splines (resolution 12): what Sample Curve, Spline Length, Spline Parameter
+// and Curve Tangent see is the evaluated curve. Control point i is evaluated point i * res.
+struct Evaluated {
+    int res = 12; std::vector<float> E, L, T, N; float total = 0;
+    void build(const float* P, int n, int resolution = 12) {
+        res = std::max(1, resolution);
+        if (n < 2) { E.assign(P, P + n * 3); L.assign(n, 0.0f); total = 0; curveFrames(E.data(), n, T, N); return; }
+        E.assign((size_t)((n - 1) * res + 1) * 3, 0.0f);
+        auto pt = [&](int i) { return &P[std::clamp(i, 0, n - 1) * 3]; };
+        for (int s = 0; s < n - 1; ++s) {
+            const float* a = pt(s - 1); const float* b = pt(s); const float* c = pt(s + 1); const float* d = pt(s + 2);
+            for (int k = 0; k < res; ++k) {
+                const float t = (float)k / res, u = 1 - t;
+                const float w0 = -t * u * u, w1 = 2 + t * t * (3 * t - 5), w2 = 2 + u * u * (3 * u - 5), w3 = -u * t * t;
+                float* o = &E[(size_t)(s * res + k) * 3];
+                if (k == 0) { std::memcpy(o, b, 12); continue; }
+                for (int j = 0; j < 3; ++j) o[j] = 0.5f * (a[j] * w0 + b[j] * w1 + c[j] * w2 + d[j] * w3);
+            }
+        }
+        std::memcpy(&E[(size_t)((n - 1) * res) * 3], pt(n - 1), 12);
+        total = cumLengths(E.data(), (int)E.size() / 3, L);
+        curveFrames(E.data(), (int)E.size() / 3, T, N);
+    }
+    int count() const { return (int)E.size() / 3; }
+    float param(int controlPoint) const { return total > 0 ? L[(size_t)controlPoint * res] / total : 0; }
+    const float* tangent(int controlPoint) const { return &T[(size_t)controlPoint * res * 3]; }
+    void at(float length, float* o) const { sampleAtLength(E.data(), count(), L, length, o); }
+};
+
+// Rotate Hair Curves: each curve turned round its root, by Factor x (Angle + its random offset), about Axis (or the
+// curve's root-to-tip direction with Lock Ends; the root's direction if the axis is zero)
+static void rotateCurves(const Tool& t, Curves& c, const Surface&, bool) {
+    const float factor = t.get("Factor"), angle = t.get("Angle"), rnd = t.get("Random Offset");
+    const float* axisIn = t.getv("Axis"); const bool lockEnds = t.getb("Lock Ends");
+    const int hseed = randomInt(t.geti("Seed"), -87614, -1073741823, 1073741823);
+    std::vector<float> T, N;
+    for (int ci = 0; ci < c.curveCount(); ++ci) {
+        const int a = c.first(ci), n = c.count(ci);
+        const float* root = &c.pos[a * 3];
+        float ax[3];
+        if (lockEnds) { const float* tip = &c.pos[(a + n - 1) * 3]; for (int k = 0; k < 3; ++k) ax[k] = tip[k] - root[k]; norm3(ax); }
+        else std::memcpy(ax, axisIn, 12);
+        if (ax[0] == 0 && ax[1] == 0 && ax[2] == 0) { curveFrames(root, n, T, N); std::memcpy(ax, &T[0], 12); }
+        norm3(ax);
+        const float ang = factor * (angle + randomFloat(a, hseed, -0.5f, 0.5f) * rnd);   // Curve ID: the root point's id (its index)
+        if (ang == 0 || len3(ax) == 0) continue;
+        const float r[3] = {root[0], root[1], root[2]};
+        for (int i = a; i < a + n; ++i) {
+            float v[3] = {c.pos[i * 3] - r[0], c.pos[i * 3 + 1] - r[1], c.pos[i * 3 + 2] - r[2]}, o[3];
+            rotateAround(v, ax, ang, o);
+            for (int k = 0; k < 3; ++k) c.pos[i * 3 + k] = r[k] + o[k];
+        }
+    }
+}
+
+// Redistribute Curve Points: the inner points moved along their curve toward even spacing by Factor (with Feature
+// Awareness, toward a spacing blurred by how straight each point is, so bends keep more points)
+static void redistributeImpl(Curves& c, float factor, bool features) {
+    if (factor <= 0) return;
+    const std::vector<float> before = c.pos;
+    std::vector<float> target; Evaluated ev;
+    for (int ci = 0; ci < c.curveCount(); ++ci) {
+        const int a = c.first(ci), n = c.count(ci);
+        if (n < 3) continue;
+        ev.build(&before[a * 3], n);
+        const float total = ev.total;
+        target.assign(n, 0.0f);
+        if (!features) for (int i = 0; i < n; ++i) target[i] = (float)i / (n - 1);
+        else {
+            std::vector<float> w(n, 0.0f), f(n);
+            for (int i = 0; i < n; ++i) {
+                f[i] = ev.param(i);
+                if (i == 0 || i == n - 1) continue;
+                float sd[3] = {before[(a + i) * 3] - before[(a + i - 1) * 3], before[(a + i) * 3 + 1] - before[(a + i - 1) * 3 + 1], before[(a + i) * 3 + 2] - before[(a + i - 1) * 3 + 2]};
+                norm3(sd);
+                const float x = std::clamp(std::fabs(dot3(ev.tangent(i), sd)), 0.0f, 1.0f);
+                w[i] = x * x * (3 - 2 * x);   // Map Range, smooth step
+            }
+            for (int it = 0; it < 10; ++it) {   // Blur Attribute on the spline parameter
+                std::vector<float> src = f;
+                for (int i = 0; i < n; ++i) {
+                    float s = src[i], tot = 1;
+                    if (i > 0) { s += src[i - 1] * w[i]; tot += w[i]; }
+                    if (i < n - 1) { s += src[i + 1] * w[i]; tot += w[i]; }
+                    f[i] = s / tot;
+                }
+            }
+            target = f;
+        }
+        for (int i = 1; i < n - 1; ++i) {
+            const float fa = ev.param(i);
+            const float u = fa + (target[i] - fa) * std::clamp(factor, 0.0f, 1.0f);
+            ev.at(u * total, &c.pos[(a + i) * 3]);
+        }
+    }
+}
+static void redistribute(const Tool& t, Curves& c, const Surface&, bool) { redistributeImpl(c, t.get("Factor"), t.getb("Feature Awareness")); }
+
+// Trim Hair Curves: each curve given a new length - Length (Replace Length) or its own, times Length Factor, plus a
+// random part of Random Offset - blended in by Mask, around the Pin at Parameter point. Without Scale Uniform the curve
+// is resampled over its new span (the ends carried on along their direction when it grows) and its points evened out;
+// with it, the whole curve is scaled about the pinned point.
+static void trim(const Tool& t, Curves& c, const Surface&, bool) {
+    const bool uniform = t.getb("Scale Uniform"), replace = t.getb("Replace Length");
+    const float lf = t.get("Length Factor"), lenIn = t.get("Length"), mask = std::clamp(t.get("Mask"), 0.0f, 1.0f);
+    const float rnd = t.get("Random Offset"), pin = t.get("Pin at Parameter");
+    const int hseed = randomInt(t.geti("Seed"), 14699, -1073741823, 1073741823);
+    const std::vector<float> before = c.pos; Evaluated ev;
+    for (int ci = 0; ci < c.curveCount(); ++ci) {
+        const int a = c.first(ci), n = c.count(ci);
+        const float* P = &before[a * 3];
+        ev.build(P, n);
+        const float cur = ev.total;
+        const float want = std::max((replace ? lenIn : cur) * lf + randomFloat(a, hseed, -1, 0) * rnd, 1e-4f);
+        const float Ln = cur + (want - cur) * mask;
+        if (uniform) {
+            float pp[3]; ev.at(std::clamp(pin, 0.0f, 1.0f) * cur, pp);
+            const float s = cur > 0 ? Ln / cur : 1;
+            for (int i = 0; i < n; ++i) for (int k = 0; k < 3; ++k) c.pos[(a + i) * 3 + k] = pp[k] + (P[i * 3 + k] - pp[k]) * s;
+            continue;
+        }
+        const float start = pin * cur - pin * Ln, end = Ln * (1 - pin) + pin * cur;
+        const float* rootDir = ev.tangent(0); const float* tipDir = &ev.T[(size_t)(ev.count() - 1) * 3];
+        for (int i = 0; i < n; ++i) {
+            const float u = n > 1 ? (float)i / (n - 1) : 0;
+            const float len = std::max(start, 0.0f) + (std::min(end, cur) - std::max(start, 0.0f)) * u;
+            float* o = &c.pos[(a + i) * 3];
+            ev.at(len, o);
+            if (i == 0 && start < 0) for (int k = 0; k < 3; ++k) o[k] += rootDir[k] * start;               // the root carried back
+            if (i == n - 1 && end > cur) for (int k = 0; k < 3; ++k) o[k] += tipDir[k] * (end - cur);     // the tip carried on
+        }
+    }
+    if (!uniform) redistributeImpl(c, 1.0f, false);
+}
+
 // ---------- tests against Blender's own results ----------
 static bool readJson(const std::string& path, Json::Value& v) {
     v = Json::Value();
@@ -480,7 +633,7 @@ int selfTest(const std::string& folder) {
             char nm[64]; std::snprintf(nm, sizeof nm, "shape_range shape %.2f base %.0f", shape, base); report(nm, err, 1e-4);
         }
     } else { std::printf("FAIL  %s/shape_range.json missing\n", folder.c_str()); ++fails; }
-    const char* tools[][2] = {{"frizz.json", "Frizz Hair Curves"}, {"smooth.json", "Smooth Hair Curves"}};
+    const char* tools[][2] = {{"frizz.json", "Frizz Hair Curves"}, {"smooth.json", "Smooth Hair Curves"}, {"rotate.json", "Rotate Hair Curves"}, {"trim.json", "Trim Hair Curves"}, {"redistribute.json", "Redistribute Curve Points"}};
     for (auto& tl : tools) {
         if (!readJson(folder + "/" + tl[0], v) || v.type != Json::Value::OBJ) { std::printf("FAIL  %s missing\n", tl[0]); ++fails; continue; }
         Curves probe;
@@ -491,6 +644,7 @@ int selfTest(const std::string& folder) {
         for (const auto& res : v.get("results")->a) {
             Tool t = makeTool(tl[1]);
             for (const auto& kv : res.get("inputs")->o) {
+                if (kv.second.type == Json::Value::ARR) { float v3[3] = {0, 0, 0}; for (size_t k = 0; k < 3 && k < kv.second.a.size(); ++k) v3[k] = (float)kv.second.a[k].n; t.setv(kv.first.c_str(), v3); continue; }
                 const float x = kv.second.type == Json::Value::BOOL ? (kv.second.b ? 1.0f : 0.0f) : (float)kv.second.n;
                 t.set(kv.first.c_str(), x);
             }
@@ -500,6 +654,14 @@ int selfTest(const std::string& folder) {
             if ((int)pos->a.size() != g.result.pointCount()) err = 1e9;
             else for (size_t i = 0; i < pos->a.size(); ++i) for (int k = 0; k < 3; ++k) err = std::max(err, std::fabs(pos->a[i].a[k].n - g.result.pos[i * 3 + k]));
             report(std::string(tl[1]) + ": " + res.str("name"), err, 1e-4);
+            if (err > 1e-4 && err < 1e8) {   // which curves, and where
+                for (int ci = 0; ci < g.result.curveCount(); ++ci) {
+                    double e = 0; int worst = 0;
+                    for (int i = g.result.first(ci); i < g.result.first(ci) + g.result.count(ci); ++i)
+                        for (int k = 0; k < 3; ++k) { const double d = std::fabs(pos->a[i].a[k].n - g.result.pos[i * 3 + k]); if (d > e) { e = d; worst = i - g.result.first(ci); } }
+                    if (e > 1e-4) std::printf("      curve %d: max error %.3g at point %d of %d\n", ci, e, worst, g.result.count(ci));
+                }
+            }
         }
     }
     std::printf("%d checks, %d failed\n", checks, fails);
@@ -511,6 +673,9 @@ static ToolFn toolFn(const std::string& type) {
     if (type == "Generate Hair Curves") return generate;
     if (type == "Frizz Hair Curves") return frizz;
     if (type == "Smooth Hair Curves") return smooth;
+    if (type == "Rotate Hair Curves") return rotateCurves;
+    if (type == "Trim Hair Curves") return trim;
+    if (type == "Redistribute Curve Points") return redistribute;
     if (type == "Straighten Hair Curves") return straighten;
     return nullptr;   // not ported yet: passes the hair through unchanged
 }

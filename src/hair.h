@@ -68,6 +68,7 @@ struct Tool {
     bool getb(const char* name) const { return get(name) != 0; }
     const float* getv(const char* name) const;
     void set(const char* name, float v);
+    void setv(const char* name, const float v[3]);
 };
 
 // The tools there are, in Blender's order, and a new one with Blender's defaults.

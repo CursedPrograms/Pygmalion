@@ -256,8 +256,10 @@ void randomVector(int id, int seed, const float min[3], const float max[3], floa
 int randomInt(int id, int seed, int min, int max) {
     // Blender 4.0's Random Value (Integer): interpf(max, min, hash_to_float(id, seed)), rounded, all in float
     const float v = hashFloat2((uint32_t)id, (uint32_t)seed);
-    // Blender's build fuses the multiply-adds: the sum comes out as if exact, rounded to float once
-    const float x = (float)((double)max * v + (double)min * (1.0 - (double)v));
+    // as Blender 4.0 computes it: min + (max - min) * v, each step a float (checked against Blender for 8 id/seed pairs)
+    volatile float range = (float)max - (float)min;
+    volatile float scaled = range * v;
+    const float x = (float)min + scaled;
     return (int)std::floor(x + 0.5f);
 }
 
@@ -350,6 +352,106 @@ void restoreSegmentLength(Curves& c, const std::vector<float>& ref, float factor
         }
         std::copy(out.begin(), out.end(), c.pos.begin() + a * 3);
     }
+}
+
+static float cumLengths(const float* P, int n, std::vector<float>& L);
+// ---------- Blender's Perlin noise (blenlib noise.cc) and its Noise Texture (3D, fBM) ----------
+static inline uint32_t floatBits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+static inline float fadeP(float t) { return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f); }
+static inline float negateIf(float v, uint32_t c) { uint32_t b; std::memcpy(&b, &v, 4); b ^= (uint32_t)(c != 0u) << 31; float o; std::memcpy(&o, &b, 4); return o; }
+static inline float gradP(uint32_t h, float x, float y, float z) {
+    h &= 15u;
+    const float u = h < 8u ? x : y, vt = (h & 13u) == 12u ? x : z, v = h < 4u ? y : vt;
+    return negateIf(u, h & 1u) + negateIf(v, h & 2u);
+}
+static inline float mix8(float v0, float v1, float v2, float v3, float v4, float v5, float v6, float v7, float x, float y, float z) {
+    const float x1 = 1 - x, y1 = 1 - y, z1 = 1 - z;
+    return z1 * (y1 * (v0 * x1 + v1 * x) + y * (v2 * x1 + v3 * x)) + z * (y1 * (v4 * x1 + v5 * x) + y * (v6 * x1 + v7 * x));
+}
+static float perlinNoise3(float px, float py, float pz) {
+    const int X = (int)std::floor(px), Y = (int)std::floor(py), Z = (int)std::floor(pz);
+    const float fx = px - (float)X, fy = py - (float)Y, fz = pz - (float)Z;
+    const float u = fadeP(fx), v = fadeP(fy), w = fadeP(fz);
+    auto H = [](int a, int b, int c) { return hash((uint32_t)a, (uint32_t)b, (uint32_t)c); };
+    return mix8(gradP(H(X, Y, Z), fx, fy, fz), gradP(H(X + 1, Y, Z), fx - 1, fy, fz), gradP(H(X, Y + 1, Z), fx, fy - 1, fz),
+                gradP(H(X + 1, Y + 1, Z), fx - 1, fy - 1, fz), gradP(H(X, Y, Z + 1), fx, fy, fz - 1), gradP(H(X + 1, Y, Z + 1), fx - 1, fy, fz - 1),
+                gradP(H(X, Y + 1, Z + 1), fx, fy - 1, fz - 1), gradP(H(X + 1, Y + 1, Z + 1), fx - 1, fy - 1, fz - 1), u, v, w);
+}
+static inline float precisionCorrection(float x) { return std::fmod(x, 100000.0f) + 0.5f * (std::fabs(x) >= 1000000.0f ? 1.0f : 0.0f); }
+static float perlinSigned3(const float p[3]) {
+    // Blender's math::mod is fmod with the sign of x (C's fmodf)
+    return perlinNoise3(precisionCorrection(p[0]), precisionCorrection(p[1]), precisionCorrection(p[2])) * 0.9820f;
+}
+static float perlinFbm3(const float p[3], float detail, float roughness, float lacunarity, bool normalize) {
+    float fscale = 1, amp = 1, maxamp = 0, sum = 0;
+    for (int i = 0; i <= (int)detail; ++i) {
+        const float q[3] = {fscale * p[0], fscale * p[1], fscale * p[2]};
+        sum += perlinSigned3(q) * amp; maxamp += amp; amp *= roughness; fscale *= lacunarity;
+    }
+    const float rmd = detail - std::floor(detail);
+    if (rmd != 0) {
+        const float q[3] = {fscale * p[0], fscale * p[1], fscale * p[2]};
+        const float sum2 = sum + perlinSigned3(q) * amp;
+        return normalize ? (0.5f * sum / maxamp + 0.5f) * (1 - rmd) + (0.5f * sum2 / (maxamp + amp) + 0.5f) * rmd : sum * (1 - rmd) + sum2 * rmd;
+    }
+    return normalize ? 0.5f * sum / maxamp + 0.5f : sum;
+}
+static void randomFloat3Offset(float seed, float o[3]) {
+    for (int k = 0; k < 3; ++k) o[k] = 100.0f + (float)hash(floatBits(seed), floatBits((float)k)) / (float)0xFFFFFFFFu * 100.0f;
+}
+// the Noise Texture node's Color: three fBM noises, the 2nd and 3rd at Blender's fixed offsets (seeds 3 and 4)
+static void noiseTextureColor(const float vec[3], float scale, float detail, float roughness, float lacunarity, bool normalize, float out[3]) {
+    const float p[3] = {vec[0] * scale, vec[1] * scale, vec[2] * scale};
+    float o3[3], o4[3]; randomFloat3Offset(3.0f, o3); randomFloat3Offset(4.0f, o4);
+    const float p3[3] = {p[0] + o3[0], p[1] + o3[1], p[2] + o3[2]}, p4[3] = {p[0] + o4[0], p[1] + o4[1], p[2] + o4[2]};
+    out[0] = perlinFbm3(p, detail, roughness, lacunarity, normalize);
+    out[1] = perlinFbm3(p3, detail, roughness, lacunarity, normalize);
+    out[2] = perlinFbm3(p4, detail, roughness, lacunarity, normalize);
+}
+
+// Hair Curves Noise: each point pushed by 3D noise in its curve's frame; the noise read at the curve's root (times
+// Scale, shifted by the seed) and along the curve (Scale along Curve, plus Offset per Curve at random); added up along
+// the curve or not, from the root, faded by Shape, Preserve Length after.
+static void curvesNoise(const Tool& t, Curves& c, const Surface&, bool) {
+    const float factor = t.get("Factor"), dist = t.get("Distance"), shape = t.get("Shape");
+    if (factor == 0) return;
+    const float scale = t.get("Scale"), along = t.get("Scale along Curve"), perCurve = t.get("Offset per Curve");
+    const bool cumulative = t.getb("Cumulative Offset"), preserve = t.getb("Preserve Length");
+    const int seed = t.geti("Seed");
+    const int hseed = randomInt(seed, 368741, -1073741823, 1073741823);
+    const float lo[3] = {-1, -1, -1}, hi[3] = {1, 1, 1};
+    float shift[3]; randomVector(seed, hseed, lo, hi, shift);
+    for (float& s : shift) s *= 100.0f;
+    const std::vector<float> before = c.pos;
+    std::vector<float> T, N, F, L, off;
+    for (int ci = 0; ci < c.curveCount(); ++ci) {
+        const int a = c.first(ci), n = c.count(ci);
+        curveFrames(&before[a * 3], n, T, N);
+        splineFactor(&before[a * 3], n, F);
+        cumLengths(&before[a * 3], n, L);
+        const float* root = &before[a * 3];
+        const float curveOff = randomFloat(a, hseed, -1, 1) * perCurve;
+        off.assign((size_t)n * 3, 0.0f);
+        for (int i = 0; i < n; ++i) {
+            const float v[3] = {root[0] * scale + shift[0], root[1] * scale + shift[1], root[2] * scale + shift[2] + L[i] * along + curveOff};
+            float col[3]; noiseTextureColor(v, 5.0f, 0, 0, 2, true, col);
+            const float r[3] = {(col[0] - 0.5f) * 2, (col[1] - 0.5f) * 2, (col[2] - 0.5f) * 2};
+            const float* tg = &T[i * 3]; const float* nm = &N[i * 3]; float bi[3]; cross3(tg, nm, bi);
+            for (int k = 0; k < 3; ++k) off[i * 3 + k] = (tg[k] * r[0] + bi[k] * r[1] + nm[k] * r[2]) * (factor * dist);
+        }
+        float lead[3] = {0, 0, 0};
+        for (int i = 0; i < n; ++i) {
+            float v[3];
+            if (cumulative) {
+                float trail[3] = {lead[0], lead[1], lead[2]};
+                for (int k = 0; k < 3; ++k) lead[k] += off[i * 3 + k];
+                for (int k = 0; k < 3; ++k) v[k] = 0.5f * (lead[k] + trail[k] - off[k]);
+            } else for (int k = 0; k < 3; ++k) v[k] = off[i * 3 + k] - off[k];
+            const float s = shapeRange(F[i], 0, 1, shape, 2);
+            for (int k = 0; k < 3; ++k) c.pos[(a + i) * 3 + k] += v[k] * s;
+        }
+    }
+    if (preserve) restoreSegmentLength(c, before, 1.0f);
 }
 
 // Frizz Hair Curves: each point pushed a random distance in its curve's frame (along, across, out), the offsets added
@@ -633,7 +735,7 @@ int selfTest(const std::string& folder) {
             char nm[64]; std::snprintf(nm, sizeof nm, "shape_range shape %.2f base %.0f", shape, base); report(nm, err, 1e-4);
         }
     } else { std::printf("FAIL  %s/shape_range.json missing\n", folder.c_str()); ++fails; }
-    const char* tools[][2] = {{"frizz.json", "Frizz Hair Curves"}, {"smooth.json", "Smooth Hair Curves"}, {"rotate.json", "Rotate Hair Curves"}, {"trim.json", "Trim Hair Curves"}, {"redistribute.json", "Redistribute Curve Points"}};
+    const char* tools[][2] = {{"frizz.json", "Frizz Hair Curves"}, {"smooth.json", "Smooth Hair Curves"}, {"rotate.json", "Rotate Hair Curves"}, {"trim.json", "Trim Hair Curves"}, {"redistribute.json", "Redistribute Curve Points"}, {"noise.json", "Hair Curves Noise"}};
     for (auto& tl : tools) {
         if (!readJson(folder + "/" + tl[0], v) || v.type != Json::Value::OBJ) { std::printf("FAIL  %s missing\n", tl[0]); ++fails; continue; }
         Curves probe;
@@ -672,6 +774,7 @@ using ToolFn = void (*)(const Tool&, Curves&, const Surface&, bool);
 static ToolFn toolFn(const std::string& type) {
     if (type == "Generate Hair Curves") return generate;
     if (type == "Frizz Hair Curves") return frizz;
+    if (type == "Hair Curves Noise") return curvesNoise;
     if (type == "Smooth Hair Curves") return smooth;
     if (type == "Rotate Hair Curves") return rotateCurves;
     if (type == "Trim Hair Curves") return trim;
